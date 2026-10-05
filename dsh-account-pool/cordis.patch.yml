@@ -1,0 +1,57 @@
+# dsh-account-pool bundle: naming this package in a profile's
+# `dsh.profile.bundles` composes both halves — the Host half that owns the
+# domain, the `pool` provider registration and the three management routes, and
+# the Client half that registers the 「账号池」 settings page plus the 「号池管理」
+# card on the Models page (`settings.section`, `settings.models.footer`,
+# `settings.models.provider-card`).
+#
+# Entry name: this install is a machine-local `link:` to a workspace directory,
+# so the row names the Host file by ABSOLUTE PATH.
+#
+# ⚠ ANY change under lib/*.js REQUIRES A RESTART — including lib/host.js.
+# Node's ESM cache is keyed by resolved URL and lives for the whole process, and
+# the Loader does not evict it: disabling and re-enabling the entry re-runs
+# `apply` but re-imports NOTHING, so the old module keeps serving. Measured, not
+# assumed: after an edit the reload still reported the previous file's line
+# numbers in its stack.
+# Only lib/client.js hot-reloads, because the browser half is fetched over HTTP
+# rather than imported. Refresh the page after editing it.
+#
+# Config:
+#   accounts          account definitions reconciled at mount; static fields are
+#                     refreshed on existing rows, runtime state (cooling windows,
+#                     counters) is always preserved
+#   pruneIntervalMs   expired-binding sweep period, default 60000
+#   statusDumpPath    write a JSON record of what actually resolved at mount
+#                     (capabilities / registrations / account counts). Set this
+#                     when the page reports a bare HTTP 404: an undeclared
+#                     service is invisible to `ctx.get`, and this dump is the
+#                     only place that says so.
+#   upstream          NOT expressible in YAML (it is a transport object), so an
+#                     installed copy mounts in management-only mode: it does NOT
+#                     register the `pool` provider and does NOT declare it in the
+#                     provider directory, because offering a selectable provider
+#                     that cannot reach anything is worse than offering none.
+#
+# ⚠ `lib/host.js` declares inject = [storageDomain, llm, connection]. All three
+# must be listed for the plugin to SEE those services at all: they are provided
+# by SIBLING rows under the profile's `include`, and Cordis makes a sibling's
+# service reachable only through the plugin's own `inject`. Omitting one is
+# silent — the fiber activates and the feature simply never registers.
+
+- insert:
+    - id: account-pool
+      name: D:/Backup/Documents/deepseek-harness/default-workspace/dsh-account-pool/lib/host.js
+      config:
+        statusDumpPath: C:/Users/Administrator/.dsh/account-pool-status.json
+        accounts:
+          - id: main
+            label: 主号
+            platform: anthropic
+            priority: 100
+            concurrency: 4
+          - id: backup
+            label: 备号
+            platform: openai
+            priority: 200
+            concurrency: 2

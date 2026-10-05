@@ -1,0 +1,13 @@
+# dsh-mcp-skills bundle patch — one insert row for the Host half.
+#
+# The Host half registers exact Fetch routes on the authenticated `/api`
+# channel (ctx.connection.fetch.register): that is the channel the app's own
+# client uses, so the page works over both the desktop carrier and a browser.
+#
+# Do NOT switch this to a private RPC channel via connection.rpc.handle():
+# that path registers its route through the *calling plugin's* ctx.webServer and
+# fails with "cannot get property \"webServer\" without inject", which leaves the
+# page requesting a channel that was never mounted (the panel then spins forever).
+- insert:
+    - id: dsh-mcp-skills
+      name: dsh-mcp-skills

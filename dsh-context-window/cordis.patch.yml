@@ -1,0 +1,27 @@
+# dsh-context-window bundle: naming this package in a profile's
+# `dsh.profile.bundles` loads it in one step. The Browser half is the feature
+# (the occupancy ring's popover); the Host half serves the MCP / built-in / skill
+# classification the Browser cannot compute, and can dump the authenticated
+# loopback URL for local screenshot verification.
+#
+# Entry name: this install is a machine-local `link:` to a workspace directory.
+# The Loader memoizes an imported Host module PER SPECIFIER, and neither a file
+# change nor a bundle disable/enable re-imports it — so a reload of the Host half
+# needs a new filename here (or a process restart). The Browser half has no such
+# constraint: it hot-reloads from disk on save. For a normally installed copy
+# (published package or plain node_modules), the portable form resolves through
+# package.json "exports" and is read once, at process start:
+#
+#   - insert:
+#       - id: context-window
+#         name: dsh-context-window
+#
+# Config keys (all optional):
+#   cacheTtlMs     re-read window for one session, default 5000
+#   maxItems       cap on the per-tool / per-skill detail lists, default 60
+#   debugDumpPath  write this process's authenticated loopback URL to that file
+#                  (local verification only; off by default)
+
+- insert:
+    - id: context-window
+      name: D:/Backup/Documents/deepseek-harness/default-workspace/dsh-context-window/lib/host.v4.js

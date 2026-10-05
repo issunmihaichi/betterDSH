@@ -1,0 +1,59 @@
+{
+  "name": "dsh-account-pool",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH 账号池：两层选路（粘性会话 + 负载感知）、失败冷却与降级（对标 sub2api 号池核心，自用规模）",
+  "license": "MIT",
+  "type": "module",
+  "main": "./lib/host.js",
+  "scripts": {
+    "test": "node tools/kernel-test.mjs && node tools/domain-test.mjs && node tools/upstream-test.mjs && node tools/host-test.mjs && node tools/client-test.mjs"
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/host.js"
+    },
+    "./kernel": {
+      "default": "./lib/kernel.js"
+    },
+    "./adapter": {
+      "default": "./lib/adapter.js"
+    },
+    "./domain": {
+      "default": "./lib/domain.js"
+    },
+    "./upstream": {
+      "default": "./lib/upstream.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "files": [
+    "lib/host.js",
+    "lib/client.js",
+    "lib/kernel.js",
+    "lib/adapter.js",
+    "lib/domain.js",
+    "lib/upstream.js",
+    "cordis.patch.yml",
+    "DESIGN.md",
+    "README.md"
+  ],
+  "dependencies": {
+    "zod": "^4.6.5"
+  }
+}

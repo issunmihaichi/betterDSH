@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "GitHub",
+    "description": "Connect github/github-mcp-server with a personal access token: manage the connection and token in Settings, call GitHub tools from the composer with /github, and download remote repositories into a workspace"
+  }
+}

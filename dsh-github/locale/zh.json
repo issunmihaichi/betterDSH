@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "GitHub",
+    "description": "用 Personal Access Token 连接 github/github-mcp-server：设置页管理连接与令牌，输入栏用 /github 调用 GitHub 工具，并可把远程仓库下载到本机并注册为工作区"
+  }
+}

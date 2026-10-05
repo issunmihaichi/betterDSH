@@ -1,0 +1,68 @@
+# dsh-mcp-skills
+
+设置里的 **「MCP 与技能」** 页：把本机已挂载的 MCP 服务器和技能库放在一个界面上管理。
+
+这是 `dsh-mcp-skill-manager` 的重写版。原插件用 `connection.rpc.handle()` 注册了一个私有 RPC 通道
+`/mcp-skill-panel`，但当前 DSH 版本的 `handle()` 是通过**调用方插件自己的 `ctx.webServer`** 挂路由的，
+插件没 inject `webServer` 就会抛：
+
+```
+Error: cannot get property "webServer" without inject
+```
+
+异常被插件自己的 `try/catch` 吞掉，通道从未注册，页面请求拿到 405；而页面首次加载没有错误处理，
+于是永远停在「加载中…」。本插件改为走**官方支持的 `/api` 通道**（`ctx.connection.fetch.register`），
+和 DSH 自己的页面同一条路，因此在桌面版和浏览器里都能工作。
+
+## 功能
+
+### MCP 服务器
+
+- 列出 Loader 当前真正在运行的 `mcp-*` 行（数据来自官方 `pluginManager` + `configEditor`，不再手工解析 `cordis.patch.yml`）。
+- 每行显示：标识、传输方式、地址（stdio 显示 command+args）、启用状态、fiber 阶段（运行中/加载中/等待中/加载失败）、以及该服务器提供给模型的工具数量与工具名。
+- 一键启用 / 停用（`pluginManager.setPluginEnabled`，即时生效，无需重启）。
+- **编辑配置**：以 JSON 编辑该行的完整配置（`configEditor.edit` 写回 profile 补丁层）。
+  密钥类字段（`authorization`、`token`、`*_key`、`secret`、`cookie` 等）**只以 `***` 回传**，
+  保存时占位符会从已存配置里还原原值 —— 令牌永远不会下发到浏览器，也不会因为一次编辑被清空。
+
+### 技能库
+
+- 列出技能注册表提供的全部技能（`ctx.get('skills').list()`）：名称、描述、来源（project-dsh / user-dsh / bundled / runtime …）、提供方、模型可调用 / 用户可调用。
+- **查看**技能全文（`skills.get()`，含正文）。
+- 切换**模型可调用**：注册表本身是 invocation-neutral 的，所以开关直接改写该技能 `SKILL.md` 的
+  frontmatter 中的 `disable-model-invocation`（行级改写，不引入 YAML 依赖）。
+  没有本地文件（例如 bundled / 远程技能）的条目会显示提示且不给开关。
+
+## 安装
+
+```bash
+cd ~/.dsh/profiles/desktop
+pnpm add link:<本目录> --config.auto-install-peers=false
+```
+
+或走官方 CLI（会同时把 bundle 登记进 `dsh.profile.bundles`）：
+
+```bash
+dsh plugin --profile desktop add link:D:/Backup/Documents/deepseek-harness/default-workspace/dsh-mcp-skills
+```
+
+装完**重启一次 DSH**：宿主端的路由是在启动时组合的。
+
+## 路由
+
+宿主端在认证过的 `/api` 通道上注册 5 条精确路由：
+
+| 路由 | 方法 | 作用 |
+| --- | --- | --- |
+| `/api/mcpskills.status` | GET | 页面全部数据（MCP 行 + 技能列表） |
+| `/api/mcpskills.mcp.toggle` | POST | `{ entryId \| patchId, enabled }` 启用/停用 MCP 行 |
+| `/api/mcpskills.mcp.config` | GET / POST | 读（已脱敏）/ 写某一行的配置 |
+| `/api/mcpskills.skill` | GET | `?name=` 取技能全文 |
+| `/api/mcpskills.skill.toggle` | POST | `{ path, modelInvocable }` 改写 SKILL.md frontmatter |
+
+## 说明
+
+- 只读 + 精确写：本插件不解析、不改写 `cordis.patch.yml`，所有写操作都交给官方服务。
+- 数据不出本机：只读本机配置文件与技能文件，无任何网络请求。
+- `lib/client.js` 是手写的 DSH client bundle（`window.__ModuleLoader__.load`），
+  React 从模块表取得，UI 用 `createElement` 构建，改完不需要构建步骤。

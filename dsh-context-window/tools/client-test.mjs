@@ -1,0 +1,438 @@
+// Offline tests for the context-window client bundle: no browser, no React, no
+// network. The bundle is loaded through a stubbed module loader; every panel
+// component is a plain function returning createElement trees, so a tiny shim is
+// enough to render one and assert on the resulting tree.
+// usage: node tools/client-test.mjs
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const clientPath = join(here, '..', 'lib', 'client.js');
+
+let passed = 0;
+const failures = [];
+const check = (name, fn) => {
+  try {
+    fn();
+    passed += 1;
+    console.log(`  ok  ${name}`);
+  } catch (error) {
+    failures.push(`${name}: ${error.message}`);
+    console.log(`FAIL  ${name}\n      ${error.message}`);
+  }
+};
+
+// --- a minimal React stand-in: createElement plus the hooks the panel uses.
+const flatten = (children) => children.flat(Infinity).filter((child) => child !== null && child !== undefined && child !== false);
+const createElement = (type, props, ...children) => ({ type, props: props ?? {}, children: flatten(children) });
+const reactShim = {
+  createElement,
+  useState: (initial) => [initial, () => {}],
+  useRef: () => ({ current: null }),
+  useEffect: () => {},
+};
+const reactDomShim = {
+  createPortal: (node) => ({ type: 'portal', props: {}, children: [node] }),
+};
+
+// --- a minimal document stand-in, to observe the stylesheet injection.
+const injected = [];
+globalThis.document = {
+  querySelector: () => null,
+  createElement: () => ({ dataset: {}, textContent: '' }),
+  head: { appendChild: (tag) => injected.push(tag) },
+  addEventListener: () => {},
+  removeEventListener: () => {},
+  body: {},
+};
+
+// --- load the bundle through the real DSH entry point.
+let entry;
+globalThis.window = { __ModuleLoader__: { load: (loaded) => { entry = loaded; } } };
+await import(`${pathToFileURL(clientPath).href}?test=${String(Date.now())}`);
+const mod = entry.factory((name) => {
+  if (name === 'react') return reactShim;
+  if (name === 'react-dom') return reactDomShim;
+  throw new Error(`unexpected module: ${name}`);
+});
+const zhT = (key) => mod.dicts.zh[key];
+
+/** Expand a tree, resolving function components, into one flat element list. */
+const flat = (node) => {
+  if (node === null || typeof node !== 'object') return [];
+  const resolved = typeof node.type === 'function' ? node.type(node.props) : node;
+  if (resolved === null || typeof resolved !== 'object') return [];
+  return [resolved, ...resolved.children.flatMap(flat)];
+};
+
+/** Every string under one element, in tree order. */
+const texts = (node) => flat(node).flatMap((element) => element.children.filter((child) => typeof child === 'string'));
+const textOf = (node) => texts(node).join('|');
+/** Elements carrying `className`, in tree order. */
+const allByClass = (node, className) => flat(node).filter((element) => element.props.className === className);
+const byClass = (node, className) => allByClass(node, className)[0];
+/** Elements whose className contains `part` (rows carry a base plus a modifier). */
+const byClassPart = (node, part) => flat(node).filter((element) => (element.props.className ?? '').includes(part));
+
+console.log('context-window client bundle');
+
+check('bundle registers its id', () => assert.equal(entry.id, 'dsh-context-window'));
+check('exports the cordis plugin face', () => {
+  assert.equal(mod.name, 'dsh-context-window');
+  assert.deepEqual(mod.inject, ['slots', 'locale']);
+  assert.equal(typeof mod.apply, 'function');
+});
+check('reads its classification from one loopback route', () => {
+  assert.equal(mod.DETAIL_ROUTE, 'api/context-window.detail');
+});
+check('injects its own stylesheet once', () => {
+  assert.equal(injected.length, 1);
+  assert.equal(injected[0].dataset.plugin, 'dsh-context-window');
+  for (const rule of ['.dcw-root{', '.dcw-trigger{', '.dcw-track{', '.dcw-fill{', '.dcw-panel{', '.dcw-bar{', '.dcw-items{', '.dcw-disclosure{']) {
+    assert.ok(injected[0].textContent.includes(rule), `stylesheet is missing ${rule}`);
+  }
+});
+check('the chevron ink is centred in its own viewBox', () => {
+  const panel = mod.ContextPanel({ ...panelProps, expanded: true, openRow: null });
+  const path = flat(panel).find((element) => element.type === 'path' && String(element.props.d ?? '').startsWith('M'));
+  const numbers = String(path.props.d).match(/-?\d+(?:\.\d+)?/g).map(Number);
+  const half = Number(path.props.strokeWidth) / 2;
+  const [x1, , x2] = numbers; // M x1 3.4  10.3 8  l-4.6 4.6
+  assert.equal((x1 - half + x2 + half) / 2, 8, 'the triangle ink must be centred on the 16-unit viewBox');
+});
+check('the nested disclosure chevron matches the top-level one', () => {
+  const css = injected[0].textContent;
+  assert.ok(css.includes('.dcw-item-button{') && css.includes('padding:0;align-items:center}'), 'nested rows must centre their chevron');
+  assert.ok(css.includes('.dcw-item-button .dcw-chevron svg{width:12px;height:12px}'), 'nested chevrons must be 12px like the top level');
+  assert.ok(!css.includes('.dcw-item-button .dcw-chevron{'), 'the nested chevron must not carry its own offset: it centres on the line box like the top level');
+});
+check('nested blocks stay close to their parent row', () => {
+  const css = injected[0].textContent;
+  assert.ok(css.includes('margin:1px 0 4px 12px'), 'the nested block indent must stay tight');
+  assert.ok(css.includes('.dcw-item{display:flex;align-items:baseline;gap:6px;'), 'the nested row gap must match the top-level disclosure');
+});
+check('rewrites its stylesheet on every module load', () => {
+  const source = readFileSync(clientPath, 'utf8');
+  assert.match(source, /tag\.textContent !== CSS/, 'CSS must be refreshed so an HMR reload cannot keep stale styles');
+});
+check('the popover keeps the shipped panel width', () => {
+  assert.ok(injected[0].textContent.includes('width:min(264px,100vw - 24px)'), 'the popover should stay at the shipped 264px width');
+});
+
+console.log('pure helpers');
+
+check('fill interpolates placeholders', () => {
+  assert.equal(mod.fill('上下文已用 {percent}', { percent: '31%' }), '上下文已用 31%');
+  assert.equal(mod.fill('{a} and {missing}', { a: 'x' }), 'x and {missing}');
+});
+
+check('formatCompact matches the design spelling', () => {
+  assert.equal(mod.formatCompact(49), '49');
+  assert.equal(mod.formatCompact(21500), '21.5k');
+  assert.equal(mod.formatCompact(224700), '224.7k');
+  assert.equal(mod.formatCompact(1000000), '1M');
+  assert.equal(mod.formatCompact(0), '0');
+  assert.equal(mod.formatCompact(Number.NaN), '0');
+});
+
+check('formatPercent keeps one decimal and rounds halves away from zero', () => {
+  assert.equal(mod.formatPercent(0.226), '22.6%');
+  assert.equal(mod.formatPercent(0.0215), '2.2%');
+  assert.equal(mod.formatPercent(0), '0.0%');
+});
+
+check('occupancyOf needs numerator and capacity', () => {
+  assert.equal(mod.occupancyOf(undefined), null);
+  assert.equal(mod.occupancyOf({ pressureTokens: 10 }), null);
+  assert.deepEqual(mod.occupancyOf({ projectedTokens: 306100, contextWindow: 1000000 }), {
+    used: 306100,
+    window: 1000000,
+    percent: 31,
+    share: 0.3061,
+  });
+});
+
+check('distribute never invents or loses a token', () => {
+  assert.deepEqual(mod.distribute(100, [1, 1]), [50, 50]);
+  assert.deepEqual(mod.distribute(10, [1, 1, 1]), [4, 3, 3]);
+  assert.equal(mod.distribute(19414, [12513, 6906]).reduce((a, b) => a + b, 0), 19414);
+  assert.deepEqual(mod.distribute(0, [5, 5]), [0, 0]);
+  assert.deepEqual(mod.distribute(100, [0, 0]), [0, 0]);
+});
+
+check('allocate never invents or loses a token', () => {
+  assert.deepEqual(mod.allocate(100, [1, 1]), [50, 50]);
+  assert.equal(mod.allocate(19414, [12513, 6906]).reduce((a, b) => a + b, 0), 19414);
+  assert.deepEqual(mod.allocate(0, [5, 5]), [0, 0]);
+  assert.deepEqual(mod.allocate(100, [0, 0]), [0, 0]);
+});
+
+const capacity = 1000000;
+const breakdown = { messageTokens: 225600, toolsTokens: 19414, systemTokens: 17700 };
+
+console.log('composition without a classification');
+
+const plain = mod.compositionOf(breakdown, capacity, null);
+check('falls back to the official three buckets plus free space', () => {
+  assert.deepEqual(plain.rows.map((row) => row.key), ['messages', 'tools', 'system']);
+  assert.equal(plain.classified, false);
+  assert.equal(plain.free, capacity - 225600 - 19414 - 17700);
+});
+check('tolerates a missing breakdown', () => {
+  const empty = mod.compositionOf(undefined, capacity, null);
+  assert.deepEqual(empty.rows, []);
+  assert.equal(empty.free, capacity);
+});
+
+console.log('composition with a classification');
+
+const detail = {
+  tools: {
+    total: 19414,
+    mcp: {
+      count: 46,
+      tokens: 12513,
+      servers: [
+        {
+          server: 'github',
+          count: 44,
+          tokens: 12000,
+          items: [
+            { name: 'mcp__github__issue_write', rawName: 'issue_write', server: 'github', tokens: 917 },
+            { name: 'mcp__github__list_issues', rawName: 'list_issues', server: 'github', tokens: 593 },
+          ],
+        },
+        {
+          server: 'fs',
+          count: 1,
+          tokens: 513,
+          items: [{ name: 'mcp__fs__read', rawName: 'read', server: 'fs', tokens: 300 }],
+        },
+      ],
+      items: [
+        { name: 'mcp__github__issue_write', rawName: 'issue_write', server: 'github', tokens: 917 },
+        { name: 'mcp__github__list_issues', rawName: 'list_issues', server: 'github', tokens: 593 },
+      ],
+    },
+    system: {
+      count: 33,
+      tokens: 6906,
+      items: [{ name: 'pwsh', tokens: 864 }, { name: 'workflow', tokens: 852 }],
+    },
+  },
+  skills: {
+    count: 3,
+    tokens: 900,
+    tool: { name: 'skill', tokens: 88 },
+    items: [{ name: 'pelican', tokens: 300 }, { name: 'svg', tokens: 250 }],
+  },
+};
+
+const classified = mod.compositionOf(breakdown, capacity, detail);
+const valueOf = (key) => classified.rows.find((row) => row.key === key)?.value;
+
+check('rows follow the design order', () => {
+  assert.deepEqual(classified.rows.map((row) => row.key), ['messages', 'mcp', 'systemTools', 'system', 'skills']);
+  assert.equal(classified.classified, true);
+});
+check('the tool split adds up to the official tools bucket', () => {
+  assert.equal(valueOf('mcp') + valueOf('systemTools'), breakdown.toolsTokens);
+  assert.ok(valueOf('mcp') > valueOf('systemTools'));
+});
+check('the skill catalog moves out of the message bucket', () => {
+  assert.equal(valueOf('messages') + valueOf('skills'), breakdown.messageTokens);
+  assert.equal(valueOf('skills'), 900);
+});
+check('counts come from the classification', () => {
+  assert.equal(classified.rows.find((row) => row.key === 'mcp').count, 46);
+  assert.equal(classified.rows.find((row) => row.key === 'systemTools').count, 33);
+  assert.equal(classified.rows.find((row) => row.key === 'skills').count, 3);
+});
+check('server rows carry the MCP total', () => {
+  const mcp = classified.rows.find((row) => row.key === 'mcp');
+  assert.deepEqual(mcp.servers.map((row) => row.server), ['github', 'fs']);
+  assert.equal(mcp.servers.reduce((sum, row) => sum + row.tokens, 0), mcp.value);
+  assert.deepEqual(mcp.servers[0].items.map((item) => item.rawName), ['issue_write', 'list_issues']);
+});
+check('a complete tool list is normalized onto its server; a capped one keeps its own prices', () => {
+  const [github, fs] = classified.rows.find((row) => row.key === 'mcp').servers;
+  assert.equal(github.items.reduce((sum, item) => sum + item.tokens, 0), 917 + 593);
+  assert.equal(fs.items.length, 1);
+  assert.equal(fs.items[0].tokens, fs.tokens);
+});
+check('the skills row points at the skill tool it does not count', () => {
+  assert.equal(classified.rows.find((row) => row.key === 'skills').noteTokens, 88);
+});
+check('rows plus free space cover the whole window', () => {
+  const known = classified.rows.reduce((total, row) => total + row.value, 0);
+  assert.equal(known + classified.free, capacity);
+  assert.equal(known, breakdown.messageTokens + breakdown.toolsTokens + breakdown.systemTokens);
+});
+check('a session without skills keeps the message bucket whole', () => {
+  const withoutSkills = mod.compositionOf(breakdown, capacity, { tools: detail.tools, skills: null });
+  assert.equal(withoutSkills.rows.find((row) => row.key === 'messages').value, breakdown.messageTokens);
+  assert.equal(withoutSkills.rows.some((row) => row.key === 'skills'), false);
+});
+
+console.log('trigger: the ring stays the ring');
+
+const pressure = { projectedTokens: 306100, contextWindow: capacity };
+const projection = (key) => ({ contextPressure: pressure, contextBreakdown: breakdown })[key];
+const seat = mod.ContextMeter({ t: zhT, useProjection: projection, sessionId: 'session-1' });
+
+check('renders the occupancy ring with the shipped geometry', () => {
+  const ring = flat(seat).find((element) => element.type === 'svg');
+  assert.equal(ring.props.viewBox, '0 0 14 14');
+  assert.equal(ring.props.width, '14');
+  const circles = ring.children;
+  assert.equal(circles.length, 2);
+  assert.equal(circles[0].props.className, 'dcw-track');
+  assert.equal(circles[1].props.className, 'dcw-fill');
+  assert.equal(circles[1].props.transform, 'rotate(-90 7 7)');
+  assert.equal(circles[1].props.strokeDasharray, `${String((mod.CIRCUMFERENCE * 31) / 100)} ${String(mod.CIRCUMFERENCE)}`);
+});
+check('keeps the percentage reading and the hover tooltip', () => {
+  const trigger = byClass(seat, 'dcw-trigger');
+  assert.equal(trigger.props['aria-haspopup'], 'dialog');
+  assert.equal(trigger.props['aria-expanded'], false);
+  assert.equal(trigger.props['aria-label'], '上下文已用 31%');
+  assert.deepEqual(texts(trigger), ['31%']);
+  assert.equal(byClass(seat, 'dcw-tip').children[0], '上下文已用 31%');
+});
+check('opens no popover until it is clicked', () => {
+  assert.equal(byClass(seat, 'dcw-panel'), undefined);
+  assert.equal(flat(seat).find((element) => element.type === 'portal'), undefined);
+});
+check('renders nothing without occupancy', () => {
+  assert.equal(mod.ContextMeter({ t: zhT, useProjection: () => undefined }), null);
+  assert.equal(mod.ContextMeter({ t: zhT }), null);
+});
+
+console.log('popover');
+
+const panelProps = {
+  occupancy: mod.occupancyOf(pressure),
+  rows: classified.rows,
+  free: classified.free,
+  freeShare: classified.freeShare,
+  onToggle: () => {},
+  onToggleRow: () => {},
+  openItem: null,
+  onToggleItem: () => {},
+  t: zhT,
+  panelRef: { current: null },
+  style: { left: 10, top: 20 },
+};
+
+const compact = mod.ContextPanel({ ...panelProps, expanded: false, openRow: null });
+check('compact popover: header figures and the whole-window bar', () => {
+  assert.equal(byClass(compact, 'dcw-title').children[0], '上下文窗口');
+  assert.equal(byClass(compact, 'dcw-figures').children[0], '306.1k / 1M (31%)');
+  assert.equal(byClass(compact, 'dcw-header').props['aria-expanded'], false);
+  assert.equal(byClass(compact, 'dcw-rows'), undefined);
+});
+check('bar segments are window shares plus the empty remainder', () => {
+  const bar = byClass(compact, 'dcw-bar');
+  assert.equal(bar.children.length, classified.rows.length + 1);
+  const coloured = bar.children.slice(0, -1).reduce((sum, segment) => sum + Number.parseFloat(segment.props.style.width), 0);
+  assert.ok(Math.abs(coloured - (1 - classified.freeShare) * 100) < 0.001);
+  assert.equal(bar.children[bar.children.length - 1].props.className, 'dcw-rest');
+});
+
+const expanded = mod.ContextPanel({ ...panelProps, expanded: true, openRow: null });
+check('expanded popover lists every bucket in design order', () => {
+  const rows = allByClass(expanded, 'dcw-row');
+  assert.deepEqual(rows.map((row) => texts(row)[0]), ['对话消息', 'MCP 工具', '系统工具', '系统提示词', '技能', '剩余空间']);
+});
+check('classified rows show their count, plain rows do not', () => {
+  const rows = allByClass(expanded, 'dcw-row');
+  assert.equal(textOf(rows[1]), 'MCP 工具|~12.5k|1.3%|46');
+  assert.equal(textOf(rows[2]).endsWith('|33'), true);
+  assert.equal(textOf(rows[4]).endsWith('|3'), true);
+  assert.equal(textOf(rows[0]).split('|').length, 3);
+  assert.equal(textOf(rows[5]).split('|').length, 3);
+});
+check('classified rows are disclosures; plain rows are not', () => {
+  const disclosures = allByClass(expanded, 'dcw-disclosure');
+  assert.equal(disclosures.length, 3);
+  assert.deepEqual(disclosures.map((button) => button.props['aria-expanded']), [false, false, false]);
+});
+check('rows plus free space still cover the window', () => {
+  const values = allByClass(expanded, 'dcw-row').map((row) => texts(row)[1]);
+  assert.deepEqual(values, ['~224.7k', '~12.5k', '~6.9k', '~17.7k', '~900', '~737.3k']);
+});
+
+const withMcpOpen = mod.ContextPanel({ ...panelProps, expanded: true, openRow: 'mcp' });
+check('the MCP row discloses its servers first', () => {
+  const servers = byClassPart(withMcpOpen, 'dcw-item-button');
+  assert.deepEqual(servers.map((server) => texts(server).join('|')), ['github|44|~12k', 'fs|1|~513']);
+  assert.equal(allByClass(withMcpOpen, 'dcw-disclosure')[0].props['aria-expanded'], true);
+  assert.deepEqual(servers.map((server) => server.props['aria-expanded']), [false, false]);
+  assert.equal(allByClass(withMcpOpen, 'dcw-subitems').length, 0);
+});
+const withServerOpen = mod.ContextPanel({ ...panelProps, expanded: true, openRow: 'mcp', openItem: 'server:github' });
+check('a server then discloses its own tools at the second level', () => {
+  assert.equal(allByClass(withServerOpen, 'dcw-subitems').length, 1);
+  const tools = allByClass(withServerOpen, 'dcw-item').map((item) => texts(item).join('|'));
+  assert.deepEqual(tools, ['issue_write|~917', 'list_issues|~593']);
+  assert.deepEqual(byClassPart(withServerOpen, 'dcw-item-button').map((server) => server.props['aria-expanded']), [true, false]);
+});
+check('only the opened server expands', () => {
+  assert.equal(allByClass(withMcpOpen, 'dcw-items').length, 1);
+});
+check('the skills row notes the skill tool it does not count', () => {
+  const skillsOpen = mod.ContextPanel({ ...panelProps, expanded: true, openRow: 'skills' });
+  assert.equal(allByClass(skillsOpen, 'dcw-more').at(-1).children[0], 'skill 工具本身 ~88 · 计入系统工具');
+});
+check('english dictionaries mirror the design labels', () => {
+  const english = mod.ContextPanel({ ...panelProps, expanded: true, openRow: null, t: (key) => mod.dicts.en[key] });
+  const labels = allByClass(english, 'dcw-row').map((row) => texts(row)[0]);
+  assert.deepEqual(labels, ['Messages', 'MCP tools', 'System tools', 'System prompt', 'Skills', 'Free space']);
+  assert.equal(byClass(english, 'dcw-title').children[0], 'Context window');
+});
+
+console.log('slot registration');
+
+check('registers one occupant in the composer dock and forwards the session id', () => {
+  const registered = [];
+  let injectedName;
+  const ctx = {
+    get: (name) => {
+      if (name === 'slots') {
+        return {
+          inject: (name_, register) => { injectedName = name_; registered.push(register()); },
+          register: (definition, render) => ({ definition, render }),
+        };
+      }
+      if (name === 'locale') return { bind: () => zhT, register: () => () => {} };
+      return undefined;
+    },
+    effect: (fn) => { fn(); },
+  };
+  mod.apply(ctx);
+  assert.equal(injectedName, 'conversation.composer.dock');
+  assert.equal(registered.length, 1);
+  assert.equal(registered[0].definition.id, 'context-window');
+  assert.equal(registered[0].definition.locale, mod.NS);
+  const rendered = registered[0].render({ t: zhT, useProjection: projection, sessionId: 'session-9' });
+  assert.equal(rendered.props.sessionId, 'session-9');
+});
+
+check('apply tolerates a missing slot service', () => {
+  assert.doesNotThrow(() => { mod.apply({ get: () => undefined, effect: () => {} }); });
+});
+
+check('the bundle file stays plain JavaScript at the real entry point', () => {
+  const source = readFileSync(clientPath, 'utf8');
+  assert.match(source, /window\.__ModuleLoader__\.load\(\{/);
+  assert.doesNotMatch(source, /^\s*import\s/m);
+  assert.doesNotMatch(source, /^\s*export\s/m);
+});
+
+console.log(`\n${String(passed)} passed, ${String(failures.length)} failed`);
+if (failures.length > 0) {
+  console.log(failures.join('\n'));
+  process.exit(1);
+}

@@ -1,0 +1,12 @@
+# 依赖
+node_modules/
+
+# 从本机已安装 app.asar 抽出的只读参考源码（研究材料，非插件本体）
+refs/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
