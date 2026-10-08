@@ -7,6 +7,9 @@
 - **点标题行**：展开分项 — 对话消息 / MCP 工具 / 系统工具 / 系统提示词 / 技能 / 剩余空间
 - **点 MCP 工具**：先出**服务层**（`github 46 ~12.5k`），再点某个服务才展开它的**工具层**（`issue_write ~902` …）
 - **点系统工具 / 技能**：展开各自的逐项明细
+- **MCP 明细末尾**：一句「在「设置 → MCP 与技能」里停用某个服务，就能省下它这一份成本。」——这份成本是
+  真的，但只有那一页能真的把服务关掉；两页现在用**同一套计价公式**，所以这句话里的数字在两边一致
+  （`dsh-mcp-skills/tools/host-test.mjs` 逐输入断言两份 `estimate.js` 副本相等）
 
 | 圆环 | 弹层 | 展开分项 |
 | --- | --- | --- |
@@ -18,17 +21,21 @@
 
 上图为真实运行中的 DSH（`desktop` profile）截图，不是设计稿。
 
+## 0.4.1 输入用量缺失时的占用修复
+
+上游输入用量为 `0` 时，官方压力投影可能只剩采样后的新增消息，导致顶部显示 `1.4k` 而分项合计约 `64.4k`。此时圆环和顶部总数改用 `messageTokens + toolsTokens + systemTokens`，顶部显示 `~` 表示估算；缺少输入采样时也采用这一回退。有有效的非零输入/缓存压力时仍使用官方压力投影。
+
 ## 每一行的数据来源
 
 | 行 | 来源 | 精确性 |
 | --- | --- | --- |
-| `572.4k / 1M (57%)` | 官方 `contextPressure` 投影（供应商上报占用 + 路由窗口容量） | 精确 |
-| 对话消息 | 官方 `contextBreakdown.messageTokens` **减去**技能目录那一条消息 | 精确 |
+| `572.4k / 1M (57%)` | 有非零输入采样时取官方 `contextPressure`；缺失或为零时取分项估算总和并显示 `~` | 上游采样或估算 |
+| 对话消息 | 官方 `contextBreakdown.messageTokens` **减去**技能目录那一条消息 | 启发式估算 |
 | MCP 工具 `46` | 最新 `request/header` 里名字为 `mcp__<server>__<tool>` 的工具（dsh-mcp-client 的命名约定），按服务分组 | 分类精确 |
 | 系统工具 `33` | 同一批工具里其余的 | 分类精确 |
-| 系统提示词 | 官方 `contextBreakdown.systemTokens` | 精确 |
+| 系统提示词 | 官方 `contextBreakdown.systemTokens` | 启发式估算 |
 | 技能 `4` | DSH 自己注入的那条 `user/message`（`source.kind = 'skill-catalog'`，带 `entries`）；行内还会标注 `skill 工具本身 ~88 · 计入系统工具` | 精确 |
-| 剩余空间 | 窗口 − 上面三项官方桶之和 | 精确 |
+| 剩余空间 | 窗口 − 上面三项官方估算桶之和 | 启发式估算 |
 
 拆分**逐层归一化**到官方总数：`MCP + 系统工具 = 工具定义`、各服务之和 = MCP 行、
 `对话消息 + 技能 = 消息`。（某个服务的工具清单被截断时，可见工具保留各自真实单价，
@@ -73,7 +80,7 @@ plugin_manager install_bundle  target = "D:\Backup\Documents\deepseek-harness\de
 | 项目 | 结果 |
 | --- | --- |
 | `node tools/host-test.mjs` | **25/25**：MCP 命名解析、工具拆分与逐项计价、**按服务分组且每组带自己的工具清单**、技能目录识别、skill 工具自身价格、会话折叠、计价副本公式 |
-| `node tools/client-test.mjs` | **40/40**：bundle 入口/导出/样式、数值格式化、`distribute` 最大余额法不增不减、**服务层/工具层两级归一化**、有/无分类两种构成、两级展开与按键语义、技能行对 skill 工具的标注、槽位注册 |
+| `node tools/client-test.mjs` | **44/44**：bundle 入口/导出/样式、数值格式化、`distribute` 最大余额法不增不减、**服务层/工具层两级归一化**、有/无分类两种构成、两级展开与按键语义、技能行对 skill 工具的标注、**MCP 明细末尾的管理提示（且只出现在 MCP 行）**、槽位注册 |
 | 实机（真实会话） | 五行：`对话消息 ~466.2k 46.6%`、`MCP 工具 ~12.5k 1.3% 46`、`系统工具 ~6.9k 0.7% 33`、`系统提示词 ~2k 0.2%`、`剩余空间 ~512.3k 51.2%`；点 MCP 出 `github 46 ~12.5k`；再点出 46 个工具逐项（`issue_write ~902`、`pull_request_read ~637` …）；控制台零错误 |
 | 实机（宿主路由） | `tools.total=19414`、`mcp=46/12513`、`server github: count=46 tokens=12724 items=46`；`skills: count=4 tokens=556 skillTool=88`（另一会话，含真实技能目录） |
 | 技能行 | 行内提示 `skill 工具本身 ~88 · 计入系统工具`（`skill` 工具的 schema 一直算在系统工具的 6906 tok 里） |

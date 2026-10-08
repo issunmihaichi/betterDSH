@@ -20,6 +20,8 @@ Error: cannot get property "webServer" without inject
 
 - 列出 Loader 当前真正在运行的 `mcp-*` 行（数据来自官方 `pluginManager` + `configEditor`，不再手工解析 `cordis.patch.yml`）。
 - 每行显示：标识、传输方式、地址（stdio 显示 command+args）、启用状态、fiber 阶段（运行中/加载中/等待中/加载失败）、以及该服务器提供给模型的工具数量与工具名。
+- **上下文成本**：每行还显示这些工具 schema 在模型上下文里的启发式开销（`~3.2k tok`，汇总行给合计）。计价用的是与「上下文窗口」圆环弹层**同一套公式**（`lib/estimate.js`，两份副本由 `tools/host-test.mjs` 逐输入断言相等），所以两个页面上的同一个服务是同一个数字。
+- **归属标注**：由别的 bundle 写入的行（今天只有 `github-mcp` → `dsh-github`）会带一个「由 dsh-github 写入」徽标；编辑这种行时保存要**再点一次**（按钮先变成「确认覆盖并保存」），因为一次保存会整体替换那个插件写下的 config。
 - 一键启用 / 停用（`pluginManager.setPluginEnabled`，即时生效，无需重启）。
 - **编辑配置**：以 JSON 编辑该行的完整配置（`configEditor.edit` 写回 profile 补丁层）。
   密钥类字段（`authorization`、`token`、`*_key`、`secret`、`cookie` 等）**只以 `***` 回传**，
@@ -54,9 +56,9 @@ dsh plugin --profile desktop add link:D:/Backup/Documents/deepseek-harness/defau
 
 | 路由 | 方法 | 作用 |
 | --- | --- | --- |
-| `/api/mcpskills.status` | GET | 页面全部数据（MCP 行 + 技能列表） |
+| `/api/mcpskills.status` | GET | 页面全部数据（MCP 行 + 技能列表）；每个 MCP 行含 `toolTokens`（上下文成本）与 `owner`（写入方或 null），`mcp.toolTokens` 是合计 |
 | `/api/mcpskills.mcp.toggle` | POST | `{ entryId \| patchId, enabled }` 启用/停用 MCP 行 |
-| `/api/mcpskills.mcp.config` | GET / POST | 读（已脱敏）/ 写某一行的配置 |
+| `/api/mcpskills.mcp.config` | GET / POST | 读（已脱敏，含 `ownedBy`）/ 写某一行的配置；写入时 `***` 占位符还原为已存值，保存前后端都会保留该行的密钥 |
 | `/api/mcpskills.skill` | GET | `?name=` 取技能全文 |
 | `/api/mcpskills.skill.toggle` | POST | `{ path, modelInvocable }` 改写 SKILL.md frontmatter |
 
@@ -66,3 +68,15 @@ dsh plugin --profile desktop add link:D:/Backup/Documents/deepseek-harness/defau
 - 数据不出本机：只读本机配置文件与技能文件，无任何网络请求。
 - `lib/client.js` 是手写的 DSH client bundle（`window.__ModuleLoader__.load`），
   React 从模块表取得，UI 用 `createElement` 构建，改完不需要构建步骤。
+- `lib/estimate.js` 是 DSH 自身计价公式的同值副本（出处 `@deepseek-ai/dsh-token-meter/estimate`，
+  经 `dsh-context-window/lib/estimate.js`）。宿主插件不能按裸包名 import DSH 内部包，本插件也不
+  import 兄弟插件，所以改用**副本 + 断言**：`tools/host-test.mjs` 同时 import 两份副本，逐输入比对
+  并钉死黄金值，任一份漂移都会红。
+- 归属映射 `ROW_OWNERS` 是一张静态表（`github-mcp → dsh-github`）。这是有意的：既然本插件坚持
+  不解析补丁文件，就不能从补丁里推断归属；新增归属改这张表。
+- 测试：`npm test`（= `node tools/host-test.mjs && node tools/client-test.mjs`），零网络、零浏览器、
+  不需要 DSH 在运行。
+- `node tools/live-probe.mjs`：只读探测**正在运行**的宿主路由，专门用来区分「客户端已更新」和
+  「宿主还需重启」——重启前后各跑一次，`toolTokens` / `owner` / `ownedBy` 会从 false 变成 true
+  （顺带看一眼 `dsh-github` 的 `repos[].workspaceId`，那是同一个重启检查的另一个半边）。
+  它只访问本机 loopback 且不打印任何密钥。

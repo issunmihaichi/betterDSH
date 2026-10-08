@@ -15,6 +15,21 @@
  *                model-invocation toggle rewrites the skill's own frontmatter
  *                flag, because the registry is invocation-neutral by design.
  *
+ *   Token cost    every MCP row also carries what its tool schemas cost in the
+ *                model's context (`toolTokens`), priced with the same formulas
+ *                the context-window panel uses (`./estimate.js`, kept equal by
+ *                `tools/estimate-parity-test.mjs`). The number is a heuristic —
+ *                it is the panel's `~` arithmetic, not a provider's billing
+ *                token count.
+ *
+ *   Ownership     `ROW_OWNERS` names the rows another bundle owns. A row written
+ *                by a sibling plugin (today: `github-mcp`, owned by dsh-github)
+ *                is labelled in the page and needs an explicit second click
+ *                before its config is saved, because that row's config is the
+ *                other plugin's write target. This is a static map on purpose:
+ *                the point of this plugin is that it never parses
+ *                cordis.patch.yml by hand.
+ *
  * Everything is served as exact Fetch routes on the authenticated `/api`
  * channel (`ctx.connection.fetch.register`). That is deliberate: a private RPC
  * channel registered with `connection.rpc.handle()` mounts its route through the
@@ -27,12 +42,24 @@
  * config, so a token can be edited around but never read back.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
+import { estimateToolsTokens } from './estimate.js';
 
 /** Cordis plugin name; must equal the package name the profile loads. */
 export const name = 'dsh-mcp-skills';
 
 /** `connection` owns the authenticated `/api` channel these routes hang on. */
 export const inject = ['connection'];
+
+/**
+ * Rows another bundle owns and writes.
+ *
+ * The page still lists them (they are real, running rows) but labels them and
+ * asks for a second confirmation before saving, so a config this plugin did not
+ * author is never overwritten by one stray click.
+ */
+export const ROW_OWNERS = {
+  'github-mcp': 'dsh-github',
+};
 
 /** Exact Fetch routes behind the Settings page. */
 export const ROUTES = {
@@ -133,6 +160,25 @@ export function describeEndpoint(config) {
 }
 
 /**
+ * What one tool schema costs in context, in the context panel's own arithmetic.
+ *
+ * Priced as a one-element list (`estimateToolsTokens([schema])`) rather than as
+ * a bare object, because that is the call the panel makes per tool — the array
+ * brackets are part of the estimate, so this is what makes the two numbers
+ * comparable instead of merely close.
+ *
+ * @param schema - one tool schema from the tools service.
+ * @returns heuristic tokens; 0 for a schema that cannot be serialized.
+ */
+export function toolTokensFor(schema) {
+  try {
+    return estimateToolsTokens([schema]);
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * The project directory a workspace-sensitive skill lookup should use.
  *
  * Only an explicit source counts: the profile row's `cwd` config, then
@@ -197,6 +243,7 @@ export function createMcpSkills(deps) {
   async function mcpRows(agent) {
     const configs = rowConfigs();
     const rows = [];
+    const schemas = toolSchemas(agent);
     for (const plugin of await listPlugins()) {
       const patchId = plugin?.patchId ?? plugin?.id;
       if (typeof patchId !== 'string') continue;
@@ -204,13 +251,13 @@ export function createMcpSkills(deps) {
       const config = found?.config ?? plugin?.config;
       if (!isMcpConfig(config)) continue;
       const prefix = 'mcp__' + config.serverName + '__';
-      const tools = toolSchemas(agent)
-        .filter((schema) => typeof schema?.name === 'string' && schema.name.startsWith(prefix))
-        .map((schema) => ({
-          name: schema.name.slice(prefix.length),
-          fullName: schema.name,
-          description: typeof schema.description === 'string' ? schema.description : '',
-        }));
+      const matched = schemas
+        .filter((schema) => typeof schema?.name === 'string' && schema.name.startsWith(prefix));
+      const tools = matched.map((schema) => ({
+        name: schema.name.slice(prefix.length),
+        fullName: schema.name,
+        description: typeof schema.description === 'string' ? schema.description : '',
+      }));
       rows.push({
         patchId,
         entryId: plugin?.entryId ?? found?.entry?.options?.id ?? null,
@@ -221,7 +268,13 @@ export function createMcpSkills(deps) {
         transport: typeof config.transport === 'string' ? config.transport : '(默认)',
         endpoint: describeEndpoint(config),
         toolCount: tools.length,
+        // One-element list per tool, exactly how the context panel prices one:
+        // `estimateToolsTokens([tool])`. Summing these reproduces that panel's
+        // per-server number without importing its module.
+        toolTokens: matched.reduce((sum, schema) => sum + toolTokensFor(schema), 0),
         tools,
+        // Another bundle's write target, or null for a row this profile owns.
+        owner: typeof ROW_OWNERS[patchId] === 'string' ? ROW_OWNERS[patchId] : null,
         editable: found?.entry !== undefined,
       });
     }
@@ -326,6 +379,9 @@ export function createMcpSkills(deps) {
         enabled: rows.filter((row) => row.enabled).length,
         disabled: rows.filter((row) => !row.enabled).length,
         toolTotal: rows.reduce((sum, row) => sum + row.toolCount, 0),
+        // What every enabled MCP server's tool schemas cost together, in the
+        // same heuristic the context panel uses.
+        toolTokens: rows.reduce((sum, row) => sum + row.toolTokens, 0),
       },
       skills: {
         items: skills.items,
@@ -383,8 +439,9 @@ export function createMcpSkills(deps) {
         }
         const entry = found.entry;
         const current = found.config ?? {};
+        const ownedBy = typeof ROW_OWNERS[patchId] === 'string' ? ROW_OWNERS[patchId] : null;
         if (request.method !== 'POST') {
-          return json({ ok: true, patchId, redacted: true, config: redactSecrets(current), text: JSON.stringify(redactSecrets(current), null, 2) });
+          return json({ ok: true, patchId, ownedBy, redacted: true, config: redactSecrets(current), text: JSON.stringify(redactSecrets(current), null, 2) });
         }
         const body = await readJson(request);
         let next;

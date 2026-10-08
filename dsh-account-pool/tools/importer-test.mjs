@@ -8,6 +8,7 @@
  *   node tools/importer-test.mjs
  */
 import assert from 'node:assert/strict';
+import { buildGeminiRequest } from '../lib/native/gemini.js';
 
 import {
   decodeBundle,
@@ -16,6 +17,8 @@ import {
   extractAccounts,
   normalizePlatform,
   planImport,
+  planMetadataImport,
+  METADATA_FORMAT,
   slugifyId,
   toDraft,
   toInstant,
@@ -211,6 +214,23 @@ await check('toDraft: a CPA auth file becomes an account', () => {
   assert.equal(bundle.plan_type, undefined, 'CPA plan_type is metadata, not secret material');
 });
 
+await check('CPA Gemini token object imports into usable OAuth credentials', () => {
+  const fixture = { type: 'gemini', email: 'gemini@example.com', project_id: 'fixture-project',
+    token: { access_token: 'fixture-gemini-access', refresh_token: 'fixture-gemini-refresh', expiry: '2027-01-15T08:00:00Z', token_type: 'Bearer' } };
+  const plan = planImport(fixture);
+  assert.equal(plan.format, 'cpa');
+  assert.equal(plan.errors.length, 0);
+  assert.equal(plan.created.length, 1);
+  const { draft, credential } = plan.created[0];
+  assert.equal(draft.expiresAt, '2027-01-15T08:00:00.000Z');
+  assert.equal(JSON.parse(credential).refresh_token, 'fixture-gemini-refresh');
+  const request = buildGeminiRequest(draft, { model: 'gemini-2.5-flash', messages: [] }, credential);
+  assert.equal(request.init.headers.authorization, 'Bearer fixture-gemini-access');
+  assert.equal(JSON.parse(request.init.body).project, 'fixture-project');
+  assert.equal(planImport([fixture]).created.length, 1);
+  assert.equal(planImport({ ...fixture, token: { refresh_token: 'fixture-refresh-only' } }).created.length, 0);
+});
+
 await check('toDraft: rejected shapes explain themselves', () => {
   assert.match(toDraft({ type: 'unknown-vendor', access_token: 'x' }, {}).reason, /unsupported CPA type/);
   assert.match(toDraft({ type: 'codex', access_token: '   ' }, {}).reason, /empty access_token/);
@@ -270,6 +290,99 @@ await check('planImport: every created draft is schema-shaped (no host-only fiel
     assert.equal('status' in entry.draft, false);
     assert.equal('credentialRef' in entry.draft, false, 'the host derives the ref from the id');
   }
+});
+
+await check('sub2api: notes and load factor survive draft conversion', () => {
+  const converted = toDraft({ ...SUB2API.data.accounts[0], notes: 'operator note', load_factor: 9, schedulable: false });
+  assert.equal(converted.draft.notes, 'operator note');
+  assert.equal(converted.draft.loadFactor, 9);
+  assert.equal(converted.draft.schedulable, false);
+});
+
+const metadataFixture = () => ({
+  format: METADATA_FORMAT, version: 1,
+  accounts: [{ id: 'a1', platform: 'anthropic', notes: 'restore', groups: ['vip'], schedulable: true, credentialRef: 'PRIVATE_REF', credentials: { api_key: 'fixture-secret' }, baseUrl: 'https://private.invalid' }],
+  groups: [{ id: 'vip', label: 'VIP', selectionMode: 'weighted-random' }],
+  priorities: [{ accountId: 'a1', groupId: 'vip', priority: 8 }],
+});
+
+await check('metadata: plans paused accounts and related groups with no secret material', () => {
+  const plan = planMetadataImport(metadataFixture(), { now: new Date(T0).toISOString() });
+  assert.equal(detectFormat(metadataFixture()), METADATA_FORMAT);
+  assert.deepEqual(plan.created, ['a1']);
+  assert.deepEqual(plan.updated, []);
+  assert.equal(plan.accounts[0].schedulable, false);
+  assert.equal(plan.accounts[0].credentialRef, null);
+  assert.equal(plan.accounts[0].baseUrl, null);
+  assert.equal(plan.accounts[0].notes, 'restore');
+  assert.equal(plan.groups[0].selectionMode, 'weighted-random');
+  assert.equal(plan.priorities[0].priority, 8);
+  assert.equal(JSON.stringify(plan).includes('fixture-secret'), false);
+  assert.equal(JSON.stringify(plan).includes('PRIVATE_REF'), false);
+});
+
+await check('metadata: groups preserve disabled state and default old documents to enabled', () => {
+  const fixture = metadataFixture();
+  assert.equal(planMetadataImport(fixture, { now: new Date(T0).toISOString() }).groups[0].enabled, true);
+  fixture.groups[0].enabled = false;
+  assert.equal(planMetadataImport(fixture, { now: new Date(T0).toISOString() }).groups[0].enabled, false);
+  fixture.groups[0].enabled = 'false';
+  assert.throws(() => planMetadataImport(fixture, { now: new Date(T0).toISOString() }));
+});
+
+await check('metadata: existing accounts retain credentials connections health and error status', () => {
+  const initial = planMetadataImport(metadataFixture(), { now: new Date(T0).toISOString() }).accounts[0];
+  const current = { ...initial, credentialRef: 'KEEP_REF', baseUrl: 'https://keep.invalid', status: 'error', errorMessage: 'keep error', consecutiveFailures: 2, overloadUntil: new Date(T0 + 60000).toISOString() };
+  const plan = planMetadataImport(metadataFixture(), { accounts: [current], now: new Date(T0 + 1000).toISOString() });
+  assert.deepEqual(plan.created, []);
+  assert.deepEqual(plan.updated, ['a1']);
+  assert.equal(plan.accounts[0].credentialRef, 'KEEP_REF');
+  assert.equal(plan.accounts[0].baseUrl, 'https://keep.invalid');
+  assert.equal(plan.accounts[0].status, 'error');
+  assert.equal(plan.accounts[0].errorMessage, 'keep error');
+  assert.equal(plan.accounts[0].overloadUntil, current.overloadUntil);
+  assert.equal(plan.accounts[0].createdAt, initial.createdAt);
+});
+
+await check('metadata: invalid versions duplicates and dangling relations fail before writes', () => {
+  const cases = [
+    { ...metadataFixture(), version: 2 },
+    { ...metadataFixture(), accounts: [...metadataFixture().accounts, ...metadataFixture().accounts] },
+    { ...metadataFixture(), groups: [{ id: 'Bad Group' }] },
+    { ...metadataFixture(), groups: [] },
+    { ...metadataFixture(), priorities: [{ accountId: 'missing', groupId: 'vip', priority: 1 }] },
+    { ...metadataFixture(), priorities: [{ accountId: 'a1', groupId: 'missing', priority: 1 }] },
+  ];
+  for (const document of cases) assert.throws(() => planMetadataImport(document, { now: new Date(T0).toISOString() }));
+});
+
+await check('imports: sub2api and CPA migrate public project/account ids without secret fields in drafts', () => {
+  for (const raw of [
+    { platform: 'gemini', type: 'oauth', credentials: { access_token: 'fixture-secret', project_id: 'gcp-project' } },
+    { type: 'gemini', access_token: 'fixture-secret', project_id: 'gcp-project' },
+  ]) {
+    const result = toDraft(raw);
+    assert.equal(result.draft.projectId, 'gcp-project');
+    assert.equal(result.draft.chatgptAccountId, null);
+    assert.equal(JSON.stringify(result.draft).includes('fixture-secret'), false);
+  }
+  for (const raw of [
+    { platform: 'openai', type: 'oauth', credentials: { access_token: 'fixture-secret', chatgpt_account_id: 'workspace-id' } },
+    { type: 'codex', access_token: 'fixture-secret', account_id: 'workspace-id' },
+  ]) {
+    const result = toDraft(raw);
+    assert.equal(result.draft.chatgptAccountId, 'workspace-id');
+    assert.equal(result.draft.projectId, null);
+    assert.equal(JSON.stringify(result.draft).includes('fixture-secret'), false);
+  }
+});
+
+await check('metadata: restore accepts public project id but excludes ChatGPT workspace identity', () => {
+  const fixture = metadataFixture();
+  fixture.accounts[0] = { ...fixture.accounts[0], platform: 'gemini', projectId: 'gcp-project', chatgptAccountId: 'private-workspace' };
+  const plan = planMetadataImport(fixture, { now: new Date(T0).toISOString() });
+  assert.equal(plan.accounts[0].projectId, 'gcp-project');
+  assert.equal(plan.accounts[0].chatgptAccountId, null);
 });
 
 // ------------------------------------------------- report

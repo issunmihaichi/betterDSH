@@ -64,7 +64,15 @@ function makeCtx(sessionQuery) {
   return { ctx, state };
 }
 
-const at = (iso) => ms(iso);
+// Anchor fixture events to the current local day so this regression stays valid
+// after the original development date. Keep the old out-of-window event old.
+const at = (iso) => {
+  if (!iso.startsWith('2026-10-05')) return ms(iso);
+  const today = new Date();
+  const fixture = new Date(iso);
+  today.setHours(fixture.getHours(), fixture.getMinutes(), fixture.getSeconds(), 0);
+  return today.getTime();
+};
 const sessions = [
   {
     id: 'session-today',

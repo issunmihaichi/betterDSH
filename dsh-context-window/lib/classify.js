@@ -131,6 +131,30 @@ export function skillCatalog(events, options) {
  * @param options - `{ maxItems, priceTools, priceContent, roleOverhead, now }`.
  * @returns JSON-safe payload for the Browser half.
  */
+/**
+ * Reconcile one explicitly verified legacy sample without rewriting its log.
+ * Snapshots are recorded at deployment, after matching the sample to a pool
+ * ledger row whose protocol includes cache reads in its input total. Once a
+ * newer sample arrives, its sequence no longer matches and no correction applies.
+ */
+export function legacyUsageCorrection(events, sessionId, legacyInputUsage = {}) {
+  const snapshot = legacyInputUsage[String(sessionId)];
+  if (snapshot === undefined) return null;
+  const latest = [...(Array.isArray(events) ? events : [])].reverse().find(event => {
+    if (!['assistant/message', 'assistant/attempt'].includes(event?.type)) return false;
+    return event.data?.usage !== undefined || (Array.isArray(event.data?.stream) && event.data.stream.some(chunk => chunk?.type === 'usage'));
+  });
+  const usage = latest?.data?.usage ?? latest?.data?.stream?.findLast(chunk => chunk?.type === 'usage')?.usage;
+  if (latest?.seq !== snapshot.sampleSeq || usage?.inputTokens !== snapshot.inputTokens
+    || (usage?.cacheReadTokens ?? 0) !== snapshot.cacheReadTokens
+    || (usage?.cacheWriteTokens ?? 0) !== (snapshot.cacheWriteTokens ?? 0)) return null;
+  const input = usage.inputTokens;
+  const cached = usage.cacheReadTokens ?? 0;
+  const written = usage.cacheWriteTokens ?? 0;
+  if (![input, cached, written].every(value => Number.isSafeInteger(value) && value >= 0) || cached === 0 || cached > input || written !== 0) return null;
+  return { sampleSeq: latest.seq, pressureTokens: input + cached + written, duplicateCacheTokens: cached };
+}
+
 export function classifySession(events, sessionId, options) {
   const list = Array.isArray(events) ? events : [];
   const lastOf = (type) => {
@@ -150,6 +174,7 @@ export function classifySession(events, sessionId, options) {
     generatedAt: typeof options.now === 'number' ? options.now : Date.now(),
     contextWindow: context?.data?.contextWindow,
     headerSeq: header?.seq,
+    usageCorrection: legacyUsageCorrection(list, sessionId, options.legacyInputUsage),
     tools: splitTools(header?.data?.header?.tools, options),
     skills: catalog === null ? null : {
       ...catalog,

@@ -169,6 +169,9 @@ function world(options = {}) {
         calls.workspace.push({ path, title });
         return { id: 'ws-1' };
       },
+      // The read-only half the page's "open workspace" needs: it answers for a
+      // directory this world has already registered, and stays silent otherwise.
+      resolveByPath: async (path) => (calls.workspace.some((entry) => entry.path === path) ? { id: 'ws-1' } : undefined),
     },
     listClones: async () => repos,
   });
@@ -475,6 +478,28 @@ await check('a confirmed clone downloads and registers a workspace', async () =>
   assert.ok(job.log.some((line) => line.includes('Receiving objects')));
   assert.equal((await bodyOf(await github.handleRoute(ROUTES.clone, get(`http://x${ROUTES.clone}`)))).repos.length, 1);
   assert.equal(repos.length, 1);
+});
+
+await check('a downloaded clone is annotated with the workspace that owns it', async () => {
+  const { github, repos, calls } = world();
+  repos.push({
+    name: 'Hello-World',
+    path: 'C:\\fake\\repos\\Hello-World',
+    remote: 'https://github.com/octocat/Hello-World.git',
+    branch: 'main',
+  });
+
+  // No registration yet: the row carries the path and nothing to open.
+  const before = await bodyOf(await github.handleRoute(ROUTES.status, get(`http://x${ROUTES.status}`)));
+  assert.equal(before.repos.length, 1);
+  assert.equal('workspaceId' in before.repos[0], false);
+
+  // The registry now owns that directory, as it does after a real clone.
+  calls.workspace.push({ path: 'C:\\fake\\repos\\Hello-World', title: 'Hello-World' });
+  const after = await bodyOf(await github.handleRoute(ROUTES.status, get(`http://x${ROUTES.status}`)));
+  assert.equal(after.repos[0].workspaceId, 'ws-1');
+  assert.equal(after.repos[0].path, 'C:\\fake\\repos\\Hello-World');
+  assert.equal(after.repos[0].branch, 'main');
 });
 
 await check('a failing clone is reported, not registered', async () => {

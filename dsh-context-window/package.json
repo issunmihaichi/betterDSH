@@ -1,17 +1,17 @@
 {
   "name": "dsh-context-window",
-  "version": "0.4.0",
+  "version": "0.4.2",
   "private": true,
   "description": "输入框下方那个「白圈」点开后的弹层：官方占用投影 + 宿主分类（MCP 工具按服务两层展开 / 系统工具 / 技能）",
   "license": "MIT",
   "type": "module",
-  "main": "lib/host.v4.js",
+  "main": "lib/host.v5.js",
   "scripts": {
     "test": "node tools/host-test.mjs && node tools/client-test.mjs"
   },
   "exports": {
     ".": {
-      "default": "./lib/host.v4.js"
+      "default": "./lib/host.v5.js"
     },
     "./client": {
       "default": "./lib/client.js"
@@ -22,7 +22,7 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib/host.v4.js",
+    "lib/host.v5.js",
     "lib/classify.js",
     "lib/estimate.js",
     "lib/client.js",

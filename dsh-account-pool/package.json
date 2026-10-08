@@ -1,17 +1,27 @@
 {
   "name": "dsh-account-pool",
-  "version": "0.1.0",
+  "version": "0.4.8",
   "private": true,
   "description": "DSH 账号池：两层选路（粘性会话 + 负载感知）、失败冷却与降级（对标 sub2api 号池核心，自用规模）",
   "license": "MIT",
   "type": "module",
-  "main": "./lib/host.js",
+  "main": "./lib/runtime-v0.4.18-probe-retries/host.js",
   "scripts": {
-    "test": "node tools/kernel-test.mjs && node tools/domain-test.mjs && node tools/upstream-test.mjs && node tools/host-test.mjs && node tools/client-test.mjs"
+    "test": "node tools/test.mjs",
+    "test:retry": "node --test tools/retry-test.mjs",
+    "test:detection": "node tools/detection-test.mjs --quick",
+    "test:detection:all": "node tools/detection-test.mjs",
+    "test:client": "node tools/client-test.mjs",
+    "test:client:styles": "node tools/client-style-test.mjs",
+    "test:host": "node tools/host-test.mjs",
+    "test:domain": "node tools/domain-test.mjs",
+    "test:quota": "node tools/quota-test.mjs",
+    "test:reset-credits": "node tools/reset-credits-test.mjs",
+    "test:all": "node tools/kernel-test.mjs && node tools/domain-test.mjs && node tools/upstream-test.mjs && node tools/claude-code-test.mjs && node tools/importer-test.mjs && node tools/oauth-test.mjs && node tools/host-test.mjs && node tools/client-test.mjs && node --test tools/codex-test.mjs tools/gemini-test.mjs tools/openai-responses-test.mjs && node tools/quota-test.mjs && node tools/reset-credits-test.mjs && node tools/prepared-call-test.mjs && node tools/supplier-test.mjs && node tools/menu-capability-test.mjs && node tools/detection-test.mjs"
   },
   "exports": {
     ".": {
-      "default": "./lib/host.js"
+      "default": "./lib/runtime-v0.4.18-probe-retries/host.js"
     },
     "./kernel": {
       "default": "./lib/kernel.js"
@@ -24,6 +34,12 @@
     },
     "./upstream": {
       "default": "./lib/upstream.js"
+    },
+    "./oauth": {
+      "default": "./lib/oauth.js"
+    },
+    "./claude-code": {
+      "default": "./lib/claude-code/index.js"
     },
     "./client": {
       "default": "./lib/client.js"
@@ -49,11 +65,25 @@
     "lib/adapter.js",
     "lib/domain.js",
     "lib/upstream.js",
+    "lib/detection.js",
+    "lib/retry.js",
+    "lib/native",
+    "lib/quota.js",
+    "lib/reset-credits.js",
+    "lib/supplier.js",
+    "lib/group-models.js",
+    "lib/importer.js",
+    "lib/oauth.js",
+    "lib/oauth",
+    "lib/claude-code",
     "cordis.patch.yml",
     "DESIGN.md",
-    "README.md"
+    "README.md",
+    "lib/runtime-v0.4.18-probe-retries"
   ],
   "dependencies": {
-    "zod": "^4.6.5"
+    "@deepseek-ai/schemastery": "3.18.4",
+    "zod": "^4.6.5",
+    "ws": "^8.18.3"
   }
 }

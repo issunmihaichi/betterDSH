@@ -491,7 +491,8 @@ await check('adapter: an error finish chunk before any output IS retryable', asy
       ? fromChunks([{ type: 'finish', reason: { kind: 'error', failure: httpError(503) } }])
       : okStream('recovered')
   ));
-  const adapter = createPoolAdapter({ initialAccounts: [a1, a2], upstream, clock });
+  // Isolate account failover from the independently tested same-account request retries.
+  const adapter = createPoolAdapter({ initialAccounts: [a1, a2], upstream, clock, requestRetries: 0 });
 
   const chunks = await drain(adapter.stream({ sessionId: 's1', model: 'claude-opus-4' }));
   assert.equal(chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join(''), 'recovered');
@@ -525,7 +526,7 @@ await check('adapter: running out of switches surfaces the LAST upstream failure
   const usages = [];
   const upstream = makeUpstream(() => failing(httpError(503)));
   const adapter = createPoolAdapter({
-    initialAccounts: [a1, a2], upstream, clock, maxSwitches: 1, onUsage: (u) => usages.push(u),
+    initialAccounts: [a1, a2], upstream, clock, maxSwitches: 1, requestRetries: 0, onUsage: (u) => usages.push(u),
   });
 
   await assert.rejects(
@@ -544,7 +545,7 @@ await check('adapter: maxSwitches bounds how many accounts one request may burn'
   const clock = makeClock();
   const accounts = [0, 1, 2, 3, 4].map((i) => account({ id: `a${i}` }));
   const upstream = makeUpstream(() => failing(httpError(503)));
-  const adapter = createPoolAdapter({ initialAccounts: accounts, upstream, clock, maxSwitches: 2 });
+  const adapter = createPoolAdapter({ initialAccounts: accounts, upstream, clock, maxSwitches: 2, requestRetries: 0 });
 
   await assert.rejects(() => drain(adapter.stream({ sessionId: 's1', model: 'x' })));
   assert.equal(upstream.calls.length, 3, 'the first attempt plus maxSwitches retries');
@@ -647,7 +648,7 @@ await check('applyAccountAction: set-priority validates, unknown actions throw',
   assert.throws(() => applyAccountAction(account(), 'set-priority', { now: T0, priority: 'high' }), RangeError);
   assert.throws(() => applyAccountAction(account(), 'set-priority', { now: T0 }), RangeError);
   assert.throws(() => applyAccountAction(account(), 'nonsense', { now: T0 }), RangeError);
-  assert.deepEqual(ACCOUNT_ACTIONS, ['enable', 'disable', 'prefer', 'clear-cooldown', 'set-priority']);
+  assert.deepEqual(ACCOUNT_ACTIONS, ['enable', 'disable', 'pause-scheduling', 'resume-scheduling', 'reset-error', 'prefer', 'clear-cooldown', 'set-priority', 'set-mimicry']);
 });
 
 // ------------------------------------------------- failure policy as data
@@ -817,6 +818,33 @@ await check('groups: an unknown group serves nothing rather than the whole pool'
   );
 });
 
+await check('groups: disabling a bound group blocks direct calls until enabled again', async () => {
+  const upstream = makeUpstream(() => okStream());
+  const adapter = createPoolAdapter({
+    initialAccounts: [account({ id: 'a1', groups: ['toggle'], models: ['m'] })],
+    initialGroups: [{ id: 'toggle', models: ['m'] }],
+    upstream, clock: makeClock(),
+  });
+  await drain(adapter.stream({ sessionId: 'sticky', provider: 'pool-toggle', model: 'm' }));
+  assert.equal(adapter.getBinding('sticky').accountId, 'a1');
+  adapter.upsertGroup({ ...adapter.getGroup('toggle'), enabled: false });
+  assert.deepEqual(adapter.routesFor(), ['pool', 'pool-toggle']);
+  assert.deepEqual(adapter.callableRoutesFor(), ['pool']);
+  assert.deepEqual(await adapter.listModels('pool-toggle'), []);
+  const calls = upstream.calls.length;
+  await assert.rejects(() => drain(adapter.stream({ sessionId: 'sticky', provider: 'pool-toggle', model: 'm' })),
+    (error) => error.code === 'POOL_EXHAUSTED');
+  assert.equal(upstream.calls.length, calls, 'a cached binding cannot bypass a disabled group');
+  assert.deepEqual(adapter.getAccount('a1').groups, ['toggle']);
+  await drain(adapter.stream({ sessionId: 'default', provider: 'pool', model: 'm' }));
+  assert.equal(upstream.calls.at(-1).accountId, 'a1', 'the default pool still covers its accounts');
+  adapter.upsertGroup({ ...adapter.getGroup('toggle'), enabled: true });
+  assert.deepEqual(adapter.callableRoutesFor(), ['pool', 'pool-toggle']);
+  assert.deepEqual((await adapter.listModels('pool-toggle')).map((model) => model.id), ['m']);
+  await drain(adapter.stream({ sessionId: 'sticky', provider: 'pool-toggle', model: 'm' }));
+  assert.equal(upstream.calls.at(-1).accountId, 'a1');
+});
+
 await check('groups: a group allow-list filters on top of the account’s own models', async () => {
   const clock = makeClock();
   const adapter = createPoolAdapter({
@@ -857,6 +885,218 @@ await check('groups: deleting a group detaches it without deleting accounts', as
   assert.equal(adapter.listAccounts().length, 2, 'a group is a view over accounts, not their owner');
   assert.deepEqual(adapter.routesFor(), ['pool', 'pool-vip'], 'and its route is gone');
   assert.deepEqual(adapter.removeGroup('cheap'), [], 'removing twice is a no-op');
+});
+
+await check('groups: a PREFERRED pool is what the default route serves', async () => {
+  const clock = makeClock();
+  const upstream = makeUpstream(() => okStream());
+  const adapter = createPoolAdapter({
+    initialAccounts: [
+      account({ id: 'a1', groups: ['cheap'], priority: 100 }),
+      // Better priority than a1, so only the preference can explain the pick.
+      account({ id: 'a2', groups: [], priority: 1 }),
+    ],
+    initialGroups: [{ id: 'cheap', models: [], preferred: true }],
+    upstream,
+    clock,
+  });
+
+  await drain(adapter.stream({ sessionId: 's1', provider: 'pool', model: 'm' }));
+  assert.equal(upstream.calls.at(-1).accountId, 'a2', 'the default route covers all accounts and ignores legacy preference');
+
+  await drain(adapter.stream({ sessionId: 's2', provider: 'pool-cheap', model: 'm' }));
+  assert.equal(upstream.calls.at(-1).accountId, 'a1', 'and an explicit pool route still works');
+});
+
+await check('groups: a preferred pool with NO members does not take the pool down', async () => {
+  // `pool` is the route everyone uses, so an empty preference degrades to
+  // "everything" rather than "nothing works" — and the UI shows the 0 members.
+  const adapter = createPoolAdapter({
+    initialAccounts: [account({ id: 'a1', groups: [] })],
+    initialGroups: [{ id: 'empty', models: [], preferred: true }],
+    upstream: makeUpstream(() => okStream()),
+    clock: makeClock(),
+  });
+  await drain(adapter.stream({ sessionId: 's1', provider: 'pool', model: 'm' }));
+  assert.equal(adapter.getBinding('s1').accountId, 'a1');
+});
+
+await check('groups: a per-pool priority outranks the account’s own, in that pool only', async () => {
+  const clock = makeClock();
+  const upstream = makeUpstream(() => okStream());
+  const adapter = createPoolAdapter({
+    initialAccounts: [
+      account({ id: 'a1', groups: ['one', 'two'], priority: 100 }),
+      account({ id: 'a2', groups: ['one', 'two'], priority: 100 }),
+    ],
+    initialGroups: [{ id: 'one', models: [] }, { id: 'two', models: [] }],
+    // The SAME two accounts, ranked oppositely in the two pools, with the accounts
+    // themselves untouched — which is the entire point of a relation table.
+    initialPriorities: [
+      { accountId: 'a1', groupId: 'two', priority: 500 },
+      { accountId: 'a2', groupId: 'two', priority: 1 },
+    ],
+    upstream,
+    clock,
+  });
+
+  await drain(adapter.stream({ sessionId: 's1', provider: 'pool-one', model: 'm' }));
+  assert.equal(upstream.calls.at(-1).accountId, 'a1', 'pool one ties, so the id order decides');
+
+  await drain(adapter.stream({ sessionId: 's2', provider: 'pool-two', model: 'm' }));
+  assert.equal(upstream.calls.at(-1).accountId, 'a2', 'pool two ranks a2 first');
+
+  assert.equal(adapter.getAccount('a1').priority, 100, 'the projection happened on a COPY');
+  assert.equal(adapter.getAccount('a2').priority, 100);
+});
+
+await check('groups: the default route uses the PREFERRED pool’s priorities', async () => {
+  const adapter = createPoolAdapter({
+    initialAccounts: [
+      account({ id: 'a1', groups: ['cheap'], priority: 1 }),
+      account({ id: 'a2', groups: ['cheap'], priority: 1 }),
+    ],
+    initialGroups: [{ id: 'cheap', models: [], preferred: true }],
+    initialPriorities: [{ accountId: 'a2', groupId: 'cheap', priority: 0 }],
+    upstream: makeUpstream(() => okStream()),
+    clock: makeClock(),
+  });
+  await drain(adapter.stream({ sessionId: 's1', provider: 'pool', model: 'm' }));
+  assert.equal(
+    adapter.getBinding('s1').accountId,
+    'a1',
+    'the default pool ranks accounts by their own priority rather than a group override',
+  );
+});
+
+await check('groups: deleting a pool clears its priority overrides with it', async () => {
+  const calls = [];
+  const adapter = createPoolAdapter({
+    initialAccounts: [account({ id: 'a1', groups: ['cheap', 'vip'] })],
+    initialGroups: [{ id: 'cheap' }, { id: 'vip' }],
+    initialPriorities: [
+      { accountId: 'a1', groupId: 'cheap', priority: 1 },
+      { accountId: 'a1', groupId: 'vip', priority: 2 },
+    ],
+    persist: { deletePriority: (key) => calls.push(key) },
+    upstream: makeUpstream(() => okStream()),
+    clock: makeClock(),
+  });
+
+  adapter.removeGroup('cheap');
+  assert.deepEqual(adapter.listPriorities().map((entry) => entry.groupId), ['vip'], 'the deleted pool’s override is gone');
+  assert.deepEqual(calls, ['a1|cheap'], 'and the removal was persisted, not only held in memory');
+});
+
+await check('accounts: deleting an account clears its priority overrides too', async () => {
+  // removeGroup had this cleanup and removeAccount did not. The asymmetry was the bug:
+  // an override for a deleted account can never apply, so it is only orphan data.
+  const calls = [];
+  const adapter = createPoolAdapter({
+    initialAccounts: [account({ id: 'a1', groups: ['one'] }), account({ id: 'a2', groups: ['one'] })],
+    initialGroups: [{ id: 'one' }],
+    initialPriorities: [
+      { accountId: 'a1', groupId: 'one', priority: 1 },
+      { accountId: 'a2', groupId: 'one', priority: 2 },
+    ],
+    persist: { deletePriority: (key) => calls.push(key) },
+    upstream: makeUpstream(() => okStream()),
+    clock: makeClock(),
+  });
+
+  assert.equal(adapter.removeAccount('a1'), true);
+  assert.deepEqual(adapter.listPriorities().map((entry) => entry.accountId), ['a2'], 'only the deleted account’s override goes');
+  assert.deepEqual(calls, ['a1|one'], 'and the removal was persisted');
+  assert.equal(adapter.removeAccount('nobody'), false, 'deleting what is not there reports false');
+});
+
+await check('management: scheduling toggles preserve disabled/error state and all cooldowns', () => {
+  for (const status of ['active', 'disabled', 'error']) {
+    const before = account({ status, errorMessage: 'keep', rateLimitResetAt: iso(T0 + 60000), overloadUntil: iso(T0 + 30000), consecutiveFailures: 3 });
+    const paused = applyAccountAction(before, 'pause-scheduling', { now: T0 });
+    assert.deepEqual(paused, { ...before, schedulable: false });
+    const resumed = applyAccountAction(paused, 'resume-scheduling', { now: T0 });
+    assert.deepEqual(resumed, before);
+    const reset = applyAccountAction(paused, 'reset-error', { now: T0 });
+    assert.equal(reset.status, status === 'error' ? 'active' : status);
+    assert.equal(reset.schedulable, false);
+    assert.equal(reset.rateLimitResetAt, before.rateLimitResetAt);
+    assert.equal(reset.overloadUntil, before.overloadUntil);
+    assert.equal(reset.errorMessage, '');
+    assert.equal(reset.consecutiveFailures, 0);
+    assert.equal(before.errorMessage, 'keep');
+  }
+});
+
+await check('groups: each selectionMode changes actual routing and sticky behavior', async () => {
+  for (const [mode, expected] of [['sticky', 'a2'], ['load-aware', 'a1'], ['prefer_soonest_reset', 'a2'], ['weighted-random', 'a2']]) {
+    const upstream = makeUpstream(() => okStream());
+    const adapter = createPoolAdapter({
+      initialAccounts: [
+        account({ id: 'a1', groups: ['g'], weight: 1, rateLimitResetAt: iso(T0 - 1000) }),
+        account({ id: 'a2', groups: ['g'], weight: 3, rateLimitResetAt: iso(T0 - 2000) }),
+      ],
+      initialGroups: [{ id: 'g', selectionMode: mode }],
+      initialBindings: [{ sessionHash: 's', accountId: 'a2', boundAt: iso(T0), expiresAt: iso(T0 + 60000) }],
+      clock: makeClock(), random: () => 0.99, upstream,
+    });
+    await drain(adapter.stream({ provider: 'pool-g', sessionId: 's', model: 'm' }));
+    assert.equal(upstream.calls[0].accountId, expected, mode);
+    await drain(adapter.stream({ provider: 'pool-g', sessionId: 'new', model: 'm' }));
+    assert.equal(adapter.getBinding('new') !== undefined, mode === 'sticky', 'only sticky mode writes bindings');
+  }
+});
+
+await check('probe: terminal error and empty streams fail without exposing arbitrary error text or code', async () => {
+  for (const chunks of [[], [{ type: 'finish', reason: { kind: 'error', failure: { status: 503, code: 'private-token', message: 'private-token' } } }]]) {
+    const adapter = createPoolAdapter({ initialAccounts: [account()], clock: makeClock(), upstream: { stream: () => fromChunks(chunks) } });
+    const result = await adapter.testAccount('a1', { model: 'm' });
+    assert.equal(result.ok, false);
+    assert.equal(JSON.stringify(result).includes('private-token'), false);
+    assert.equal(result.errorCode, chunks.length === 0 ? 'POOL_EMPTY_RESPONSE' : 'http-503');
+    assert.equal(adapter.inflightSnapshot().size, 0);
+    assert.equal(adapter.getAccount('a1').lastTestOk, false);
+  }
+});
+
+await check('probe: timeout aborts the transport and releases the concurrency slot', async () => {
+  let seenSignal;
+  const adapter = createPoolAdapter({ initialAccounts: [account({ concurrency: 1 })], clock: makeClock(), upstream: {
+    stream(_account, options) {
+      seenSignal = options.signal;
+      return (async function* () { await new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })); })();
+    },
+  } });
+  const pending = adapter.testAccount('a1', { model: 'm', timeoutMs: 10 });
+  assert.equal(adapter.inflightSnapshot().get('a1'), 1);
+  await assert.rejects(adapter.testAccount('a1', { model: 'm' }), (error) => error.code === 'POOL_TEST_BUSY');
+  const result = await pending;
+  assert.equal(result.errorCode, 'POOL_TEST_TIMEOUT');
+  assert.equal(result.ok, false);
+  assert.equal(seenSignal.aborted, true);
+  assert.equal(adapter.inflightSnapshot().size, 0);
+  assert.equal(adapter.getAccount('a1').lastTestErrorCode, 'POOL_TEST_TIMEOUT');
+});
+
+await check('probe: finishing merges concurrent edits and never recreates a deleted account', async () => {
+  for (const remove of [false, true]) {
+    let proceed;
+    const gate = new Promise((resolve) => { proceed = resolve; });
+    const adapter = createPoolAdapter({ initialAccounts: [account()], clock: makeClock(), upstream: {
+      stream: () => (async function* () { await gate; yield { type: 'text-delta', text: 'OK' }; })(),
+    } });
+    const pending = adapter.testAccount('a1', { model: 'm' });
+    if (remove) adapter.removeAccount('a1');
+    else adapter.upsertAccount({ ...adapter.getAccount('a1'), schedulable: false, notes: 'edited during probe' });
+    proceed();
+    assert.equal((await pending).ok, true);
+    if (remove) assert.equal(adapter.getAccount('a1'), undefined);
+    else {
+      assert.equal(adapter.getAccount('a1').schedulable, false);
+      assert.equal(adapter.getAccount('a1').notes, 'edited during probe');
+      assert.equal(adapter.getAccount('a1').lastTestOk, true);
+    }
+  }
 });
 
 // ------------------------------------------------- report

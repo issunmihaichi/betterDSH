@@ -61,6 +61,10 @@ window.__ModuleLoader__.load({
 			endpoint: '地址',
 			tools: '工具',
 			toolCount: '{count} 个',
+			toolTokens: '约 {tokens} tok',
+			ownerBadge: '由 {owner} 写入',
+			ownerWarn: '这一行的配置由 {owner} 写入。保存会用上面的 JSON 整体替换它的 config，确认这就是你想要的最终值再继续。',
+			ownerConfirm: '确认覆盖并保存',
 			showTools: '查看工具',
 			hideTools: '收起工具',
 			editConfig: '编辑配置',
@@ -78,7 +82,7 @@ window.__ModuleLoader__.load({
 			skillProvider: '提供方',
 			skillNoPath: '该技能没有本地文件，无法切换',
 			skillTitle: '{name}',
-			mcpSummary: '{total} 个服务器 · 已启用 {enabled} · 已停用 {disabled} · 共 {tools} 个工具',
+			mcpSummary: '{total} 个服务器 · 已启用 {enabled} · 已停用 {disabled} · 共 {tools} 个工具 · 约 {tokens} tok',
 			skillSummary: '{total} 个技能 · 模型可调用 {model}',
 			rootsFrom: '项目目录：{cwd}',
 			localOnly: '仅本机'
@@ -105,6 +109,10 @@ window.__ModuleLoader__.load({
 			endpoint: 'Endpoint',
 			tools: 'Tools',
 			toolCount: '{count}',
+			toolTokens: '~{tokens} tok',
+			ownerBadge: 'written by {owner}',
+			ownerWarn: 'This row\u2019s config is written by {owner}. Saving replaces its config with the JSON above — continue only when that is the value you want.',
+			ownerConfirm: 'Overwrite and save',
 			showTools: 'Show tools',
 			hideTools: 'Hide tools',
 			editConfig: 'Edit config',
@@ -122,7 +130,7 @@ window.__ModuleLoader__.load({
 			skillProvider: 'Provider',
 			skillNoPath: 'This skill has no local file to switch',
 			skillTitle: '{name}',
-			mcpSummary: '{total} servers · {enabled} enabled · {disabled} disabled · {tools} tools',
+			mcpSummary: '{total} servers · {enabled} enabled · {disabled} disabled · {tools} tools · ~{tokens} tok',
 			skillSummary: '{total} skills · {model} model-invocable',
 			rootsFrom: 'Project directory: {cwd}',
 			localOnly: 'Local only'
@@ -133,6 +141,37 @@ window.__ModuleLoader__.load({
 		/** Substitute `{name}` placeholders. */
 		function fill(text, values) {
 			return String(text).replace(/\{(\w+)\}/g, (whole, key) => (values !== undefined && key in values ? String(values[key]) : whole));
+		}
+
+		/**
+		 * Compact token readout: 1 decimal above 1000, exact below it.
+		 *
+		 * Kept local rather than shared with the context-window panel: the two
+		 * bundles are separate artifacts and a formatting change here must never
+		 * be able to break a page it does not own.
+		 */
+		function formatTokens(value) {
+			const tokens = typeof value === 'number' && Number.isFinite(value) ? value : Number(value);
+			if (!Number.isFinite(tokens) || tokens <= 0) return '0';
+			return tokens >= 1000 ? (tokens / 1000).toFixed(1) + 'k' : String(Math.round(tokens));
+		}
+
+		/** True when this row's config is another bundle's write target. */
+		function isOwnedRow(row) {
+			return row !== null && row !== undefined && typeof row.owner === 'string' && row.owner !== '';
+		}
+
+		/**
+		 * What pressing Save does right now.
+		 *
+		 * `'confirm'` means the click only arms the gate (and relabels the button);
+		 * `'save'` means it actually writes. A row another bundle owns always goes
+		 * through `'confirm'` once, so replacing that bundle's config is never a
+		 * single stray click. Kept as a pure function so the rule is testable
+		 * without a DOM.
+		 */
+		function saveGate(row, armed) {
+			return isOwnedRow(row) && armed !== true ? 'confirm' : 'save';
 		}
 
 		const C = {
@@ -290,9 +329,13 @@ window.__ModuleLoader__.load({
 					]),
 					h(Badge, { key: 'enabled', text: row.enabled ? t('enabled') : t('disabled'), tone: row.enabled ? 'ok' : 'muted' }),
 					phase === undefined ? null : h(Badge, { key: 'phase', text: t(phase[0]), tone: phase[1] }),
+					row.owner === null || row.owner === undefined
+						? null
+						: h(Badge, { key: 'owner', text: fill(t('ownerBadge'), { owner: row.owner }), tone: 'warn' }),
 				]),
 				h('div', { key: 'bottom', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } }, [
 					h('span', { key: 'tools', style: { fontSize: 12, color: C.dim } }, t('tools') + ': ' + fill(t('toolCount'), { count: row.toolCount })),
+					row.toolCount === 0 ? null : h('span', { key: 'tokens', style: { fontSize: 12, color: C.faint } }, fill(t('toolTokens'), { tokens: formatTokens(row.toolTokens) })),
 					row.tools.length === 0 ? null : h(Button, { key: 'expand', onClick: () => setOpen(!open) }, open ? t('hideTools') : t('showTools')),
 					h(Button, { key: 'edit', onClick: () => onEdit(row), disabled: row.editable !== true }, t('editConfig')),
 				]),
@@ -340,6 +383,8 @@ window.__ModuleLoader__.load({
 			const [note, setNote] = React.useState(null);
 			const [config, setConfig] = React.useState(null);
 			const [skill, setSkill] = React.useState(null);
+			/** Second-click gate for a row another bundle owns. */
+			const [armed, setArmed] = React.useState(false);
 			const alive = React.useRef(true);
 
 			React.useEffect(() => () => { alive.current = false; }, []);
@@ -385,11 +430,20 @@ window.__ModuleLoader__.load({
 
 			const openConfig = (row) => run(async () => {
 				const body = await readJson(ROUTE_MCP_CONFIG + '?patchId=' + encodeURIComponent(row.patchId));
-				setConfig({ row, text: body.text ?? JSON.stringify(body.config ?? {}, null, 2) });
+				const owner = body.ownedBy === undefined ? row.owner : body.ownedBy;
+				setArmed(false);
+				setConfig({ row: { ...row, owner }, text: body.text ?? JSON.stringify(body.config ?? {}, null, 2) });
 				return undefined;
 			}).catch(() => undefined);
 
 			const saveConfig = () => run(async () => {
+				// A row another bundle writes gets one confirming click first: the
+				// save replaces that plugin's whole config, so a stray click must not
+				// be able to do it.
+				if (saveGate(config.row, armed) === 'confirm') {
+					setArmed(true);
+					return undefined;
+				}
 				let parsed;
 				try {
 					parsed = JSON.parse(config.text);
@@ -402,6 +456,7 @@ window.__ModuleLoader__.load({
 					headers: { 'content-type': 'application/json' },
 					body: JSON.stringify({ patchId: config.row.patchId, config: parsed }),
 				});
+				setArmed(false);
 				setConfig(null);
 				setNote(t('saved'));
 				return outcome;
@@ -455,7 +510,8 @@ window.__ModuleLoader__.load({
 			if (data === null) body.push(h(Empty, { key: 'loading', text: t('loading') }));
 			else if (tab === 'mcp') {
 				body.push(h('div', { key: 'sum', style: { fontSize: 12, color: C.dim } }, fill(t('mcpSummary'), {
-					total: data.mcp.total, enabled: data.mcp.enabled, disabled: data.mcp.disabled, tools: data.mcp.toolTotal,
+					total: data.mcp.total, enabled: data.mcp.enabled, disabled: data.mcp.disabled,
+					tools: data.mcp.toolTotal, tokens: formatTokens(data.mcp.toolTokens),
 				})));
 				body.push(data.mcp.rows.length === 0
 					? h(Empty, { key: 'empty', text: t('emptyMcp') })
@@ -488,8 +544,17 @@ window.__ModuleLoader__.load({
 					t,
 					title: fill(t('configTitle'), { name: config.row.serverName }),
 					hint: t('configHint'),
-					onClose: () => setConfig(null),
+					onClose: () => { setArmed(false); setConfig(null); },
 				}, [
+					isOwnedRow(config.row)
+						? h('div', {
+							key: 'owned',
+							style: {
+								fontSize: 12, color: C.warn, border: '1px solid ' + C.warn,
+								borderRadius: 8, padding: '6px 8px',
+							},
+						}, fill(t('ownerWarn'), { owner: config.row.owner }))
+						: null,
 					h('textarea', {
 						key: 'ta',
 						value: config.text,
@@ -502,7 +567,11 @@ window.__ModuleLoader__.load({
 						},
 					}),
 					h('div', { key: 'actions', style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
-						h(Button, { kind: 'primary', onClick: () => { void saveConfig(); }, disabled: busy }, busy ? t('saving') : t('save'))),
+						h(Button, {
+							kind: 'primary',
+							onClick: () => { void saveConfig(); },
+							disabled: busy,
+						}, busy ? t('saving') : (saveGate(config.row, armed) === 'confirm' ? t('ownerConfirm') : t('save')))),
 				]));
 			}
 			if (skill !== null) {
@@ -556,6 +625,14 @@ window.__ModuleLoader__.load({
 		exports.inject = inject;
 		exports.apply = apply;
 		exports.ROUTE_STATUS = ROUTE_STATUS;
+		// Pure helpers, exported so the offline bundle test can pin their behavior
+		// without rendering the page.
+		exports.formatTokens = formatTokens;
+		exports.isOwnedRow = isOwnedRow;
+		exports.saveGate = saveGate;
+		// The row component is exported for the same reason dsh-github exports its
+		// cards: the bundle test renders it through a minimal React stub.
+		exports.McpRow = McpRow;
 
 		module.exports = exports;
 		return module.exports;

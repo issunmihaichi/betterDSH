@@ -568,13 +568,36 @@ export function createGithub(deps) {
     return { ok: true, job: publicJob(job) };
   }
 
+  /**
+   * Every git working copy under the clone root, each annotated with the DSH
+   * workspace that owns its directory (when one does).
+   *
+   * `workspaceId` is what lets the page offer "打开" — the Browser half can only
+   * navigate through `uiWorkspace.openWorkspace(id)`, and it has no service that
+   * maps a path to a workspace id. The lookup is read-only (`resolveByPath` never
+   * creates a registration) and best-effort: a path that the registry does not
+   * know, or a host generation whose registry has no such method, simply yields
+   * rows without the field, and the page falls back to showing the path alone.
+   */
   async function listRepos() {
+    let repos;
     try {
-      return await (deps.listClones ?? listClones)(await cloneRoot());
+      repos = await (deps.listClones ?? listClones)(await cloneRoot());
     } catch (error) {
       lastError = `读取下载目录失败：${error instanceof Error ? error.message : String(error)}`;
       return [];
     }
+    const registry = deps.workspaceRegistry;
+    if (registry === undefined || typeof registry.resolveByPath !== 'function') return repos;
+    return Promise.all(repos.map(async (repo) => {
+      try {
+        const entity = await registry.resolveByPath(repo.path);
+        const id = entity?.id;
+        return typeof id === 'string' && id !== '' ? { ...repo, workspaceId: id } : repo;
+      } catch {
+        return repo;
+      }
+    }));
   }
 
   /** What the composer's `/` menu will show, straight from the command registry. */

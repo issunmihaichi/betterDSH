@@ -111,7 +111,9 @@ const HOME = process.env.DSH_HOME || 'C:/Users/Administrator/.dsh';
 const sessionsRoot = `${HOME}/sessions`;
 const cacheRoot = `${HOME}/storages/session_projcache/sessions`;
 
-if (!fs.existsSync(sessionsRoot)) {
+if (process.argv.includes('--synthetic-only')) {
+  console.log('SKIP operator-local projection cross-check (--synthetic-only)');
+} else if (!fs.existsSync(sessionsRoot)) {
   console.log(`SKIP no local sessions at ${sessionsRoot}`);
 } else {
   const slug = fs.readdirSync(sessionsRoot).find((name) => fs.statSync(`${sessionsRoot}/${name}`).isDirectory());

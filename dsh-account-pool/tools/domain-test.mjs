@@ -96,10 +96,34 @@ function makeValidatingPersist() {
   };
 }
 
+await check('accounts: old rows default public connection ids to null and explicit ids validate', () => {
+  const old = makeAccount({ id: 'old', now: iso(T0) });
+  assert.equal(old.projectId, null);
+  assert.equal(old.chatgptAccountId, null);
+  const row = makeAccount({ id: 'new', now: iso(T0), projectId: 'my-project', chatgptAccountId: 'workspace-id' });
+  assert.equal(row.projectId, 'my-project');
+  assert.equal(row.chatgptAccountId, 'workspace-id');
+  assert.equal(accountSchema.safeParse({ ...row, projectId: 5 }).success, false);
+  assert.equal(accountSchema.safeParse({ ...row, chatgptAccountId: {} }).success, false);
+});
+
+await check('accounts: pool detection settings default safely and validate bounded retries and literal keywords', () => {
+  const row=makeAccount({id:'detection',now:iso(T0)});
+  assert.equal(row.poolDetectionRetry,false);assert.equal(row.poolDetectionRetries,2);assert.equal(row.poolDetectionRetryDelayMs,1000);
+  assert.deepEqual(row.poolDetectionKeywords,['号池检测','池检测','号池不可用']);
+  const configured=accountSchema.parse({...row,poolDetectionRetry:true,poolDetectionRetries:5,poolDetectionRetryDelayMs:10000,poolDetectionKeywords:['  custom detection  ']});
+  assert.deepEqual(configured.poolDetectionKeywords,['custom detection']);
+  for(const patch of [{poolDetectionRetry:'yes'},{poolDetectionRetries:6},{poolDetectionRetries:-1},{poolDetectionRetries:1.5},{poolDetectionRetryDelayMs:0},{poolDetectionRetryDelayMs:10001},{poolDetectionKeywords:['']},{poolDetectionKeywords:['x'.repeat(201)]},{poolDetectionKeywords:Array(21).fill('x')}])assert.equal(accountSchema.safeParse({...row,...patch}).success,false);
+  assert.deepEqual(accountSchema.parse({...row,poolDetectionKeywords:[]}).poolDetectionKeywords,[],'Explicitly empty rules match nothing');
+});
+
 // ------------------------------------------------- spec shape
 
 await check('spec: declares the three tables and a non-nullable global', () => {
-  assert.deepEqual(Object.keys(poolDomainSpec.tables).sort(), ['accounts', 'bindings', 'groups', 'usage']);
+  assert.deepEqual(
+    Object.keys(poolDomainSpec.tables).sort(),
+    ['accounts', 'bindings', 'groups', 'priorities', 'usage'],
+  );
   assert.equal(poolDomainSpec.invalidRecords, 'backup-and-skip');
   assert.equal(poolDomainSpec.global.schema.safeParse(null).success, false);
 });
@@ -171,10 +195,31 @@ await check('spec: a group carries an optional model allow-list and a route-safe
   );
 });
 
+await check('groups: old durable rows default enabled and explicit disabled records remain disabled', () => {
+  const old = { id: 'legacy', createdAt: iso(T0), updatedAt: iso(T0) };
+  assert.equal(groupSchema.parse(old).enabled, true);
+  const disabled = groupSchema.parse({ ...old, enabled: false });
+  assert.equal(disabled.enabled, false);
+  assert.deepEqual(groupSchema.parse(disabled), disabled);
+  assert.equal(groupSchema.safeParse({ ...old, enabled: 'false' }).success, false);
+});
+
 await check('spec: an account belongs to no group until it is added', () => {
   // Empty means "the default pool only" — NOT every group, or creating a group
   // would silently sweep in every account that already existed.
   assert.deepEqual(makeAccount({ id: 'a1' }).groups, []);
+});
+
+await check('spec: an account declares no extra betas until its upstream demands one', () => {
+  // Empty by default, because the token is a fact about the RELAY: a beta the
+  // upstream model does not support is itself a 400, so it must be opted into one
+  // account at a time (`CONTEXT_1M_BETA` is the measured case — Anyrouter answers
+  // 400 to every request that does not claim 1M context).
+  assert.deepEqual(makeAccount({ id: 'a1' }).betas, []);
+  assert.deepEqual(
+    accountSchema.parse(makeAccount({ id: 'a1', betas: ['context-1m-2025-08-07'] })).betas,
+    ['context-1m-2025-08-07'],
+  );
 });
 
 // ------------------------------------------------- makeAccount
@@ -352,6 +397,33 @@ await check('usage: a POOL_EXHAUSTED payload with no usage folds into zeros, not
   });
   assert.equal(record.inputTokens, 0);
   assert.equal(record.accountId, '');
+});
+
+await check('management: old account records gain safe notes and health defaults', () => {
+  const old = makeAccount({ id: 'a1' });
+  for (const field of ['notes', 'lastTestAt', 'lastTestOk', 'lastTestModel', 'lastTestLatencyMs', 'lastTestErrorCode', 'lastTestMessage']) delete old[field];
+  const record = accountSchema.parse(old);
+  assert.equal(record.notes, '');
+  assert.equal(record.lastTestAt, null);
+  assert.equal(record.lastTestOk, null);
+  assert.equal(record.lastTestModel, '');
+  assert.equal(record.lastTestLatencyMs, null);
+  assert.equal(record.lastTestErrorCode, '');
+  assert.equal(record.lastTestMessage, '');
+  assert.equal(accountSchema.safeParse({ ...record, lastTestLatencyMs: -1 }).success, false);
+  assert.equal(accountSchema.safeParse({ ...record, notes: 'x'.repeat(10001) }).success, false);
+});
+
+await check('management: probe writes remain valid durable account records', async () => {
+  const persist = makeValidatingPersist();
+  const adapter = createPoolAdapter({ initialAccounts: [makeAccount({ id: 'a1', now: iso(T0) })], upstream: { stream: () => okStream() }, clock: makeClock(), persist });
+  const result = await adapter.testAccount('a1', { model: 'm' });
+  assert.equal(result.ok, true);
+  const written = persist.seen.accounts.at(-1);
+  assert.equal(written.lastTestAt, iso(T0));
+  assert.equal(written.lastTestOk, true);
+  assert.equal(written.lastTestLatencyMs, 0);
+  assert.equal(written.lastUsedAt, null);
 });
 
 // ------------------------------------------------- report

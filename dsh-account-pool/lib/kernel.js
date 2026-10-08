@@ -8,6 +8,11 @@
  * Semantics are ported from sub2api's account scheduler; see DESIGN.md §4–§6 and
  * the referenced source lines for each rule.
  */
+// The Claude Code mode vocabulary, imported from the module group's LEAF constants
+// file rather than from its index: that file imports nothing, so the kernel stays
+// dependency-free (no `node:crypto`, no group wiring) while the mode names still
+// have exactly one definition.
+import { MIMICRY_MODES } from './claude-code/constants.js';
 
 /** Tunables. Kept here so tests can assert against the same constants. */
 export const DURATIONS = {
@@ -207,6 +212,7 @@ export function selectCandidate({
   now,
   inflight,
   mode = 'load-aware',
+  useSticky = true,
   random = Math.random,
 } = {}) {
   const candidates = [];
@@ -218,7 +224,7 @@ export function selectCandidate({
     candidates.push(account);
   }
 
-  const binding = bindings?.get?.(sessionHash);
+  const binding = useSticky ? bindings?.get?.(sessionHash) : undefined;
   let bindingState = 'absent';
   if (binding !== undefined && binding !== null) {
     const live = activeBinding(bindings, sessionHash, now) !== undefined;
@@ -277,6 +283,8 @@ export const CONFIG_ERROR_CODES = new Set([
   'POOL_NO_CREDENTIAL',
   'POOL_UNSUPPORTED_CONTENT',
   'POOL_NO_UPSTREAM',
+  'POOL_GEMINI_PROJECT_REQUIRED',
+  'POOL_CODEX_ACCOUNT_REQUIRED',
 ]);
 
 /**
@@ -454,7 +462,7 @@ export function accumulateUsage(totals, usage) {
 // --------------------------------------------------------------- operator actions
 
 /** Actions the management surface may apply to one account. */
-export const ACCOUNT_ACTIONS = ['enable', 'disable', 'prefer', 'clear-cooldown', 'set-priority'];
+export const ACCOUNT_ACTIONS = ['enable', 'disable', 'pause-scheduling', 'resume-scheduling', 'reset-error', 'prefer', 'clear-cooldown', 'set-priority', 'set-mimicry'];
 
 /**
  * Apply one operator action, returning a NEW account record.
@@ -482,6 +490,21 @@ export function applyAccountAction(account, action, options = {}) {
 
     case 'disable':
       return { ...account, status: 'disabled', schedulable: false, updatedAt: stamp };
+
+    case 'pause-scheduling':
+      return { ...account, schedulable: false, updatedAt: stamp };
+
+    case 'resume-scheduling':
+      return { ...account, schedulable: true, updatedAt: stamp };
+
+    case 'reset-error':
+      return {
+        ...account,
+        status: account.status === 'error' ? 'active' : account.status,
+        errorMessage: '',
+        consecutiveFailures: 0,
+        updatedAt: stamp,
+      };
 
     case 'prefer': {
       // Strictly below every sibling, so `prefer` always wins the priority key
@@ -513,6 +536,19 @@ export function applyAccountAction(account, action, options = {}) {
         throw new RangeError(`set-priority needs an integer priority, got ${String(options.priority)}`);
       }
       return { ...account, priority: options.priority, updatedAt: stamp };
+
+    /**
+     * Turn the Claude Code disguise on or off for one account.
+     *
+     * Orthogonal like the rest: it changes the disguise and NOTHING else. It does
+     * not flip `authMode` (which credential type this account holds is a fact, not
+     * a preference) and it does not touch cooling windows.
+     */
+    case 'set-mimicry':
+      if (!MIMICRY_MODES.includes(options.mimicry)) {
+        throw new RangeError(`set-mimicry needs one of ${MIMICRY_MODES.join(', ')}, got ${String(options.mimicry)}`);
+      }
+      return { ...account, mimicry: options.mimicry, updatedAt: stamp };
 
     default:
       throw new RangeError(`unknown account action '${String(action)}'`);

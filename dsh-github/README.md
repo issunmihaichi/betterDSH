@@ -45,7 +45,7 @@ GitHub 是可选功能，用阻塞式首启流程不合适，所以向导做在�
 | 访问令牌 | 令牌来源（本机保存 / 环境变量）、令牌输入与清除；令牌只存本机 |
 | 传输方式 | Streamable HTTP 或 stdio、端点 / 可执行文件 / 参数、toolsets、只读、严格启动、下载目录 |
 | GitHub 工具 | 服务器暴露的工具列表，可过滤、展开参数、直接调用并看结果 |
-| 远程连接仓库 | 账号行、仓库列表（公开/私有/已归档/语言标签）、搜索、加载更多、手动输入兜底、下载确认、实时进度、已下载仓库 |
+| 远程连接仓库 | 账号行、仓库列表（公开/私有/已归档/语言标签）、搜索、加载更多、手动输入兜底、下载确认、实时进度、已下载仓库；每个已注册工作区的仓库带一个「打开工作区」按钮（走 `uiWorkspace.openWorkspace`） |
 | 页脚 | `/github` 是否已注册进指令目录、配置目录、重新运行向导 |
 
 控件形态与 DSH 自身一致：开关用 36×20 的 `role=switch` 圆钮，二选一用胶囊分段控件，
@@ -67,6 +67,17 @@ GitHub 是可选功能，用阻塞式首启流程不合适，所以向导做在�
 `/github` 已注册进宿主 `commands` 服务，输入栏的 `/` 菜单会把它列出来（实测：
 `catalog=[/compact /export /feedback /github /goal /permission /plan]`），
 并带上提示词 `[list|tools|call|clone|repos|status|help]`。
+
+### 打开已下载的仓库
+
+「已下载的仓库」列表里，如果一个仓库目录**已经注册为 DSH 工作区**，这一行会多一个「打开工作区」
+按钮：点击切到那个工作区（复用外壳自己的 `uiWorkspace.openWorkspace`，和会话头部用的是同一个入口）。
+
+- 归属关系由宿主补上：`/api/github.status` 的 `repos[]` 多一个 `workspaceId` 字段，来自
+  `workspaceRegistry.resolveByPath(path)`——只读查询，不会顺手注册新工作区；查不到（目录已删、
+  从没注册过）就**不带这个字段**，页面便只显示路径，不显示按钮。
+- 打不开时（工作区被移除、或宿主没有 `uiWorkspace`）只在卡片里给一句话，不会在控制台留未处理的
+  rejection；点击永远不会把异常抛到 React 事件里。
 
 ## 架构
 
@@ -129,20 +140,25 @@ plugin_manager install_bundle target = "D:\Backup\Documents\deepseek-harness\def
 | 项目 | 结果 |
 | --- | --- |
 | `node tools/pure-test.mjs` | **59/59**：设置归一化（含向导标记）、MCP config 生成（两种传输、令牌、无残留字段）、仓库地址解析、指令解析（含 JSON 参数原样保留）、文本输出、客户端静态检查（路由表完整性、不 import Harness 包） |
-| `node tools/host-test.mjs` | **60/60**：7 条路由契约、令牌保存/清除/**先校验后落盘**（拒绝时不写任何东西）、连接与断开（含禁用行时的延迟写入）、工具调用与 409、仓库列表与上游错误映射、带令牌克隆与 origin 擦除、全部指令分支 |
-| `node tools/client-test.mjs` | **28/28**：把真实 `lib/client.js` 装进假 module loader + 极简 React 里求值——注册形态、向导「该从第几步开始」的 6 种状态、每步渲染出的文案与控件（含"就是圆钮开关不是原生 checkbox"）、卡片的各种空/有状态 |
+| `node tools/host-test.mjs` | **61/61**：7 条路由契约、令牌保存/清除/**先校验后落盘**（拒绝时不写任何东西）、连接与断开（含禁用行时的延迟写入）、工具调用与 409、仓库列表与上游错误映射、带令牌克隆与 origin 擦除、**已下载仓库的 `workspaceId` 归属**（未注册时字段不出现）、全部指令分支 |
+| `node tools/client-test.mjs` | **33/33**：把真实 `lib/client.js` 装进假 module loader + 极简 React 里求值——注册形态、向导「该从第几步开始」的 6 种状态、每步渲染出的文案与控件（含"就是圆钮开关不是原生 checkbox"）、卡片的各种空/有状态、**「打开工作区」按钮的有/无与拒绝路径** |
 | `node tools/e2e-check.mjs --clone` | **23/23**（真实运行中的 DSH + 真实 git）：路由可认证、指令已注册、无令牌时拒绝、坏仓库提前拒绝、确认后真下载、**工作区注册成功**、进度流式回传、origin 不含凭据 |
 | `node tools/ui-check.mjs --stub-fresh` | 真实页面无头渲染向导首启态：`第 2/4 步 · 访问令牌`，控制台**零错误** |
-| `node tools/ui-check.mjs --stub` | 同上渲染已连接态：`第 4/4 步 · 下载仓库` + 账号行 + 仓库列表；`settings.section` 出现 `{registrant:"dsh-github", id:"github", order:14, active:true}` |
+| `node tools/ui-check.mjs --stub` | 同上渲染已连接态：`第 4/4 步 · 下载仓库` + 账号行 + 仓库列表；`settings.section` 出现 `{registrant:"dsh-github", id:"github", order:16, active:true}`（贡献页序号阶梯：12 思考强度 / 13 用量 / 14 账号池 / 15 MCP 与技能 / 16 GitHub） |
 | `node tools/bundle-check.mjs` | 运行中的应用**确实**在发最新 revision 的客户端包（按 rev 校验内容） |
 | 截图 | `docs/screenshots/`：向导两步、改前/改后控件、未连接、已连接、仓库选择器、下载确认 |
 
-合计 **147** 项离线断言 + 23 项真实运行断言。`tools/` 下的脚本都是本机自检工具，只访问
+合计 **153** 项离线断言 + 23 项真实运行断言。`tools/` 下的脚本都是本机自检工具，只访问
 loopback：它们用 harness 自己保存的 browser-session 签名密钥现签一个会话 cookie
 （与浏览器持有的那个同构，密钥不落盘、不打印），以便在真实页面 / 真实路由上做端到端验证。
 
 ## 已知限制
 
+- **本轮联动的生效方式**：客户端半边（序号 16、已下载仓库的「打开工作区」按钮）刷新页面即可见；
+  宿主半边（`repos[].workspaceId`）与所有 Host 改动一样**要重启应用**——重启前页面不会渲染那个按钮，
+  其余功能不受影响。
+- **`openWorkspace` 之后**：切工作区由外壳完成，本插件不接管后续（不自动开会话、不切模型）。工作区若
+  在别处被移除，按钮会给出「打不开」的提示而不是静默失败。
 - **Host 半边的改动需要重启应用**：加载器按 specifier 记忆已导入的宿主模块，
   开关 bundle 不会重新导入同一个文件。客户端半边按 rev 提供，刷新页面即可见。
   本次新增的 `/api/github.remote`（列仓库）与 `/api/github.token` 的 `verify` 分支都属于

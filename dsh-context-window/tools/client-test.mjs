@@ -90,28 +90,19 @@ check('reads its classification from one loopback route', () => {
 check('injects its own stylesheet once', () => {
   assert.equal(injected.length, 1);
   assert.equal(injected[0].dataset.plugin, 'dsh-context-window');
-  for (const rule of ['.dcw-root{', '.dcw-trigger{', '.dcw-track{', '.dcw-fill{', '.dcw-panel{', '.dcw-bar{', '.dcw-items{', '.dcw-disclosure{']) {
+  for (const rule of ['.dcw-root{', '.dcw-trigger{', '.dcw-track{', '.dcw-fill{', '.dcw-panel{', '.dcw-bar{', '.dcw-section{', '.dcw-list{', '.dcw-entry{']) {
     assert.ok(injected[0].textContent.includes(rule), `stylesheet is missing ${rule}`);
   }
 });
-check('the chevron ink is centred in its own viewBox', () => {
-  const panel = mod.ContextPanel({ ...panelProps, expanded: true, openRow: null });
-  const path = flat(panel).find((element) => element.type === 'path' && String(element.props.d ?? '').startsWith('M'));
-  const numbers = String(path.props.d).match(/-?\d+(?:\.\d+)?/g).map(Number);
-  const half = Number(path.props.strokeWidth) / 2;
-  const [x1, , x2] = numbers; // M x1 3.4  10.3 8  l-4.6 4.6
-  assert.equal((x1 - half + x2 + half) / 2, 8, 'the triangle ink must be centred on the 16-unit viewBox');
-});
-check('the nested disclosure chevron matches the top-level one', () => {
+check('the section chevron matches the header chevron', () => {
   const css = injected[0].textContent;
-  assert.ok(css.includes('.dcw-item-button{') && css.includes('padding:0;align-items:center}'), 'nested rows must centre their chevron');
-  assert.ok(css.includes('.dcw-item-button .dcw-chevron svg{width:12px;height:12px}'), 'nested chevrons must be 12px like the top level');
-  assert.ok(!css.includes('.dcw-item-button .dcw-chevron{'), 'the nested chevron must not carry its own offset: it centres on the line box like the top level');
+  assert.ok(css.includes('.dcw-section .dcw-chevron svg{width:12px;height:12px}'), 'section chevrons must be 12px');
+  assert.ok(!css.includes('.dcw-section .dcw-chevron{'), 'section chevrons must not carry their own offset');
 });
-check('nested blocks stay close to their parent row', () => {
+check('the section list has a bounded, scrollable body', () => {
   const css = injected[0].textContent;
-  assert.ok(css.includes('margin:1px 0 4px 12px'), 'the nested block indent must stay tight');
-  assert.ok(css.includes('.dcw-item{display:flex;align-items:baseline;gap:6px;'), 'the nested row gap must match the top-level disclosure');
+  assert.ok(css.includes('.dcw-list{') && css.includes('max-height:150px') && css.includes('overflow-y:auto'), 'a long entry list must scroll inside the panel');
+  assert.ok(css.includes('margin:2px 0 4px 10px'), 'the list indent must stay tight');
 });
 check('rewrites its stylesheet on every module load', () => {
   const source = readFileSync(clientPath, 'utf8');
@@ -148,10 +139,31 @@ check('occupancyOf needs numerator and capacity', () => {
   assert.equal(mod.occupancyOf({ pressureTokens: 10 }), null);
   assert.deepEqual(mod.occupancyOf({ projectedTokens: 306100, contextWindow: 1000000 }), {
     used: 306100,
+    estimated: false,
     window: 1000000,
     percent: 31,
     share: 0.3061,
   });
+});
+
+check('zero upstream input uses the full composition instead of only the new messages', () => {
+  const buckets = { messageTokens: 44022, toolsTokens: 18414, systemTokens: 2000 };
+  const estimate = mod.occupancyOf({ pressureTokens: 0, projectedTokens: 1417, contextWindow: 200000 }, buckets);
+  assert.equal(estimate.used, 64436);
+  assert.equal(estimate.percent, 32);
+  assert.equal(estimate.estimated, true);
+  const composition = mod.compositionOf(buckets, estimate.window, null);
+  assert.equal(composition.rows.reduce((sum, row) => sum + row.value, 0), estimate.used);
+  assert.equal(composition.free + estimate.used, estimate.window);
+  const panel = mod.ContextPanel({ occupancy: estimate, ...composition, expanded: false, t: zhT });
+  assert.equal(byClass(panel, 'dcw-figures').children[0], '~64.4k / 200k (32%)');
+});
+check('missing input sampling falls back, while valid provider pressure stays authoritative', () => {
+  const buckets = { messageTokens: 10000, toolsTokens: 5000, systemTokens: 2000 };
+  assert.equal(mod.occupancyOf({ contextWindow: 200000 }, buckets).used, 17000);
+  const measured = mod.occupancyOf({ pressureTokens: 12000, projectedTokens: 13500, contextWindow: 200000 }, buckets);
+  assert.equal(measured.used, 13500);
+  assert.equal(measured.estimated, true);
 });
 
 check('distribute never invents or loses a token', () => {
@@ -342,22 +354,42 @@ check('bar segments are window shares plus the empty remainder', () => {
 });
 
 const expanded = mod.ContextPanel({ ...panelProps, expanded: true, openRow: null });
+check('the chevron ink is centred in its own viewBox', () => {
+  const path = flat(expanded).find((element) => element.type === 'path' && String(element.props.d ?? '').startsWith('M'));
+  const numbers = String(path.props.d).match(/-?\d+(?:\.\d+)?/g).map(Number);
+  const half = Number(path.props.strokeWidth) / 2;
+  const [x1, , x2] = numbers; // the triangle's two absolute x coordinates
+  assert.equal((x1 - half + x2 + half) / 2, 8, 'the triangle ink must be centred on the 16-unit viewBox');
+});
 check('expanded popover lists every bucket in design order', () => {
   const rows = allByClass(expanded, 'dcw-row');
   assert.deepEqual(rows.map((row) => texts(row)[0]), ['对话消息', 'MCP 工具', '系统工具', '系统提示词', '技能', '剩余空间']);
 });
-check('classified rows show their count, plain rows do not', () => {
+check('the rows are plain: colour, label, value, percent', () => {
   const rows = allByClass(expanded, 'dcw-row');
-  assert.equal(textOf(rows[1]), 'MCP 工具|~12.5k|1.3%|46');
-  assert.equal(textOf(rows[2]).endsWith('|33'), true);
-  assert.equal(textOf(rows[4]).endsWith('|3'), true);
-  assert.equal(textOf(rows[0]).split('|').length, 3);
-  assert.equal(textOf(rows[5]).split('|').length, 3);
+  assert.deepEqual(rows.map((row) => texts(row).join('|')), [
+    '对话消息|~224.7k|22.5%',
+    'MCP 工具|~12.5k|1.3%',
+    '系统工具|~6.9k|0.7%',
+    '系统提示词|~17.7k|1.8%',
+    '技能|~900|0.1%',
+    '剩余空间|~737.3k|73.7%',
+  ]);
+  assert.equal(
+    allByClass(expanded, 'dcw-row').some((row) => flat(row).some((element) => String(element.props.className ?? '').includes('dcw-chevron'))),
+    false,
+    'no legend row carries a disclosure any more',
+  );
 });
-check('classified rows are disclosures; plain rows are not', () => {
-  const disclosures = allByClass(expanded, 'dcw-disclosure');
-  assert.equal(disclosures.length, 3);
-  assert.deepEqual(disclosures.map((button) => button.props['aria-expanded']), [false, false, false]);
+check('every classified bucket gets its own section below the legend', () => {
+  const sections = allByClass(expanded, 'dcw-section');
+  assert.deepEqual(sections.map((section) => texts(section).join('|')), [
+    'MCP 工具|~12.5k|46',
+    '系统工具|~6.9k|33',
+    '技能|~900|3',
+  ]);
+  assert.deepEqual(sections.map((section) => section.props['aria-expanded']), [false, false, false]);
+  assert.equal(allByClass(expanded, 'dcw-list').length, 0);
 });
 check('rows plus free space still cover the window', () => {
   const values = allByClass(expanded, 'dcw-row').map((row) => texts(row)[1]);
@@ -365,24 +397,22 @@ check('rows plus free space still cover the window', () => {
 });
 
 const withMcpOpen = mod.ContextPanel({ ...panelProps, expanded: true, openRow: 'mcp' });
-check('the MCP row discloses its servers first', () => {
-  const servers = byClassPart(withMcpOpen, 'dcw-item-button');
-  assert.deepEqual(servers.map((server) => texts(server).join('|')), ['github|44|~12k', 'fs|1|~513']);
-  assert.equal(allByClass(withMcpOpen, 'dcw-disclosure')[0].props['aria-expanded'], true);
-  assert.deepEqual(servers.map((server) => server.props['aria-expanded']), [false, false]);
-  assert.equal(allByClass(withMcpOpen, 'dcw-subitems').length, 0);
+check('an open section lists its entries with the server prefix, in a scroll box', () => {
+  assert.equal(allByClass(withMcpOpen, 'dcw-list').length, 1);
+  assert.deepEqual(allByClass(withMcpOpen, 'dcw-entry').map((entry) => texts(entry).join('|')), [
+    'github · issue_write|~917',
+    'github · list_issues|~593',
+    'fs · read|~513',
+  ]);
+  const mcpSection = allByClass(withMcpOpen, 'dcw-section').find((section) => texts(section)[0] === 'MCP 工具');
+  assert.equal(mcpSection.props['aria-expanded'], true);
+  assert.equal(allByClass(withMcpOpen, 'dcw-more').length, 1);
 });
-const withServerOpen = mod.ContextPanel({ ...panelProps, expanded: true, openRow: 'mcp', openItem: 'server:github' });
-check('a server then discloses its own tools at the second level', () => {
-  assert.equal(allByClass(withServerOpen, 'dcw-subitems').length, 1);
-  const tools = allByClass(withServerOpen, 'dcw-item').map((item) => texts(item).join('|'));
-  assert.deepEqual(tools, ['issue_write|~917', 'list_issues|~593']);
-  assert.deepEqual(byClassPart(withServerOpen, 'dcw-item-button').map((server) => server.props['aria-expanded']), [true, false]);
+check('only the opened section expands', () => {
+  assert.equal(allByClass(withMcpOpen, 'dcw-list').length, 1);
+  assert.equal(allByClass(withMcpOpen, 'dcw-entry').length, 3);
 });
-check('only the opened server expands', () => {
-  assert.equal(allByClass(withMcpOpen, 'dcw-items').length, 1);
-});
-check('the skills row notes the skill tool it does not count', () => {
+check('the skills section notes the skill tool it does not count', () => {
   const skillsOpen = mod.ContextPanel({ ...panelProps, expanded: true, openRow: 'skills' });
   assert.equal(allByClass(skillsOpen, 'dcw-more').at(-1).children[0], 'skill 工具本身 ~88 · 计入系统工具');
 });
@@ -429,6 +459,45 @@ check('the bundle file stays plain JavaScript at the real entry point', () => {
   assert.match(source, /window\.__ModuleLoader__\.load\(\{/);
   assert.doesNotMatch(source, /^\s*import\s/m);
   assert.doesNotMatch(source, /^\s*export\s/m);
+});
+
+check('the reported total controls free space and the whole-window bar', () => {
+  const buckets = { messageTokens: 189018, toolsTokens: 18382, systemTokens: 2000 };
+  const view = mod.compositionOf(buckets, 1000000, null, 516000);
+  assert.equal(view.rows.find(row => row.key === 'adjustment').value, 306600);
+  assert.equal(view.free, 484000);
+  assert.equal(view.rows.reduce((sum, row) => sum + row.value, 0) + view.free, 1000000);
+  assert.ok(Math.abs(view.barRows.reduce((sum, row) => sum + row.share, 0) - 0.516) < 1e-12);
+  assert.equal(view.rows.find(row => row.key === 'messages').value, buckets.messageTokens);
+});
+check('a verified old cache sample corrects both occupancy and its remainder', () => {
+  const pressure = { pressureTokens: 571741, projectedTokens: 571860, contextWindow: 1000000 };
+  const buckets = { systemTokens: 2000, toolsTokens: 18382, messageTokens: 209142 };
+  const detail = { usageCorrection: { pressureTokens: 571741, duplicateCacheTokens: 285184 } };
+  const occupancy = mod.occupancyOf(pressure, buckets, detail);
+  assert.equal(occupancy.used, 286676);
+  assert.equal(occupancy.percent, 29);
+  assert.equal(occupancy.estimated, true);
+  const view = mod.compositionOf(buckets, occupancy.window, null, occupancy.used);
+  assert.equal(view.free, 713324);
+  assert.equal(view.rows.find(row => row.key === 'adjustment').value, 57152);
+  assert.equal(mod.occupancyOf({ ...pressure, pressureTokens: 286557, projectedTokens: 286676 }, buckets, detail).used, 286676);
+});
+check('negative differences, unavailable breakdowns and overflow retain consistent occupancy', () => {
+  const below = mod.compositionOf({ messageTokens: 8000 }, 10000, null, 5000);
+  assert.equal(below.rows.find(row => row.key === 'adjustment').value, -3000);
+  assert.equal(below.free, 5000);
+  assert.equal(below.barRows.reduce((sum, row) => sum + row.share, 0), 0.5);
+  const legend = mod.BreakdownRows({ ...below, t: zhT });
+  assert.ok(textOf(legend).includes('~−3k'));
+  assert.ok(textOf(legend).includes('−30.0%'));
+  const empty = mod.compositionOf(undefined, 10000, null, 3000);
+  assert.equal(empty.free, 7000);
+  assert.equal(empty.rows[0].value, 3000);
+  const over = mod.compositionOf({ messageTokens: 8000 }, 10000, null, 15000);
+  assert.equal(over.free, 0);
+  assert.equal(over.rows.reduce((sum, row) => sum + row.value, 0), 15000);
+  assert.ok(Math.abs(over.barRows.reduce((sum, row) => sum + row.share, 0) - 1) < 1e-12);
 });
 
 console.log(`\n${String(passed)} passed, ${String(failures.length)} failed`);

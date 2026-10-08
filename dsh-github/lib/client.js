@@ -29,9 +29,21 @@ window.__ModuleLoader__.load({
 
 		/** Locale namespace owned by this plugin. */
 		const NS = 'settings.github';
-		/** Settings nav cell: after 用量 (13). */
+		/**
+		 * Settings nav cell and its position.
+		 *
+		 * The profile's five contributed pages sit on one ascending ladder, so no
+		 * two of them can drift into an accidental tie (a tie is broken by bundle
+		 * order, which is invisible in the UI):
+		 *
+		 *   12 thinking-effort · 13 usage · 14 account-pool · 15 MCP & skills · 16 GitHub
+		 *
+		 * This page used to sit on 14 — the same slot account-pool claimed, so the
+		 * order users saw was decided by the profile's bundle list rather than by
+		 * either plugin. 16 keeps GitHub last, next to the integration it manages.
+		 */
 		const SECTION_ID = 'github';
-		const SECTION_ORDER = 14;
+		const SECTION_ORDER = 16;
 
 		const ROUTES = {
 			status: 'api/github.status',
@@ -173,6 +185,8 @@ window.__ModuleLoader__.load({
 			workspaceCreated: '已注册为工作区。',
 			workspaceFailed: '注册工作区失败：{reason}',
 			reposTitle: '已下载的仓库',
+			openWorkspace: '打开工作区',
+			openWorkspaceFailed: '打不开这个工作区：它可能已被移除，或在设置里重新注册过。',
 			reposEmpty: '下载目录里还没有 git 仓库。',
 			reopen: '打开所在目录',
 			openFailed: '打开失败：{message}',
@@ -314,6 +328,8 @@ window.__ModuleLoader__.load({
 			workspaceCreated: 'Registered as a workspace.',
 			workspaceFailed: 'Workspace registration failed: {reason}',
 			reposTitle: 'Downloaded repositories',
+			openWorkspace: 'Open workspace',
+			openWorkspaceFailed: 'Could not open that workspace: it may have been removed, or re-registered in settings.',
 			reposEmpty: 'No git repository in the download directory yet.',
 			reopen: 'Open containing directory',
 			openFailed: 'Open failed: {message}',
@@ -818,7 +834,7 @@ window.__ModuleLoader__.load({
 
 		/** 「远程连接仓库」: your account's repositories, pick one, confirm, download. */
 		function RepoCard(props) {
-			const { t, data, onChanged } = props;
+			const { t, data, onChanged, onOpenWorkspace } = props;
 			const [filter, setFilter] = React.useState('');
 			const [listing, setListing] = React.useState({ status: 'idle', account: null, items: [], page: 0, hasMore: false, scanned: 0, error: null });
 			const [plan, setPlan] = React.useState(null);
@@ -829,6 +845,26 @@ window.__ModuleLoader__.load({
 			const [manual, setManual] = React.useState('');
 
 			const tokenReady = data.token.present === true;
+
+			/**
+			 * Switch the app to a downloaded clone's workspace.
+			 *
+			 * `uiWorkspace.openWorkspace` is the shell's own navigation face (the
+			 * same one the conversation header calls). It is a soft dependency: a
+			 * host without it, or a workspace since removed, must surface as one
+			 * sentence here rather than as an unhandled rejection in the console.
+			 */
+			const openWorkspace = (entry) => {
+				const fail = () => setMessage({ kind: 'error', text: t('openWorkspaceFailed') });
+				try {
+					const outcome = onOpenWorkspace(entry);
+					if (outcome !== null && outcome !== undefined && typeof outcome.then === 'function') {
+						outcome.catch(fail);
+					}
+				} catch {
+					fail();
+				}
+			};
 
 			const load = React.useCallback(async (page, query, append) => {
 				setListing((previous) => ({ ...previous, status: 'loading', error: null }));
@@ -1017,11 +1053,22 @@ window.__ModuleLoader__.load({
 				h('div', { key: 'repos-title', className: 'dsg-label', style: { marginTop: '12px' } }, t('reposTitle')),
 				(data.repos ?? []).length === 0
 					? h('div', { className: 'dsg-empty', key: 'repos-empty' }, t('reposEmpty'))
-					: h('div', { className: 'dsg-repos', key: 'repos' }, data.repos.map((entry) => h('div', { className: 'dsg-repo', key: entry.path }, [
-						h('div', { className: 'dsg-repo-name', key: 'name' }, `${entry.name}${entry.branch === undefined ? '' : ` @${entry.branch}`}`),
-						h('div', { className: 'dsg-repo-path', key: 'path' }, entry.path),
-						entry.remote === undefined ? null : h('div', { className: 'dsg-repo-path', key: 'remote' }, entry.remote),
-					]))),
+					: h('div', { className: 'dsg-repos', key: 'repos' }, data.repos.map((entry) => {
+						// The host annotates a clone with the workspace that owns its
+						// directory; without that id there is nothing to open, so the
+						// row falls back to showing the path alone.
+						const canOpen = typeof entry.workspaceId === 'string' && entry.workspaceId !== ''
+							&& typeof onOpenWorkspace === 'function';
+						return h('div', { className: 'dsg-repo', key: entry.path }, [
+							h('div', { className: 'dsg-repo-name', key: 'name' }, `${entry.name}${entry.branch === undefined ? '' : ` @${entry.branch}`}`),
+							h('div', { className: 'dsg-repo-path', key: 'path' }, entry.path),
+							entry.remote === undefined ? null : h('div', { className: 'dsg-repo-path', key: 'remote' }, entry.remote),
+							canOpen
+								? h('div', { key: 'open', style: { marginTop: '6px' } },
+									h(Button, { onClick: () => openWorkspace(entry) }, t('openWorkspace')))
+								: null,
+						]);
+					})),
 			]);
 		}
 
@@ -1058,7 +1105,7 @@ window.__ModuleLoader__.load({
 		 * resumes at the first unfinished step, and can be skipped in one click.
 		 */
 		function SetupWizard(props) {
-			const { t, data, onChanged, onDone } = props;
+			const { t, data, onChanged, onDone, onOpenWorkspace } = props;
 			const derived = setupStep(data);
 			const [page, setPage] = React.useState(derived);
 			const [busy, setBusy] = React.useState(false);
@@ -1192,7 +1239,7 @@ window.__ModuleLoader__.load({
 			if (step === 'repos') {
 				return h('div', { className: 'dsg-wizard', key: 'wizard' }, [
 					h('section', { className: 'dsg-card', key: 'head' }, [head, stepsRow, h('p', { className: 'dsg-card-sub', key: 'intro' }, t('wizardIntroRepos'))]),
-					h(RepoCard, { key: 'repo', t, data, onChanged }),
+					h(RepoCard, { key: 'repo', t, data, onChanged, onOpenWorkspace }),
 					noteNode,
 					nav,
 				]);
@@ -1294,6 +1341,21 @@ window.__ModuleLoader__.load({
 				return typeof service?.pickDirectory === 'function' ? service.pickDirectory() : null;
 			}, [ctx]);
 
+			/**
+			 * Open one downloaded clone's workspace through the shell's own
+			 * navigation face. Throws when the service is absent so `RepoCard` can
+			 * report it in one sentence instead of failing silently.
+			 *
+			 * @param entry - one `repos` row from `/api/github.status` (carries `workspaceId`).
+			 */
+			const openWorkspace = React.useCallback((entry) => {
+				const service = ctx.get('uiWorkspace');
+				if (typeof service?.openWorkspace !== 'function') {
+					throw new Error('uiWorkspace.openWorkspace is unavailable');
+				}
+				return service.openWorkspace(entry.workspaceId, () => {});
+			}, [ctx]);
+
 			const head = h('div', { className: 'dsg-head', key: 'head' }, [
 				h('div', { key: 'text', style: { flex: '1 1 auto', minWidth: '0' } }, [
 					h('h3', { className: 'dsg-title', key: 'title' }, t('title')),
@@ -1327,7 +1389,7 @@ window.__ModuleLoader__.load({
 				h(TokenCard, { key: 'token', t, data, onChanged: reload }),
 				h(TransportCard, { key: 'transport', t, data, onChanged: reload, pickDirectory }),
 				h(ToolCard, { key: 'tools', t, data }),
-				h(RepoCard, { key: 'repo', t, data, onChanged: reload }),
+				h(RepoCard, { key: 'repo', t, data, onChanged: reload, onOpenWorkspace: openWorkspace }),
 			];
 
 			return h('div', { className: 'dsg-root' }, [
@@ -1357,7 +1419,7 @@ window.__ModuleLoader__.load({
 				]),
 				data.git?.ok === false ? h('div', { key: 'git', className: 'dsg-warn' }, fill(t('gitMissing'), { reason: data.git.reason })) : null,
 				wizardOpen === true
-					? h(SetupWizard, { key: 'wizard', t, data, onChanged: reload, onDone: reload })
+					? h(SetupWizard, { key: 'wizard', t, data, onChanged: reload, onDone: reload, onOpenWorkspace: openWorkspace })
 					: null,
 				wizardOpen === true
 					? h('div', { className: 'dsg-actions', key: 'advanced' }, [

@@ -137,7 +137,9 @@ check('apply registers one settings section and nothing else', () => {
   assert.deepEqual(injected, ['settings.section']);
   assert.equal(registrations.length, 1);
   assert.equal(registrations[0].id, 'github');
-  assert.equal(registrations[0].order, 14);
+  // The five contributed settings pages share one ascending ladder; GitHub sits
+  // last (16) so it can never tie with account-pool (14) again.
+  assert.equal(registrations[0].order, 16);
   assert.equal(registrations[0].locale, 'settings.github');
 });
 
@@ -342,6 +344,81 @@ check('parameter rows put required parameters first', () => {
   assert.equal(rows[0].name, 'query');
   assert.deepEqual(rows.map((row) => row.name), ['query', 'page']);
 });
+
+// ------------------------------------------------------- open downloaded repo ---
+
+/** The open-workspace button in a rendered repository card, or undefined. */
+const openButton = (tree) => elementsOf(tree)
+  .find((node) => node.type === 'button' && textOf(node) === 't:openWorkspace');
+
+/** Status with one downloaded clone; `workspaceId` is what the host annotates. */
+function statusWithClone(workspaceId) {
+  const entry = { name: 'Hello-World', path: 'C:\\repos\\Hello-World', branch: 'main' };
+  if (workspaceId !== undefined) entry.workspaceId = workspaceId;
+  return baseStatus({ token: { present: true, preview: 'x' }, repos: [entry] });
+}
+
+check('a downloaded clone with a registered workspace offers to open it', () => {
+  const opened = [];
+  const tree = client.RepoCard({
+    t,
+    data: statusWithClone('ws-1'),
+    onChanged: () => {},
+    onOpenWorkspace: (entry) => { opened.push(entry); },
+  });
+  const button = openButton(tree);
+  assert.ok(button !== undefined, 'expected an open-workspace button');
+  button.props.onClick();
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0].workspaceId, 'ws-1');
+});
+
+check('a clone the registry does not own gets no open button', () => {
+  const tree = client.RepoCard({
+    t,
+    data: statusWithClone(undefined),
+    onChanged: () => {},
+    onOpenWorkspace: () => {},
+  });
+  assert.equal(openButton(tree), undefined);
+});
+
+check('a host without the navigation face renders the row without the button', () => {
+  const tree = client.RepoCard({ t, data: statusWithClone('ws-1'), onChanged: () => {} });
+  assert.equal(openButton(tree), undefined);
+});
+
+check('a refusing navigation face never throws out of the click', () => {
+  const tree = client.RepoCard({
+    t,
+    data: statusWithClone('ws-1'),
+    onChanged: () => {},
+    onOpenWorkspace: () => { throw new Error('uiWorkspace.openWorkspace is unavailable'); },
+  });
+  const button = openButton(tree);
+  assert.ok(button !== undefined);
+  assert.doesNotThrow(() => button.props.onClick());
+});
+
+// A rejecting face must be caught by the click handler itself: an unhandled
+// rejection here would surface as a console error on the real page.
+{
+  let unhandled = 0;
+  const onUnhandled = () => { unhandled += 1; };
+  process.on('unhandledRejection', onUnhandled);
+  const tree = client.RepoCard({
+    t,
+    data: statusWithClone('ws-1'),
+    onChanged: () => {},
+    onOpenWorkspace: () => Promise.reject(new Error('nope')),
+  });
+  openButton(tree).props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  process.off('unhandledRejection', onUnhandled);
+  check('a rejecting navigation face is caught, not left unhandled', () => {
+    assert.equal(unhandled, 0);
+  });
+}
 
 check('fill interpolates and keeps unknown placeholders', () => {
   assert.equal(fill('a {x} b {y}', { x: 1 }), 'a 1 b {y}');

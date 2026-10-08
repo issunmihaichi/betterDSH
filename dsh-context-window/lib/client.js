@@ -26,8 +26,10 @@
  *   - the Host half's classification route, which says *which* tools are MCP
  *     (`mcp__<server>__<tool>`) and *which* durable message is DSH's skill
  *     catalog, each priced with DSH's own estimator.
- * The classification is normalized onto the official totals, so the rows always
- * add up to what DSH itself reports, and the heuristic parts keep DSH's `~`.
+ * Reported nonzero input pressure controls the total. If a provider omits
+ * input usage or reports zero, the total falls back to the official heuristic
+ * breakdown and carries `~`; the ring and header use the same resolved value.
+ * The classification splits those heuristic totals into rows.
  *
  * Shipped as a DSH client bundle (`window.__ModuleLoader__.load`), hand-written
  * in plain JavaScript: React and ReactDOM arrive through the module table and the
@@ -76,6 +78,7 @@ window.__ModuleLoader__.load({
 			systemTools: 'var(--dsw-alias-state-success-primary)',
 			system: 'var(--dsw-static-neutral-bluish-400)',
 			skills: '#a78bfa',
+			adjustment: 'var(--dsw-static-neutral-bluish-500)',
 			free: 'var(--dsw-alias-border-l3)',
 		};
 
@@ -88,6 +91,7 @@ window.__ModuleLoader__.load({
 			system: '系统提示词',
 			skills: '技能',
 			free: '剩余空间',
+			adjustment: '用量差额',
 			expand: '展开分项',
 			collapse: '收起分项',
 			moreItems: '还有 {count} 项未显示',
@@ -105,6 +109,7 @@ window.__ModuleLoader__.load({
 			system: 'System prompt',
 			skills: 'Skills',
 			free: 'Free space',
+			adjustment: 'Usage difference',
 			expand: 'Expand breakdown',
 			collapse: 'Collapse breakdown',
 			moreItems: '{count} more not shown',
@@ -130,7 +135,7 @@ window.__ModuleLoader__.load({
 .dcw-chevron{flex:none;display:grid;place-items:center;color:var(--dsw-alias-label-tertiary);transition:transform .12s ease}
 .dcw-chevron-open{transform:rotate(90deg)}
 .dcw-bar{display:flex;gap:1px;height:4px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);overflow:hidden;margin:10px 0 12px}
-.dcw-segment{flex:none;min-width:2px;height:100%;border-radius:1px}
+.dcw-segment{flex:none;min-width:0;height:100%;border-radius:1px}
 .dcw-rest{flex:auto;min-width:0}
 .dcw-rows{display:flex;flex-direction:column;gap:2px;margin:6px 0 0;padding:0}
 .dcw-row{display:flex;align-items:center;gap:8px;font-size:12px;line-height:20px}
@@ -147,7 +152,19 @@ window.__ModuleLoader__.load({
 .dcw-items{display:flex;flex-direction:column;gap:1px;margin:1px 0 4px 12px;padding:0;border-left:1px solid var(--dsw-alias-border-l2);padding-left:8px}
 .dcw-item{display:flex;align-items:baseline;gap:6px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
 .dcw-item-button{width:100%;background:0 0;border:none;font:inherit;color:inherit;text-align:left;cursor:pointer;padding:0;align-items:center}
-.dcw-item-button .dcw-chevron svg{width:12px;height:12px}
+.dcw-sections{display:flex;flex-direction:column;gap:2px;margin:8px 0 0;padding:0}
+.dcw-section{display:flex;align-items:center;gap:6px;width:100%;padding:0;background:0 0;border:none;font:inherit;color:inherit;text-align:left;cursor:pointer}
+.dcw-section:hover .dcw-section-label{color:var(--dsw-alias-label-primary)}
+.dcw-section .dcw-chevron svg{width:12px;height:12px}
+.dcw-section-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
+.dcw-section-value{margin-left:auto;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+.dcw-section-count{flex:none;min-width:20px;text-align:right;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+.dcw-list{display:flex;flex-direction:column;gap:1px;max-height:150px;margin:2px 0 4px 10px;padding:0 6px 0 8px;border-left:1px solid var(--dsw-alias-border-l2);overflow-y:auto;--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2)}
+.dcw-list::-webkit-scrollbar{width:6px}
+.dcw-list::-webkit-scrollbar-thumb{background:var(--dsw-alias-scrollbar-bg-l2);border-radius:3px}
+.dcw-entry{display:flex;align-items:baseline;gap:8px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.dcw-entry-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dcw-entry-value{margin-left:auto;font-variant-numeric:tabular-nums}
 .dcw-item-button:hover .dcw-itemname{color:var(--dsw-alias-label-secondary)}
 .dcw-itemname{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dcw-itemcount{flex:none;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
@@ -221,12 +238,21 @@ window.__ModuleLoader__.load({
 		 * @param pressure - latest token-meter projection.
 		 * @returns Occupancy, or null until numerator and capacity are both known.
 		 */
-		function occupancyOf(pressure) {
-			const used = pressure?.projectedTokens ?? pressure?.pressureTokens;
+		function occupancyOf(pressure, breakdown, detail) {
+			const measured = pressure?.projectedTokens ?? pressure?.pressureTokens;
 			const capacity = pressure?.contextWindow;
-			if (typeof used !== 'number' || typeof capacity !== 'number' || !(capacity > 0)) return null;
+			const compositionTotal = numberOr(breakdown?.messageTokens) + numberOr(breakdown?.toolsTokens) + numberOr(breakdown?.systemTokens);
+			const fallback = typeof measured !== 'number' || !Number.isFinite(measured) || (pressure?.pressureTokens === 0 && compositionTotal > 0);
+			const correction = detail?.usageCorrection;
+			// A legacy sample is corrected only when both halves still refer to the
+			// same pressure. A newly normalized sample must never be reduced again.
+			const duplicateCache = !fallback && correction?.pressureTokens === pressure?.pressureTokens
+				? numberOr(correction?.duplicateCacheTokens) : 0;
+			const used = fallback ? (compositionTotal > 0 ? compositionTotal : undefined) : Math.max(0, measured - duplicateCache);
+			if (typeof used !== 'number' || !Number.isFinite(used) || used < 0 || typeof capacity !== 'number' || !Number.isFinite(capacity) || !(capacity > 0)) return null;
 			return {
 				used,
+				estimated: fallback || (typeof pressure?.pressureTokens === 'number' && measured !== pressure.pressureTokens),
 				window: capacity,
 				percent: Math.min(100, Math.round((used / capacity) * 100)),
 				share: Math.min(1, used / capacity),
@@ -278,7 +304,7 @@ window.__ModuleLoader__.load({
 		 * @param detail - Host classification payload, or null while unavailable.
 		 * @returns `{ rows, free, freeShare, classified }`.
 		 */
-		function compositionOf(breakdown, capacity, detail) {
+		function compositionOf(breakdown, capacity, detail, usedTokens) {
 			const messageTokens = numberOr(breakdown?.messageTokens);
 			const toolsTokens = numberOr(breakdown?.toolsTokens);
 			const systemTokens = numberOr(breakdown?.systemTokens);
@@ -342,8 +368,20 @@ window.__ModuleLoader__.load({
 				});
 			}
 			const known = rows.reduce((total, row) => total + row.value, 0);
-			const free = Math.max(0, capacity - known);
-			return { rows, free, freeShare: free / capacity, classified };
+			const used = typeof usedTokens === 'number' && Number.isFinite(usedTokens) && usedTokens >= 0 ? usedTokens : known;
+			const adjustment = used - known;
+			if (adjustment !== 0) {
+				rows.push({ key: 'adjustment', label: 'adjustment', tint: TINT.adjustment, value: adjustment, share: adjustment / capacity, signed: true });
+			}
+			const free = Math.max(0, capacity - used);
+			// A negative reconciliation has no physical segment. In that case the
+			// bar apportions net occupancy by the positive estimates; the legend
+			// retains their original values and explicitly shows the signed difference.
+			const positiveRows = rows.filter((row) => row.value > 0);
+			const positiveTotal = positiveRows.reduce((total, row) => total + row.value, 0);
+			const occupiedShare = Math.min(1, used / capacity);
+			const barRows = positiveRows.map((row) => ({ ...row, share: positiveTotal > 0 ? occupiedShare * row.value / positiveTotal : 0 }));
+			return { rows, barRows, free, freeShare: free / capacity, classified };
 		}
 
 		/**
@@ -356,7 +394,7 @@ window.__ModuleLoader__.load({
 		function useDetail(sessionId, enabled) {
 			const [detail, setDetail] = React.useState(null);
 			React.useEffect(() => {
-				if (!enabled || typeof sessionId !== 'string' || sessionId === '') return undefined;
+				if (typeof sessionId !== 'string' || sessionId === '') return undefined;
 				let cancelled = false;
 				const load = () => {
 					fetch(`${DETAIL_ROUTE}?session=${encodeURIComponent(sessionId)}`, { headers: { accept: 'application/json' } })
@@ -368,13 +406,13 @@ window.__ModuleLoader__.load({
 						.catch(() => {});
 				};
 				load();
-				const timer = setInterval(load, DETAIL_REFRESH_MS);
+				const timer = enabled ? setInterval(load, DETAIL_REFRESH_MS) : undefined;
 				return () => {
 					cancelled = true;
 					clearInterval(timer);
 				};
 			}, [sessionId, enabled]);
-			return detail;
+			return detail?.sessionId === sessionId ? detail : null;
 		}
 
 		/**
@@ -542,101 +580,94 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * One classified row's detail, indented under it while the row is open. A row
-		 * that carries servers (MCP) discloses one level first — the servers — and
-		 * each server then discloses its own tools. A row may also carry a note line
-		 * (the skills row uses it to point at the `skill` tool's own schema price).
+		 * Flatten one classified row into the entries its section lists. Following the
+		 * reference panel, MCP tools carry a `server · tool` prefix rather than a
+		 * nested level, and every entry keeps the tool's own price.
+		 * @param row - one composition row.
+		 * @returns `[{ key, label, title, tokens }]` in the row's own order.
 		 */
-		function DetailItems(props) {
-			const { row, t, openItem, onToggleItem } = props;
-			const items = Array.isArray(row.items) ? row.items : [];
+		function entriesOf(row) {
 			const servers = Array.isArray(row.servers) ? row.servers : [];
-			const children = [];
 			if (servers.length > 0) {
-				for (const server of servers) {
-					const key = server.key;
-					const open = openItem === key;
-					const label = server.server === '' ? t('mcpUnnamedServer') : server.server;
-					children.push(h('button', {
-						key,
-						type: 'button',
-						className: 'dcw-item dcw-item-button',
-						'aria-expanded': open,
-						'aria-label': `${label} — ${open ? t('collapse') : t('expand')}`,
-						onClick: () => { onToggleItem(key); },
-					}, [
-						h(Chevron, { key: 'chevron', open }),
-						h('span', { key: 'name', className: 'dcw-itemname', title: label }, label),
-						h('span', { key: 'count', className: 'dcw-itemcount' }, String(server.count)),
-						h('span', { key: 'value', className: 'dcw-itemvalue' }, `~${formatCompact(server.tokens)}`),
-					]));
-					if (!open) continue;
-					const tools = Array.isArray(server.items) ? server.items : [];
-					const hiddenTools = Math.max(0, server.count - tools.length);
-					children.push(h('div', { key: `${key}:tools`, className: 'dcw-subitems' }, [
-						...tools.map((item) => h('div', { key: item.name, className: 'dcw-item' }, [
-							h('span', { key: 'name', className: 'dcw-itemname', title: item.name }, item.rawName ?? item.name),
-							h('span', { key: 'value', className: 'dcw-itemvalue' }, `~${formatCompact(item.tokens)}`),
-						])),
-						hiddenTools > 0
-							? h('div', { key: 'more', className: 'dcw-more' }, fill(t('moreItems'), { count: String(hiddenTools) }))
-							: null,
-					]));
-				}
-			} else {
-				const hidden = Math.max(0, (row.count ?? items.length) - items.length);
-				children.push(...items.map((item) => h('div', { key: item.name, className: 'dcw-item' }, [
-					h('span', { key: 'name', className: 'dcw-itemname', title: item.name }, item.rawName ?? item.name),
-					h('span', { key: 'value', className: 'dcw-itemvalue' }, `~${formatCompact(item.tokens)}`),
-				])));
-				if (hidden > 0) children.push(h('div', { key: 'more', className: 'dcw-more' }, fill(t('moreItems'), { count: String(hidden) })));
+				return servers.flatMap((server) => (Array.isArray(server.items) ? server.items : []).map((item) => ({
+					key: `${String(server.server)}:${String(item.name)}`,
+					label: server.server === ''
+						? String(item.rawName ?? item.name)
+						: `${String(server.server)} · ${String(item.rawName ?? item.name)}`,
+					title: String(item.name),
+					tokens: numberOr(item.tokens),
+				})));
 			}
-			if (numberOr(row.noteTokens) > 0) {
-				children.push(h('div', { key: 'note', className: 'dcw-more' }, fill(t('skillToolNote'), { tokens: formatCompact(row.noteTokens) })));
-			}
-			return h('div', { className: 'dcw-items' }, children);
+			return (Array.isArray(row.items) ? row.items : []).map((item) => ({
+				key: String(item.name),
+				label: String(item.rawName ?? item.name),
+				title: String(item.name),
+				tokens: numberOr(item.tokens),
+			}));
 		}
 
 		/**
-		 * The legend: one row per bucket, then the free remainder. Rows that carry
-		 * a classification disclose their items through their own label button.
+		 * The disclosure sections under the legend, as the reference panel lays them
+		 * out: one row per classified bucket (`MCP tools 21.5k 85`) and, while it is
+		 * open, its entries in a scrollable list.
 		 */
-		function BreakdownRows(props) {
-			const { rows, free, freeShare, t, openRow, onToggleRow, openItem, onToggleItem } = props;
-			const items = [...rows, { key: 'free', label: 'free', value: free, share: freeShare, tint: TINT.free }];
-			return h('div', { className: 'dcw-rows' }, items.flatMap((item) => {
-				const detail = Array.isArray(item.items) ? item.items : [];
-				const expandable = detail.length > 0;
-				const open = expandable && openRow === item.key;
-				const head = expandable
-					? h('button', {
-						key: 'head',
+		function DetailSections(props) {
+			const { rows, t, openRow, onToggleRow } = props;
+			const sections = rows.filter((row) => entriesOf(row).length > 0);
+			if (sections.length === 0) return null;
+			return h('div', { className: 'dcw-sections' }, sections.flatMap((row) => {
+				const entries = entriesOf(row);
+				const open = openRow === row.key;
+				const children = [
+					h('button', {
+						key: `${row.key}:head`,
 						type: 'button',
-						className: 'dcw-disclosure',
+						className: 'dcw-section',
 						'aria-expanded': open,
-						'aria-label': `${t(item.label)} — ${open ? t('collapse') : t('expand')}`,
-						onClick: () => { onToggleRow(item.key); },
+						'aria-label': `${t(row.label)} — ${open ? t('collapse') : t('expand')}`,
+						onClick: () => { onToggleRow(row.key); },
 					}, [
 						h(Chevron, { key: 'chevron', open }),
-						h('span', { key: 'swatch', className: 'dcw-swatch', style: { background: item.tint }, 'aria-hidden': true }),
-						h('span', { key: 'label', className: 'dcw-label' }, t(item.label)),
-					])
-					: h('span', { key: 'head', className: 'dcw-term' }, [
-						h('span', { key: 'swatch', className: 'dcw-swatch', style: { background: item.tint }, 'aria-hidden': true }),
-						h('span', { key: 'label', className: 'dcw-label' }, t(item.label)),
-					]);
-				const row = h('div', { key: item.key, className: 'dcw-row' }, [
-					head,
-					h('span', { key: 'definition', className: 'dcw-def' }, [
-						h('span', { key: 'value', className: 'dcw-value' }, `~${formatCompact(item.value)}`),
-						h('span', { key: 'percent', className: 'dcw-percent' }, formatPercent(item.share)),
-						expandable ? h('span', { key: 'count', className: 'dcw-count' }, String(item.count ?? detail.length)) : null,
+						h('span', { key: 'label', className: 'dcw-section-label' }, t(row.label)),
+						h('span', { key: 'value', className: 'dcw-section-value' }, `~${formatCompact(row.value)}`),
+						h('span', { key: 'count', className: 'dcw-section-count' }, String(row.count ?? entries.length)),
 					]),
-				]);
-				return open
-					? [row, h(DetailItems, { key: `${item.key}:items`, row: item, t, openItem, onToggleItem })]
-					: [row];
+				];
+				if (open) {
+					const hidden = Math.max(0, numberOr(row.count) - entries.length);
+					children.push(h('div', { key: `${row.key}:list`, className: 'dcw-list' }, [
+						...entries.map((entry) => h('div', { key: entry.key, className: 'dcw-entry' }, [
+							h('span', { key: 'name', className: 'dcw-entry-name', title: entry.title }, entry.label),
+							h('span', { key: 'value', className: 'dcw-entry-value' }, `~${formatCompact(entry.tokens)}`),
+						])),
+						hidden > 0 ? h('div', { key: 'more', className: 'dcw-more' }, fill(t('moreItems'), { count: String(hidden) })) : null,
+						numberOr(row.noteTokens) > 0
+							? h('div', { key: 'note', className: 'dcw-more' }, fill(t('skillToolNote'), { tokens: formatCompact(row.noteTokens) }))
+							: null,
+					]));
+				}
+				return children;
 			}));
+		}
+
+		/**
+		 * The legend: one plain row per bucket, then the free remainder. Following
+		 * the reference panel, the rows themselves carry no disclosure — the
+		 * classified buckets are disclosed by the sections underneath.
+		 */
+		function BreakdownRows(props) {
+			const { rows, free, freeShare, t } = props;
+			const items = [...rows, { key: 'free', label: 'free', value: free, share: freeShare, tint: TINT.free }];
+			return h('div', { className: 'dcw-rows' }, items.map((item) => h('div', { key: item.key, className: 'dcw-row' }, [
+				h('span', { key: 'head', className: 'dcw-term' }, [
+					h('span', { key: 'swatch', className: 'dcw-swatch', style: { background: item.tint }, 'aria-hidden': true }),
+					h('span', { key: 'label', className: 'dcw-label' }, t(item.label)),
+				]),
+				h('span', { key: 'definition', className: 'dcw-def' }, [
+					 h('span', { key: 'value', className: 'dcw-value' }, `~${item.signed ? (item.value < 0 ? '−' : '+') : ''}${formatCompact(Math.abs(item.value))}`),
+					 h('span', { key: 'percent', className: 'dcw-percent' }, `${item.share < 0 ? '−' : ''}${formatPercent(Math.abs(item.share))}`),
+				]),
+			])));
 		}
 
 		/**
@@ -644,8 +675,8 @@ window.__ModuleLoader__.load({
 		 * (title, figures, bar) and the row click reveals the per-bucket legend.
 		 */
 		function ContextPanel(props) {
-			const { occupancy, rows, free, freeShare, expanded, onToggle, openRow, onToggleRow, openItem, onToggleItem, t, panelRef, style } = props;
-			const figures = `${formatCompact(occupancy.used)} / ${formatCompact(occupancy.window)} (${String(occupancy.percent)}%)`;
+			const { occupancy, rows, barRows, free, freeShare, expanded, onToggle, openRow, onToggleRow, t, panelRef, style } = props;
+			const figures = `${occupancy.estimated ? '~' : ''}${formatCompact(occupancy.used)} / ${formatCompact(occupancy.window)} (${String(occupancy.percent)}%)`;
 			return h('div', {
 				ref: panelRef,
 				className: 'dcw-panel',
@@ -666,8 +697,9 @@ window.__ModuleLoader__.load({
 					h('span', { key: 'figures', className: 'dcw-figures' }, figures),
 					h(Chevron, { key: 'chevron', open: expanded }),
 				]),
-				h(OccupancyBar, { key: 'bar', rows }),
-				expanded ? h(BreakdownRows, { key: 'rows', rows, free, freeShare, t, openRow, onToggleRow, openItem, onToggleItem }) : null,
+				h(OccupancyBar, { key: 'bar', rows: barRows ?? rows }),
+				expanded ? h(BreakdownRows, { key: 'rows', rows, free, freeShare, t }) : null,
+				expanded ? h(DetailSections, { key: 'sections', rows, t, openRow, onToggleRow }) : null,
 			]);
 		}
 
@@ -679,21 +711,21 @@ window.__ModuleLoader__.load({
 		function ContextMeter(props) {
 			const t = props.t ?? ((key) => key);
 			const projectionOf = typeof props.useProjection === 'function' ? props.useProjection : () => undefined;
-			const occupancy = occupancyOf(projectionOf('contextPressure'));
+			const pressure = projectionOf('contextPressure');
 			const breakdown = projectionOf('contextBreakdown');
 			const [open, setOpen] = React.useState(false);
 			const [expanded, setExpanded] = React.useState(false);
 			const [openRow, setOpenRow] = React.useState(null);
-			const [openItem, setOpenItem] = React.useState(null);
 			const rootRef = React.useRef(null);
 			const panelRef = React.useRef(null);
 			const detail = useDetail(typeof props.sessionId === 'string' ? props.sessionId : undefined, open);
+			const occupancy = occupancyOf(pressure, breakdown, detail);
 			useHideShippedMeter(rootRef, occupancy !== null);
 			useDismiss(rootRef, panelRef, open, () => { setOpen(false); });
-			const revision = `${String(expanded)}:${openRow ?? ''}:${openItem ?? ''}:${String(detail?.generatedAt ?? 0)}`;
+			const revision = `${String(expanded)}:${openRow ?? ''}:${String(detail?.generatedAt ?? 0)}`;
 			const position = usePanelPosition(rootRef, panelRef, open, revision);
 			if (occupancy === null) return null;
-			const composition = compositionOf(breakdown, occupancy.window, detail);
+			const composition = compositionOf(breakdown, occupancy.window, detail, occupancy.used);
 			const reading = `${String(occupancy.percent)}%`;
 			const tip = fill(t('aria'), { percent: reading });
 			return h('span', { ref: rootRef, className: 'dcw-root', 'data-testid': 'context-window' }, [
@@ -707,7 +739,6 @@ window.__ModuleLoader__.load({
 					onClick: () => {
 						setExpanded(false);
 						setOpenRow(null);
-						setOpenItem(null);
 						setOpen(!open);
 					},
 				}, [
@@ -719,17 +750,13 @@ window.__ModuleLoader__.load({
 					key: 'panel',
 					occupancy,
 					rows: composition.rows,
+					barRows: composition.barRows,
 					free: composition.free,
 					freeShare: composition.freeShare,
 					expanded,
 					onToggle: () => { setExpanded((value) => !value); },
 					openRow,
-					onToggleRow: (key) => {
-						setOpenRow((current) => (current === key ? null : key));
-						setOpenItem(null);
-					},
-					openItem,
-					onToggleItem: (key) => { setOpenItem((current) => (current === key ? null : key)); },
+					onToggleRow: (key) => { setOpenRow((current) => (current === key ? null : key)); },
 					t,
 					panelRef,
 					style: position,
@@ -784,7 +811,8 @@ window.__ModuleLoader__.load({
 		exports.ContextPanel = ContextPanel;
 		exports.OccupancyBar = OccupancyBar;
 		exports.BreakdownRows = BreakdownRows;
-		exports.DetailItems = DetailItems;
+		exports.DetailSections = DetailSections;
+		exports.entriesOf = entriesOf;
 		exports.Ring = Ring;
 
 		module.exports = exports;

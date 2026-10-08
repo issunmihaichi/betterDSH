@@ -6,6 +6,9 @@
   "license": "MIT",
   "type": "module",
   "main": "lib/host.js",
+  "scripts": {
+    "test": "node tools/host-test.mjs && node tools/client-test.mjs"
+  },
   "exports": {
     ".": {
       "default": "./lib/host.js"
@@ -19,7 +22,8 @@
     "lib/host.js",
     "lib/client.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "lib/estimate.js"
   ],
   "dsh": {
     "bundle": {

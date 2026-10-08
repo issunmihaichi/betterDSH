@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { MCP_PREFIX, classifySession, mcpCoordinates, skillCatalog, splitTools } from '../lib/classify.js';
+import { MCP_PREFIX, classifySession, legacyUsageCorrection, mcpCoordinates, skillCatalog, splitTools } from '../lib/classify.js';
 import { CHARS_PER_TOKEN, estimateContent, estimateMessage, estimateText, estimateToolsTokens } from '../lib/estimate.js';
 
 let passed = 0;
@@ -215,6 +215,30 @@ check('an empty log classifies without inventing anything', () => {
   assert.equal(empty.tools.mcp.count, 0);
   assert.equal(empty.skills, null);
   assert.equal(empty.contextWindow, undefined);
+});
+
+check('corrects only a verified legacy sample and expires after a newer sample', () => {
+  const sample = { type: 'assistant/message', seq: 984, data: { usage: { inputTokens: 286557, cacheReadTokens: 285184, cacheWriteTokens: 0 } } };
+  const snapshots = { legacy: { sampleSeq: 984, inputTokens: 286557, cacheReadTokens: 285184, cacheWriteTokens: 0 } };
+  assert.deepEqual(legacyUsageCorrection([sample], 'legacy', snapshots), { sampleSeq: 984, pressureTokens: 571741, duplicateCacheTokens: 285184 });
+  assert.equal(legacyUsageCorrection([sample], 'other', snapshots), null);
+  assert.equal(legacyUsageCorrection([sample], 'legacy'), null);
+  assert.equal(legacyUsageCorrection([sample, { type: 'assistant/message', seq: 990, data: { usage: { inputTokens: 1373, cacheReadTokens: 285184 } } }], 'legacy', snapshots), null);
+  assert.equal(legacyUsageCorrection([{ ...sample, data: { usage: { inputTokens: 1373, cacheReadTokens: 285184 } } }], 'legacy', snapshots), null);
+  assert.equal(legacyUsageCorrection([{ ...sample, data: { usage: { inputTokens: 286557, cacheReadTokens: 285183 } } }], 'legacy', snapshots), null);
+  const payload = classifySession([sample], 'legacy', { ...options, legacyInputUsage: snapshots });
+  assert.equal(payload.usageCorrection.duplicateCacheTokens, 285184);
+});
+check('usage snapshots never treat Anthropic cache writes or malformed counts as duplicate input', () => {
+  for (const usage of [
+    { inputTokens: 25, cacheReadTokens: 10, cacheWriteTokens: 2 },
+    { inputTokens: 5, cacheReadTokens: 10, cacheWriteTokens: 0 },
+    { inputTokens: 25, cacheReadTokens: -1, cacheWriteTokens: 0 },
+  ]) {
+    const sample = { type: 'assistant/attempt', seq: 10, data: { usage } };
+    const snapshots = { guarded: { sampleSeq: 10, ...usage } };
+    assert.equal(legacyUsageCorrection([sample], 'guarded', snapshots), null);
+  }
 });
 
 console.log(`\n${String(passed)} passed, ${String(failures.length)} failed`);

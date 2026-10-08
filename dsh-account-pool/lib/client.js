@@ -24,19 +24,29 @@ window.__ModuleLoader__.load({
 		const React = require('react');
 		const h = React.createElement;
 
+		// =====================================================================
+		// § 1  Constants — routes, ids, vocabularies
+		// =====================================================================
+
 		/** Host routes this page reads and writes; document-relative, like the app's other routes. */
 		const ACCOUNTS_ROUTE = 'api/accountPool.accounts';
 		const USAGE_ROUTE = 'api/accountPool.usage';
 		const ACTION_ROUTE = 'api/accountPool.account';
+		const OAUTH_ROUTE = 'api/accountPool.oauth';
 		/** Locale namespace owned by this plugin. */
 		const NS = 'settings.accountPool';
 		/** Settings nav cell: fresh id, right after the usage page. */
 		const SECTION_ID = 'accountPool';
 		const SECTION_ORDER = 14;
-		/** Slots the Models page exposes for a provider directory row and the area after the add controls. */
-		const FOOTER_SLOT = 'settings.models.footer';
+		/**
+		 * The keyed card the Models page renders on a provider directory row,
+		 * dispatched with the Loader entry id.
+		 *
+		 * The pool switcher that used to be installed as a third tab inside the
+		 * shipped add-provider card is gone (DESIGN.md §27): that card is left exactly
+		 * as the shell renders it, and 「账号池」 is the only surface that manages pools.
+		 */
 		const PROVIDER_CARD_SLOT = 'settings.models.provider-card';
-		const FOOTER_ORDER = 20;
 		/**
 		 * The provider-card key is the Loader ENTRY ID (that is what the Host half
 		 * declares as `settingsNs`), and cordis.patch.yml pins that id.
@@ -44,16 +54,134 @@ window.__ModuleLoader__.load({
 		const ENTRY_ID = 'account-pool';
 		/** Platforms the form offers; must stay in step with the domain enum. */
 		const PLATFORMS = ['anthropic', 'openai', 'gemini', 'grok', 'custom'];
+		/**
+		 * Credential type and Claude Code mode vocabularies. Inlined for the same
+		 * reason as `PLATFORMS` — this bundle has no import step — so they must stay
+		 * in step with `lib/claude-code/constants.js`. A drifted value here is not
+		 * silent: the Host rejects the action with `invalid-argument`.
+		 */
+		const AUTH_MODES = ['api-key', 'oauth'];
+		const SELECTION_MODES = [['sticky', 'modeSticky'], ['load-aware', 'modeLoad'], ['prefer_soonest_reset', 'modeReset'], ['weighted-random', 'modeWeighted']];
+		const MIMICRY_MODES = ['off', 'claude-code'];
+		const POOL_DETECTION_KEYWORDS = ['号池检测', '池检测', '号池不可用'];
 		/** How many usage rows to show. */
 		const USAGE_LIMIT = 50;
+		/**
+		 * A v4 UUID. Reset requests are keyed by one, and an id that fails this test
+		 * is discarded rather than replayed, so a corrupt session record can never
+		 * turn into a duplicate reset.
+		 */
+		const RESET_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+		const SUPPLIER_PLATFORMS = ['anthropic', 'openai', 'gemini'];
+		const SUPPLIER_ZH = {
+			connectSupplier: '接入供应商', advancedAdd: '高级新增账号', supplierTitle: '接入供应商',
+			supplierHint: '填写供应商信息与 API Key。接入后，在聊天的模型列表里选择该供应商下的模型。',
+			openaiApi: '请求格式', openaiTransport: '传输方式', openaiChat: 'Chat Completions（/chat/completions）', openaiResponses: 'Responses（/responses）', openaiHttp: 'HTTP 流式（SSE）', openaiWebSocket: 'WebSocket', openaiWebSocketHint: 'WebSocket 需要上游支持 Responses WebSocket；模型目录仍通过 HTTP 获取。',
+			supplierName: '供应商名称', supplierProtocol: '调用协议', supplierAddress: 'API 地址', supplierKey: 'API Key', supplierModels: '可用模型',
+			supplierModelsHint: '多个模型用逗号或换行分隔，也可以从上游获取。', supplierDiscover: '获取模型目录', supplierDiscovering: '正在获取…',
+			supplierDiscoveryFailed: '获取失败：{message}。可以手动填写模型后接入。', supplierDiscoveryEmpty: '上游没有返回模型，请手动填写。', supplierDiscoveryDone: '已获取 {n} 个模型，可以编辑后接入。',
+			supplierAdvanced: '高级设置', supplierGroup: '加入已有供应商 / 分组', supplierNewGroup: '新建供应商',
+			supplierGroupHint: '同一供应商下可接入多个账号。已有分组限制模型时，需要填写它允许的模型。',
+			supplierClaudeCode: 'Claude Code 模式', supplierBeta: '可选 Anthropic Beta（逗号分隔）',
+			supplierRequired: '请填写供应商名称、API 地址、API Key 和至少一个模型。', supplierUrlInvalid: '请填写完整的 HTTP / HTTPS 地址；OpenAI 兼容也支持 WS / WSS 地址。',
+			supplierRestart: '重启 DSH 后可使用简化的供应商接入。现在仍可通过「新增账号」添加。',
+			supplierConnected: '已接入 {name}', supplierNext: '打开聊天输入框下方的模型列表，选择「{name}」下的模型，即可开始聊天。',
+			supplierAnthropic: 'Claude / Anthropic', supplierOpenai: 'OpenAI 兼容', supplierGemini: 'Gemini API', supplierCustom: '其他 OpenAI 兼容',
+		};
+		const SUPPLIER_EN = {
+			connectSupplier: 'Connect supplier', advancedAdd: 'Advanced account setup', supplierTitle: 'Connect supplier',
+			supplierHint: 'Enter the supplier details and API key. After connecting, choose one of its models in the chat model list.',
+			openaiApi: 'Request format', openaiTransport: 'Transport', openaiChat: 'Chat Completions (/chat/completions)', openaiResponses: 'Responses (/responses)', openaiHttp: 'HTTP streaming (SSE)', openaiWebSocket: 'WebSocket', openaiWebSocketHint: 'WebSocket requires upstream Responses WebSocket support; model discovery still uses HTTP.',
+			supplierName: 'Supplier name', supplierProtocol: 'API protocol', supplierAddress: 'API URL', supplierKey: 'API key', supplierModels: 'Available models',
+			supplierModelsHint: 'Separate models with commas or newlines, or fetch them from the supplier.', supplierDiscover: 'Fetch model list', supplierDiscovering: 'Fetching…',
+			supplierDiscoveryFailed: 'Could not fetch models: {message}. You can enter models manually and connect.', supplierDiscoveryEmpty: 'The supplier returned no models. Enter them manually.', supplierDiscoveryDone: 'Fetched {n} models. You can edit them before connecting.',
+			supplierAdvanced: 'Advanced settings', supplierGroup: 'Join an existing supplier / group', supplierNewGroup: 'Create a new supplier',
+			supplierGroupHint: 'A supplier can contain multiple accounts. If the existing group restricts models, enter models it allows.',
+			supplierClaudeCode: 'Claude Code mode', supplierBeta: 'Optional Anthropic betas (comma-separated)',
+			supplierRequired: 'Enter a supplier name, API URL, API key and at least one model.', supplierUrlInvalid: 'Enter a full HTTP / HTTPS URL; OpenAI-compatible suppliers also accept WS / WSS URLs.',
+			supplierRestart: 'Restart DSH to use simplified supplier setup. You can still use Add account now.',
+			supplierConnected: 'Connected {name}', supplierNext: 'Open the model list below the chat input and choose a model under “{name}” to start chatting.',
+			supplierAnthropic: 'Claude / Anthropic', supplierOpenai: 'OpenAI compatible', supplierGemini: 'Gemini API', supplierCustom: 'Other OpenAI compatible',
+		};
+
+		// =====================================================================
+		// § 2  Dictionaries — `zh` and `en` are the same key set, merged with the
+		//      supplier block above. Both must stay in lockstep: the locale
+		//      registry enforces bilingual balance at registration.
+		// =====================================================================
 
 		const zh = {
+			...SUPPLIER_ZH,
+			usageSummary: '最近 {n} 条 · 成功 {ok} · 失败 {failed} · 输入 {input} / 输出 {output}', usageAccount: '全部账号用量', usageModel: '筛选模型…', cacheDetail: '缓存写 {write} · 推理 {reasoning}',
+			fieldPoolDetectionRetry: '池检测重试',
+			poolDetectionHint: '命中检测关键词时不冷却账号，仅在输出前重试同一账号；达到重试上限后明确返回失败。次数为额外尝试次数，0 表示不重试。',
+			fieldPoolDetectionRetries: '额外重试次数（0–5）',
+			fieldPoolDetectionRetryDelayMs: '重试间隔（毫秒，100–10000）',
+			fieldPoolDetectionKeywords: '检测关键词（每行一个）',
+			poolDetectionKeywordsHint: '按文字关键词匹配，不使用正则；最多 20 项，每项 1–200 字符。',
+			poolDetectionInvalid: '请填写 0–5 的整数重试次数、100–10000 毫秒的整数间隔，关键词最多 20 项且每项不超过 200 字符。',
+			poolDetectionRestart: '重启 DSH 后可配置池检测重试。',
+			fieldBetas: 'Anthropic Beta（多个值用逗号分隔）',
+			fieldSelectionMode: '分组调度策略', modeSticky: '粘性会话', modeLoad: '负载感知', modeReset: '最早重置', modeWeighted: '加权随机', pagePrev: '上一页', pageNext: '下一页', pageSize: '每页数量', pageOf: '第 {page} / {total} 页',
+			restartRequired: '管理界面已更新。重启 DSH 后可使用账号测试、有效期编辑和新增批量操作。',
+			search: '搜索账号、备注、模型或地址…',
+			allPlatforms: '全部平台',
+			allStates: '全部状态',
+			allGroups: '全部分组',
+			ungrouped: '未分组',
+			noMatches: '没有符合条件的账号',
+			shown: '匹配 {n} / 共 {total} 个',
+			sortPriority: '按优先级',
+			sortName: '按账号名称',
+			sortRecent: '按最近使用',
+			autoRefresh: '每 15 秒刷新',
+			statusPaused: '已暂停调度',
+			statusExpired: '已到期',
+			actPause: '暂停调度',
+			actResume: '恢复调度',
+			actResetError: '重置异常',
+			actTest: '测试连接',
+			fieldNotes: '备注',
+			fieldExpiresAt: '有效期（本地时间，留空=永久）',
+			fieldLoadFactor: '负载系数（留空=使用并发上限）',
+			fieldSchedulable: '允许调度',
+			fieldAutoPause: '到期自动暂停',
+			colExpires: '有效期', quotaUnknown: '尚未查询', quotaUnsupported: '该类型暂无远端额度接口', quotaStale: '上次成功查询，数据已过期', quotaAt: '查询时间', quotaRemaining: '剩余 {n}%', quotaAmount: '剩余 {n}', quotaReset: '重置 {at}', quotaUnlimited: '无限', quotaCredits: '点数 {n}', quotaNoData: '上游未提供额度窗口', quotaRestart: '重启 DSH 后可使用远端额度查询和 Codex / Gemini 原生调用。', fieldProjectId: 'Google 项目 ID（留空自动发现）', fieldChatgptAccountId: 'ChatGPT 账号 ID（留空读取登录凭据）',
+			colLastUsed: '最近使用',
+			colAuthMode: '类型',
+			exportAction: '导出配置',
+			exportHint: '导出账号与分组配置，不包含密钥',
+			resultTitle: '操作结果',
+			testPassed: '测试成功 · {ms} ms',
+			testFailed: '测试失败：{message}',
+			actClearCooldown: '清冷却',
+			batchEdit: '批量编辑',
+			batchEditHint: '仅填写需要统一修改的字段；留空的字段保持原值。',
+			batchSave: '应用到所选账号',
+			resultDismiss: '收起结果',
+			permanent: '永久',
+
 			title: '账号池',
-			intro: '本机账号池：上游账号的调度状态、冷却窗口与最近用量。密钥不在本页显示，账号行只持有一个凭据引用。',
+			intro: '管理账号与分组，让每次请求都有清晰的去向。',
+			tabAccounts: '账号管理', tabGroups: '分组管理', tabUsage: '请求用量', tabLabel: '账号池管理页面',
+			cardGroups: '账号分组', cardGroupsHint: '独立路由，灵活调度',
+			accountsHint: '查看账号状态，维护连接与调度配置。', groupsHint: '把账号组织成独立号池，在模型菜单中快速切换。', usageHint: '最近请求的结果、Token 消耗与换号记录。',
+			colConnection: '连接 / 凭据', colScheduling: '调度', colActivity: '用量 / 额度',
+			viewAccountUsage: '查看用量', accountUsageTitle: '{name} · 用量与额度', accountUsageHint: '显示上游订阅额度；每个窗口按平台自己的周期重置。', refreshAccountUsage: '刷新用量', quotaLoading: '正在查询额度…', quotaRefreshing: '正在更新…', quotaQueryFailed: '额度查询失败，点击刷新重试。', quotaRemainingShort: '余 {n}%', quotaWindowPrimary: '主窗口', quotaWindowSecondary: '次窗口', quotaWindowHours: '{n} 小时', quotaWindowDays: '{n} 天', quotaResetsIn: '{time}后重置', quotaResetPending: '等待上游更新重置窗口', quotaUnknownValue: '未提供用量',
+			resetCardRetry: '重查本次使用结果', resetCardUncertain: '上次请求的结果尚未确认。此操作会复用原请求标识，查询同一次使用的结果。',
+			resetCards: '重置卡', resetCardsCount: '{n} 张可用', resetCardsUnknown: '尚未查询重置卡', resetCardsFailed: '重置卡查询失败', resetCardsExpired: '卡片到期', resetCardUse: '使用重置卡', resetCardConfirmTitle: '确认使用 {name} 的重置卡？', resetCardConfirmHint: '将消耗此账号的 1 张可用重置卡。实际重置的窗口以上游返回为准。', resetCardConfirm: '确认使用 1 张', resetCardCancel: '取消使用重置卡', resetCardNone: '没有可用重置卡', resetCardRestart: '重启 DSH 后可查询和使用重置卡。', resetCardSuccess: '已使用 1 张重置卡，重置 {n} 个额度窗口。', resetCardCrypto: '当前浏览器无法生成请求标识，请刷新后重试。', resetCardRefreshHint: '使用后会重新查询额度和剩余卡数。',
+			moreActions: '更多操作', allModels: '全部模型', clearFilters: '清除筛选',
+			sectionConnection: '基本信息与连接', sectionScheduling: '调度与有效期',
+			usageRequests: '请求数', usageSuccess: '成功', usageFailures: '失败', usageInput: '输入 Token', usageOutput: '输出 Token',
 			refresh: '刷新',
 			loading: '正在读取账号池…',
+			loadingHint: '正在向 Host 请求账号、分组与用量数据。',
+			loadFailedTitle: '无法读取账号池',
+			loadFailedHint: 'Host 没有返回账号数据。检查后端是否已重启，然后重试。',
+			retryLoad: '重新读取',
 			noConnection: '当前环境没有可用的连接',
-			empty: '账号池还没有账号。在插件配置里加入账号后重启该条目即可。',
+			empty: '账号池还没有账号。点击「接入供应商」、导入配置或通过 OAuth 登录添加。',
 			cardAccounts: '账号',
 			cardAccountsHint: '可用 {ready} · 冷却 {cooling} · 异常 {failed}',
 			cardRequests: '累计请求',
@@ -63,11 +191,9 @@ window.__ModuleLoader__.load({
 			accountsTitle: '账号',
 			usageTitle: '最近用量',
 			colAccount: '账号',
-			colPlatform: '平台',
 			colStatus: '状态',
 			colPriority: '优先级',
 			colSlots: '并发',
-			colCooling: '冷却剩余',
 			colFailures: '连续失败',
 			colTime: '时间',
 			colModel: '模型',
@@ -77,17 +203,23 @@ window.__ModuleLoader__.load({
 			colActions: '操作',
 			actEnable: '启用',
 			actDisable: '停用',
-			actPrefer: '设为优先',
+			batchSelected: '已选 {n} 个',
+			batchPickGroup: '选择分组…',
+			batchJoin: '加入分组',
+			batchLeave: '移出分组',
+			batchClear: '清除选择',
+			batchDelete: '批量删除',
+			batchConfirmDelete: '确认删除 {n} 个',
 			actClear: '清冷却',
 			actWorking: '处理中…',
 			actFailed: '操作失败：{message}',
-			preferred: '当前优先',
-			modelsTitle: '号池管理',
-			modelsHint: '选择一个账号作为首选，或在「账号池」页管理全部账号。',
-			modelsEmpty: '账号池还没有账号，先到「账号池」页添加。',
-			providerTitle: '号池',
+			providerEnabled: '已启用', providerDisabled: '已停用', fieldGroupEnabled: '启用此模型提供商',
+			groupFetchModels: '从上游获取模型', groupFetchingModels: '获取中…',
+			groupModelsHint: '读取此分组账号的上游模型目录并更新账号模型列表；分组白名单在保存后生效。',
+			groupModelsFetched: '已获取 {n} 个模型，勾选后保存。', groupModelsEmpty: '已获取 0 个模型，原有白名单已保留。', groupModelsFailed: '获取失败：{message}',
+			groupModelsSelectAll: '全选', groupModelsClear: '清除选择', groupModelsSearch: '搜索上游模型…', groupModelsSelected: '已选 {n} 个模型',
+			providerDeleteHint: '删除「{name}」分组和对应模型入口？分组中的账号会保留。',
 			providerHint: '{total} 个账号 · 可用 {ready} · 冷却 {cooling}',
-			colCredential: '凭据',
 			addAccount: '新增账号',
 			editAccount: '编辑',
 			deleteAccount: '删除',
@@ -101,17 +233,55 @@ window.__ModuleLoader__.load({
 			fieldLabel: '标签',
 			fieldPlatform: '平台',
 			fieldBaseUrl: '上游地址',
-			fieldCredential: '密钥',
+			fieldCredential: '密钥 / OAuth 令牌包',
 			fieldCredentialKeep: '留空表示不修改',
 			fieldModels: '模型（逗号分隔，留空=全部）',
 			fieldPriority: '优先级（越小越优先）',
 			fieldWeight: '权重',
 			fieldConcurrency: '并发上限（0=不限）',
+			fieldAuthMode: '凭据类型',
+			fieldMimicry: 'Claude Code 模式',
+			authModeApiKey: 'API Key（x-api-key）',
+			authModeOauth: 'OAuth 订阅号（Bearer）',
+			mimicryOff: '关闭',
+			mimicryClaudeCode: '伪装成官方 CLI',
+			mimicryOn: 'CC 模式',
+			actMimicryOn: '开启 CC 模式',
+			actMimicryOff: '关闭 CC 模式',
+			mimicryHint: 'Claude Code 模式：把该账号的上游请求伪装成官方 CLI —— 改写 system 为官方三块形态、注入 x-anthropic-billing-header 计费块与 metadata.user_id 指纹、对齐 CLI 请求头与 ?beta=true 端点，并补齐 CLI 必发字段（Opus 5.5 不发 temperature）。只有订阅号（OAuth）需要它；开启后客户端原本的 system 提示词会被迁移到首轮对话里，缓存断点跟着一起搬。',
 			credConfigured: '已配置',
 			credMissing: '未配置',
 			credReadOnly: '只读',
 			credSource: '来源 {source}',
 			importAction: '导入',
+			oauthAction: 'OAuth 登录',
+			oauthTitle: 'OAuth 登录上游账号',
+			oauthHint: '选择提供商并点击「开始登录」，在官方授权页完成登录。本地回调会自动接入账号；需要手动完成时，再粘贴回调地址或 code。',
+			oauthProvider: '提供商',
+			oauthStart: '开始登录',
+			oauthOpen: '打开授权页',
+			oauthWaiting: '等待授权…',
+			oauthManual: '这个提供商的回调地址在厂商那边，需要你手动把地址栏里的整条 URL（或 code）粘回来。',
+			oauthCallback: '本地回调已就绪：授权完成后本页会自动发现（也可以手动粘贴）。',
+			oauthInput: '回调地址或 code',
+			oauthInputPlaceholder: 'http://localhost:14518/oauth/callback?code=…&state=…',
+			oauthFinish: '完成登录',
+			oauthCancel: '取消登录',
+			oauthDone: '登录成功，账号 {id} 已加入号池',
+			oauthCompletedTitle: '登录已完成', oauthCompletedHint: '账号已保存。点击「完成并返回」查看账号列表。', oauthReturn: '完成并返回', oauthAddAnother: '继续添加账号',
+			oauthFailed: '登录失败：{message}',
+			oauthExpires: '本次登录 {time} 后过期',
+			oauthNoCredential: '凭据服务不可用，登录结果无处保存',
+			oauthUnverified: '端点未核实',
+			oauthCaveat: '注意：{text}',
+			oauthCopy: '复制',
+			oauthCopied: '已复制',
+			oauthCheck: '自检参数',
+			oauthCheckOk: '本插件发出去的那几个参数没问题。若浏览器里仍是错误页，请把地址栏里那条 URL（或页面上的错误 JSON）发出来 —— 那是厂商自己的话。',
+			oauthCheckProblems: '发现问题：{list}',
+			oauthRedirectHost: '回调主机名',
+			oauthRedirectHostHint: '厂商那边注册的是哪个就选哪个 —— `localhost` 和 `127.0.0.1` 在它们看来是两个不同的字符串，不会互相兼容。授权页报 invalid_authorize_request／redirect_uri 时先换这个。',
+			oauthEmptyProviders: '没有可用的 OAuth 提供商',
 			importTitle: '导入号池',
 			importHint: '粘贴 sub2api 管理员备份，或 CPA auth 文件（JSON）。支持 {data:{accounts:[…]}}、裸数组、单个账号／单个 CPA 文件。',
 			importRun: '开始导入',
@@ -123,15 +293,15 @@ window.__ModuleLoader__.load({
 			groupAdd: '新建分组',
 			groupEmpty: '还没有分组。分组会作为独立的模型提供商出现（号池-组名），可在「模型」页直接切换。',
 			groupMembers: '{n} 个账号',
-			groupRoutes: '路由',
 			formGroupCreate: '新建分组',
 			formGroupEdit: '编辑分组 {id}',
 			fieldGroupId: 'ID（会成为路由后缀：号池-<ID>）',
 			fieldGroupLabel: '名称',
 			fieldGroupModels: '模型白名单（逗号分隔，留空=不限）',
 			fieldGroupDescription: '说明',
-			colGroups: '分组',
 			fieldGroups: '所属分组',
+			fieldGroupPriority: '组内优先级（留空=用账号自身优先级）',
+			fieldGroupPriorityInherit: '继承',
 			noGroups: '未分组',
 			statusActive: '可用',
 			statusError: '异常',
@@ -147,14 +317,78 @@ window.__ModuleLoader__.load({
 			secondsShort: '{n} 秒',
 			minutesShort: '{n} 分',
 			hoursShort: '{n} 小时',
-			footer: '仅本机 · 数据来自插件自己的 domain 表',
+			footer: '账号池本机管理 · 用量与重置卡数据来自上游',
 		};
 
 		const en = {
+			...SUPPLIER_EN,
+			usageSummary: 'Latest {n} records · Success {ok} · Failed {failed} · Input {input} / Output {output}', usageAccount: 'All account usage', usageModel: 'Filter models…', cacheDetail: 'Cache write {write} · Reasoning {reasoning}',
+			fieldPoolDetectionRetry: 'Pool detection retry',
+			poolDetectionHint: 'Matched detection keywords do not cool down the account. Retry the same account only before output; report failure when the retry limit is reached. The count is additional attempts; 0 disables retries.',
+			fieldPoolDetectionRetries: 'Additional retries (0–5)',
+			fieldPoolDetectionRetryDelayMs: 'Retry interval (ms, 100–10000)',
+			fieldPoolDetectionKeywords: 'Detection keywords (one per line)',
+			poolDetectionKeywordsHint: 'Literal keywords, no regular expressions. Up to 20 entries, 1–200 characters each.',
+			poolDetectionInvalid: 'Enter integer retries from 0 to 5, an integer interval from 100 to 10000 ms, and up to 20 keywords of at most 200 characters each.',
+			poolDetectionRestart: 'Restart DSH to configure pool detection retries.',
+			fieldBetas: 'Anthropic betas (comma separated)',
+			fieldSelectionMode: 'Group scheduling strategy', modeSticky: 'Sticky session', modeLoad: 'Load aware', modeReset: 'Soonest reset', modeWeighted: 'Weighted random', pagePrev: 'Previous', pageNext: 'Next', pageSize: 'Page size', pageOf: 'Page {page} of {total}',
+			restartRequired: 'The management page is updated. Restart DSH to enable account tests, expiry editing and new batch actions.',
+			search: 'Search accounts, notes, models or URL…',
+			allPlatforms: 'All platforms',
+			allStates: 'All statuses',
+			allGroups: 'All groups',
+			ungrouped: 'Ungrouped',
+			noMatches: 'No accounts match these filters',
+			shown: 'Showing {n} of {total}',
+			sortPriority: 'Priority',
+			sortName: 'Account name',
+			sortRecent: 'Last used',
+			autoRefresh: 'Refresh every 15 seconds',
+			statusPaused: 'Scheduling paused',
+			statusExpired: 'Expired',
+			actPause: 'Pause scheduling',
+			actResume: 'Resume scheduling',
+			actResetError: 'Reset error',
+			actTest: 'Test connection',
+			fieldNotes: 'Notes',
+			fieldExpiresAt: 'Expires at (local time, blank = permanent)',
+			fieldLoadFactor: 'Load factor (blank = concurrency)',
+			fieldSchedulable: 'Allow scheduling',
+			fieldAutoPause: 'Pause when expired',
+			colExpires: 'Expires at', quotaUnknown: 'Not queried', quotaUnsupported: 'No remote quota API for this account type', quotaStale: 'Last successful query; data is stale', quotaAt: 'Queried at', quotaRemaining: '{n}% remaining', quotaAmount: '{n} remaining', quotaReset: 'Resets {at}', quotaUnlimited: 'Unlimited', quotaCredits: 'Credits {n}', quotaNoData: 'Upstream provided no quota windows', quotaRestart: 'Restart DSH to enable remote quota queries and native Codex / Gemini calls.', fieldProjectId: 'Google project ID (discover if blank)', fieldChatgptAccountId: 'ChatGPT account ID (from login if blank)',
+			colLastUsed: 'Last used',
+			colAuthMode: 'Type',
+			exportAction: 'Export configuration',
+			exportHint: 'Export account and group configuration without secrets',
+			resultTitle: 'Action results',
+			testPassed: 'Test passed · {ms} ms',
+			testFailed: 'Test failed: {message}',
+			actClearCooldown: 'Clear cooldown',
+			batchEdit: 'Batch edit',
+			batchEditHint: 'Fill only fields to change for all selected accounts; blank fields remain unchanged.',
+			batchSave: 'Apply to selected accounts',
+			resultDismiss: 'Dismiss results',
+			permanent: 'Permanent',
+
 			title: 'Account pool',
-			intro: 'Local account pool: scheduling state, cooling windows and recent usage. Secrets are never shown here — an account row holds only a credential reference.',
+			intro: 'Manage accounts and groups, and see where each request goes.',
+			tabAccounts: 'Accounts', tabGroups: 'Groups', tabUsage: 'Usage', tabLabel: 'Account pool pages',
+			cardGroups: 'Account groups', cardGroupsHint: 'Independent routes and scheduling',
+			accountsHint: 'Monitor account health and manage connections and scheduling.', groupsHint: 'Organize accounts into pools you can select from the model menu.', usageHint: 'Recent request results, token usage and account switches.',
+			colConnection: 'Connection / credential', colScheduling: 'Scheduling', colActivity: 'Usage / quota',
+			viewAccountUsage: 'View usage', accountUsageTitle: '{name} · Usage and quota', accountUsageHint: 'Subscription quota from the provider; each window resets on its own schedule.', refreshAccountUsage: 'Refresh usage', quotaLoading: 'Querying quota…', quotaRefreshing: 'Updating…', quotaQueryFailed: 'Quota query failed. Refresh to retry.', quotaRemainingShort: '{n}% left', quotaWindowPrimary: 'Primary window', quotaWindowSecondary: 'Secondary window', quotaWindowHours: '{n} hours', quotaWindowDays: '{n} days', quotaResetsIn: 'Resets in {time}', quotaResetPending: 'Waiting for the provider to update this window', quotaUnknownValue: 'Usage not provided',
+			resetCardRetry: 'Check this reset result', resetCardUncertain: 'The previous request has no confirmed result. This reuses its request ID to recover the same operation.',
+			resetCards: 'Reset cards', resetCardsCount: '{n} available', resetCardsUnknown: 'Reset cards not queried', resetCardsFailed: 'Reset card query failed', resetCardsExpired: 'Card expires', resetCardUse: 'Use reset card', resetCardConfirmTitle: 'Use a reset card for {name}?', resetCardConfirmHint: 'This consumes one available reset card on this account. The provider determines which windows reset.', resetCardConfirm: 'Confirm use of 1 card', resetCardCancel: 'Cancel reset card use', resetCardNone: 'No reset cards available', resetCardRestart: 'Restart DSH to query and use reset cards.', resetCardSuccess: 'Used 1 reset card and reset {n} quota windows.', resetCardCrypto: 'This browser cannot create a request ID. Refresh and retry.', resetCardRefreshHint: 'Quota and card count are queried again after use.',
+			moreActions: 'More actions', allModels: 'All models', clearFilters: 'Clear filters',
+			sectionConnection: 'Account & connection', sectionScheduling: 'Scheduling & expiry',
+			usageRequests: 'Requests', usageSuccess: 'Succeeded', usageFailures: 'Failed', usageInput: 'Input tokens', usageOutput: 'Output tokens',
 			refresh: 'Refresh',
 			loading: 'Reading the account pool…',
+			loadingHint: 'Requesting accounts, groups, and usage from the Host.',
+			loadFailedTitle: 'The account pool could not be read',
+			loadFailedHint: 'The Host returned no account data. Check that the backend has restarted, then retry.',
+			retryLoad: 'Read again',
 			noConnection: 'No usable connection in this environment',
 			empty: 'The pool has no accounts yet. Add accounts to the plugin config and reload the entry.',
 			cardAccounts: 'Accounts',
@@ -166,11 +400,9 @@ window.__ModuleLoader__.load({
 			accountsTitle: 'Accounts',
 			usageTitle: 'Recent usage',
 			colAccount: 'Account',
-			colPlatform: 'Platform',
 			colStatus: 'Status',
 			colPriority: 'Priority',
 			colSlots: 'Slots',
-			colCooling: 'Cooling for',
 			colFailures: 'Failures',
 			colTime: 'Time',
 			colModel: 'Model',
@@ -180,17 +412,23 @@ window.__ModuleLoader__.load({
 			colActions: 'Actions',
 			actEnable: 'Enable',
 			actDisable: 'Disable',
-			actPrefer: 'Make preferred',
+			batchSelected: '{n} selected',
+			batchPickGroup: 'Pick a group…',
+			batchJoin: 'Add to group',
+			batchLeave: 'Remove from group',
+			batchClear: 'Clear selection',
+			batchDelete: 'Delete selected',
+			batchConfirmDelete: 'Confirm deleting {n}',
 			actClear: 'Clear cooldown',
 			actWorking: 'Working…',
 			actFailed: 'Action failed: {message}',
-			preferred: 'preferred',
-			modelsTitle: 'Account pool',
-			modelsHint: 'Pick an account to prefer, or manage the whole pool on the Account pool page.',
-			modelsEmpty: 'The pool has no accounts yet — add them on the Account pool page.',
-			providerTitle: 'Account pool',
+			providerEnabled: 'Enabled', providerDisabled: 'Disabled', fieldGroupEnabled: 'Enable this model provider',
+			groupFetchModels: 'Fetch models from upstream', groupFetchingModels: 'Fetching…',
+			groupModelsHint: 'Fetch this group’s upstream catalogs and refresh account model lists. The group allowlist takes effect after saving.',
+			groupModelsFetched: 'Fetched {n} models. Select models, then save.', groupModelsEmpty: 'Fetched 0 models. The existing allowlist has been kept.', groupModelsFailed: 'Fetch failed: {message}',
+			groupModelsSelectAll: 'Select all', groupModelsClear: 'Clear selection', groupModelsSearch: 'Search upstream models…', groupModelsSelected: '{n} models selected',
+			providerDeleteHint: 'Delete the group “{name}” and its model entry? Its accounts will be kept.',
 			providerHint: '{total} accounts · {ready} ready · {cooling} cooling',
-			colCredential: 'Credential',
 			addAccount: 'Add account',
 			editAccount: 'Edit',
 			deleteAccount: 'Delete',
@@ -204,17 +442,55 @@ window.__ModuleLoader__.load({
 			fieldLabel: 'Label',
 			fieldPlatform: 'Platform',
 			fieldBaseUrl: 'Base URL',
-			fieldCredential: 'API key',
+			fieldCredential: 'API key / OAuth credential bundle',
 			fieldCredentialKeep: 'Leave blank to keep',
 			fieldModels: 'Models (comma separated; blank = all)',
 			fieldPriority: 'Priority (lower wins)',
 			fieldWeight: 'Weight',
 			fieldConcurrency: 'Concurrency cap (0 = unlimited)',
+			fieldAuthMode: 'Credential type',
+			fieldMimicry: 'Claude Code mode',
+			authModeApiKey: 'API key (x-api-key)',
+			authModeOauth: 'OAuth subscription (Bearer)',
+			mimicryOff: 'Off',
+			mimicryClaudeCode: 'Impersonate the official CLI',
+			mimicryOn: 'CC mode',
+			actMimicryOn: 'Enable CC mode',
+			actMimicryOff: 'Disable CC mode',
+			mimicryHint: 'Claude Code mode: disguise this account’s upstream request as the official CLI — rebuilds `system` into the official three blocks, injects the x-anthropic-billing-header block plus the metadata.user_id fingerprint, aligns the CLI headers and the ?beta=true endpoint, and fills the fields the CLI always sends (Opus 5.5 gets no temperature). Only subscription (OAuth) accounts need it; enabling it migrates the client’s own system prompt into the first turn of the conversation, cache breakpoint included.',
 			credConfigured: 'set',
 			credMissing: 'unset',
 			credReadOnly: 'read-only',
 			credSource: 'from {source}',
 			importAction: 'Import',
+			oauthAction: 'OAuth sign-in',
+			oauthTitle: 'Sign in an upstream account over OAuth',
+			oauthHint: 'Choose a provider and start the login on its official consent page. A local callback adds the account automatically; paste the callback URL or code only when manual completion is needed.',
+			oauthProvider: 'Provider',
+			oauthStart: 'Start login',
+			oauthOpen: 'Open the consent page',
+			oauthWaiting: 'Waiting for authorization…',
+			oauthManual: 'This provider sends the callback to its own page, so paste the whole URL from the address bar (or the code) back here.',
+			oauthCallback: 'The local callback listener is up: this page discovers the result on its own (pasting still works).',
+			oauthInput: 'Callback URL or code',
+			oauthInputPlaceholder: 'http://localhost:14518/oauth/callback?code=…&state=…',
+			oauthFinish: 'Finish login',
+			oauthCancel: 'Cancel login',
+			oauthDone: 'Signed in — account {id} was added to the pool',
+			oauthCompletedTitle: 'Sign-in complete', oauthCompletedHint: 'Your account is saved. Select Done and return to view the account list.', oauthReturn: 'Done and return', oauthAddAnother: 'Add another account',
+			oauthFailed: 'Login failed: {message}',
+			oauthExpires: 'This login expires in {time}',
+			oauthNoCredential: 'The credentials service is unavailable, so a login could not be stored',
+			oauthUnverified: 'endpoints unverified',
+			oauthCaveat: 'Note: {text}',
+			oauthCopy: 'Copy',
+			oauthCopied: 'Copied',
+			oauthCheck: 'Check parameters',
+			oauthCheckOk: 'Every parameter this pool controls looks right. If the browser still shows an error page, send the URL from the address bar (or the error JSON on the page) — that is the vendor’s own message.',
+			oauthCheckProblems: 'Problem found: {list}',
+			oauthRedirectHost: 'Callback hostname',
+			oauthRedirectHostHint: 'Pick the spelling the vendor registered — `localhost` and `127.0.0.1` are two different strings to them and are not interchangeable. Switch this first when the consent page answers invalid_authorize_request / redirect_uri.',
+			oauthEmptyProviders: 'No OAuth provider is available',
 			importTitle: 'Import a pool',
 			importHint: 'Paste a sub2api admin backup, or CPA auth files (JSON). Accepts {data:{accounts:[…]}}, a bare array, a single account, or a single CPA file.',
 			importRun: 'Import',
@@ -226,15 +502,15 @@ window.__ModuleLoader__.load({
 			groupAdd: 'New group',
 			groupEmpty: 'No groups yet. Each group appears as its own model provider (pool-<id>) and can be switched on the Models page.',
 			groupMembers: '{n} account(s)',
-			groupRoutes: 'Routes',
 			formGroupCreate: 'New group',
 			formGroupEdit: 'Edit group {id}',
 			fieldGroupId: 'ID (becomes the route suffix: pool-<ID>)',
 			fieldGroupLabel: 'Name',
 			fieldGroupModels: 'Model allow-list (comma separated; blank = any)',
 			fieldGroupDescription: 'Description',
-			colGroups: 'Groups',
 			fieldGroups: 'Groups',
+			fieldGroupPriority: 'Priority within each pool (blank = inherit the account’s own)',
+			fieldGroupPriorityInherit: 'inherit',
 			noGroups: 'ungrouped',
 			statusActive: 'ready',
 			statusError: 'failed',
@@ -250,78 +526,128 @@ window.__ModuleLoader__.load({
 			secondsShort: '{n}s',
 			minutesShort: '{n}m',
 			hoursShort: '{n}h',
-			footer: 'Local only · read from the plugin’s own domain tables',
+			footer: 'Local account management · Usage and reset card data come from the provider',
 		};
 
 		const dicts = { zh, en };
 
+		// =====================================================================
+		// § 3  Stylesheet — one `<style>` tag, scoped under `.dap-root`, coloured
+		//      entirely through `--dsw-alias-*` platform variables so the page
+		//      follows the shell's light/dark theme without a second stylesheet.
+		// =====================================================================
+
 		const CSS = `
-.dap-root{display:flex;flex-direction:column;gap:14px;padding:2px 0 4px}
-.dap-head{display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap}
-.dap-head-text{flex:1 1 auto;min-width:0}
-.dap-title{margin:0;font-size:15px;font-weight:600;color:var(--dsw-alias-label-primary)}
-.dap-intro{margin:4px 0 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
-.dap-refresh{border:1px solid var(--dsw-alias-border-l1);background:transparent;color:var(--dsw-alias-label-secondary);border-radius:var(--dsw-radius-sm,6px);padding:2px 10px;font:inherit;font-size:12px;line-height:20px;cursor:pointer}
-.dap-refresh:hover{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2)}
-.dap-cards{display:flex;gap:10px;flex-wrap:wrap}
-.dap-card{flex:1 1 170px;min-width:0;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-md,8px);background:var(--dsw-alias-bg-layer-1);padding:10px 12px}
-.dap-card-label{font-size:11px;color:var(--dsw-alias-label-secondary)}
-.dap-card-value{margin-top:2px;font-size:20px;font-weight:600;color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums}
-.dap-card-hint{margin-top:2px;font-size:11px;color:var(--dsw-alias-label-secondary)}
-.dap-panel{border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-md,8px);background:var(--dsw-alias-bg-layer-1);overflow:hidden}
-.dap-panel-head{display:flex;align-items:baseline;gap:8px;padding:10px 12px 8px}
-.dap-panel-title{margin:0;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}
-.dap-table{width:100%;border-collapse:collapse;font-size:12px}
-.dap-table th{text-align:left;font-weight:500;color:var(--dsw-alias-label-secondary);padding:6px 12px;border-top:1px solid var(--dsw-alias-border-l1);white-space:nowrap}
-.dap-table td{padding:6px 12px;border-top:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-primary);vertical-align:top}
-.dap-num{font-variant-numeric:tabular-nums;white-space:nowrap}
-.dap-mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
-.dap-dim{color:var(--dsw-alias-label-secondary)}
-.dap-pill{display:inline-block;border-radius:999px;padding:0 7px;font-size:11px;line-height:16px;border:1px solid transparent}
-.dap-pill-ready{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}
-.dap-pill-cooling{color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary)}
-.dap-pill-failed{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
-.dap-pill-idle{color:var(--dsw-alias-state-idle-primary);border-color:var(--dsw-alias-border-l2)}
-.dap-status{padding:12px;font-size:12px;color:var(--dsw-alias-label-secondary)}
-.dap-foot{font-size:11px;color:var(--dsw-alias-label-secondary)}
-.dap-actions{display:flex;gap:6px;flex-wrap:wrap}
-.dap-btn{border:1px solid var(--dsw-alias-border-l1);background:transparent;color:var(--dsw-alias-label-secondary);border-radius:var(--dsw-radius-sm,6px);padding:0 7px;font:inherit;font-size:11px;line-height:18px;cursor:pointer;white-space:nowrap}
-.dap-btn:hover:not(:disabled){color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2)}
-.dap-btn:disabled{opacity:.5;cursor:default}
-.dap-btn-primary{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}
-.dap-error{font-size:11px;color:var(--dsw-alias-state-error-primary)}
-.dap-models{display:flex;flex-direction:column;gap:8px;border:1px dashed var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md,8px);padding:10px 12px}
-.dap-models-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
-.dap-models-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}
-.dap-models-hint{font-size:11px;color:var(--dsw-alias-label-secondary)}
-.dap-models-row{display:flex;align-items:center;gap:8px;font-size:12px;padding:4px 0;border-top:1px solid var(--dsw-alias-border-l1)}
-.dap-models-name{font-weight:500;color:var(--dsw-alias-label-primary)}
-.dap-preferred{font-size:11px;color:var(--dsw-alias-brand-primary)}
-.dap-form{border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md,8px);background:var(--dsw-alias-bg-layer-2);padding:12px;display:flex;flex-direction:column;gap:10px}
-.dap-form-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}
-.dap-form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px 12px}
-.dap-field{display:flex;flex-direction:column;gap:3px;min-width:0}
-.dap-field-label{font-size:11px;color:var(--dsw-alias-label-secondary)}
-.dap-input{border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;line-height:20px;padding:2px 7px;min-width:0}
-.dap-form-actions{display:flex;gap:8px}
-.dap-cred-set{color:var(--dsw-alias-state-success-primary);font-size:11px}
-.dap-cred-missing{color:var(--dsw-alias-state-warn-primary);font-size:11px}
-.dap-textarea{min-height:130px;width:100%;box-sizing:border-box;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:16px;white-space:pre;resize:vertical}
-.dap-head-actions{display:flex;gap:8px;align-items:flex-start}
+.dap-root{--dap-accent:var(--dsw-alias-brand-primary,#4263eb);--dap-surface:var(--dsw-alias-bg-layer-1,#fff);--dap-base:var(--dsw-alias-bg-base,#f7f8fb);--dap-border:var(--dsw-alias-border-l1,#e8ebf1);--dap-text:var(--dsw-alias-label-primary,#202635);--dap-muted:var(--dsw-alias-label-secondary,#7b8495);--dap-soft:color-mix(in srgb,var(--dap-accent) 7%,var(--dap-surface));display:flex;flex-direction:column;gap:22px;min-width:0;padding:8px 0 24px;color:var(--dap-text);font-size:13px;line-height:1.55}
+.dap-root *{box-sizing:border-box}.dap-root [hidden]{display:none!important}
+.dap-models-provider[data-native-edit=true] .dap-provider-edit-fallback{display:none}.dap-models-provider{padding:12px 20px;gap:12px}.dap-models-provider[data-expanded=false]{display:none}.dap-models-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.dap-provider-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none;background:var(--dsw-alias-state-success-primary,#20c56b)}.dap-provider-dot[data-enabled=false]{background:var(--dsw-alias-label-tertiary,#777)}.dap-provider-state{font-size:12px;color:var(--dap-muted)}.dap-provider-state[data-enabled=true]{color:var(--dsw-alias-state-success-primary,#208669)}
+.dap-head{display:flex;align-items:center;justify-content:space-between;gap:18px;flex-wrap:wrap;padding:4px 0 2px}
+.dap-head-text{display:flex;gap:14px;align-items:center;flex:1 1 270px;min-width:0}.dap-heading-copy{min-width:0}
+.dap-brand-mark{display:grid;place-items:center;flex:none;width:46px;height:46px;border:1px solid color-mix(in srgb,var(--dap-accent) 18%,var(--dap-border));border-radius:14px;background:var(--dap-soft);color:var(--dap-accent)}
+.dap-title{margin:0;font-size:24px;font-weight:650;letter-spacing:-.5px;line-height:1.35;color:var(--dsw-alias-label-primary,#202635)}
+.dap-intro{margin:5px 0 0;font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary,#7b8495)}
+.dap-icon{width:17px;height:17px;flex:none;stroke:currentColor;stroke-width:1.7;fill:none;stroke-linecap:round;stroke-linejoin:round}
+.dap-head-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.dap-btn,.dap-refresh{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;border:1px solid var(--dsw-alias-border-l1,#e8ebf1);background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#202635);border-radius:8px;padding:5px 11px;font:inherit;font-size:12px;line-height:20px;font-weight:500;cursor:pointer;white-space:nowrap;transition:background .15s,border-color .15s,color .15s}
+.dap-btn:hover:not(:disabled),.dap-refresh:hover:not(:disabled){background:color-mix(in srgb,var(--dsw-alias-brand-primary,#4263eb) 6%,var(--dsw-alias-bg-layer-1,#fff));border-color:color-mix(in srgb,var(--dsw-alias-brand-primary,#4263eb) 32%,var(--dsw-alias-border-l1,#e8ebf1))}
+.dap-btn:disabled,.dap-refresh:disabled,.dap-input:disabled{opacity:.5;cursor:default}.dap-btn-primary{color:var(--dsw-alias-bg-base,#fff);background:var(--dsw-alias-brand-primary,#4263eb);border-color:var(--dsw-alias-brand-primary,#4263eb)}.dap-btn-primary:hover:not(:disabled){background:color-mix(in srgb,var(--dsw-alias-brand-primary,#4263eb) 88%,#000);color:var(--dsw-alias-bg-base,#fff);border-color:transparent}
+.dap-btn-danger{color:var(--dsw-alias-state-error-primary,#db5262)}.dap-btn-soft{color:var(--dsw-alias-brand-primary,#4263eb);background:color-mix(in srgb,var(--dsw-alias-brand-primary,#4263eb) 8%,var(--dsw-alias-bg-layer-1,#fff));border-color:transparent}
+.dap-root :is(button,input,select,textarea,summary):focus-visible{outline:2px solid var(--dap-accent);outline-offset:3px}
+.dap-cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.dap-card{min-width:0;border:1px solid var(--dap-border);border-radius:13px;background:var(--dap-surface);padding:17px 18px;box-shadow:0 2px 5px #00000003}.dap-card-top{display:flex;justify-content:space-between;align-items:center;gap:10px}.dap-card-icon{display:grid;place-items:center;width:30px;height:30px;border-radius:9px;background:var(--dap-soft);color:var(--dap-accent)}.dap-card-label{font-size:12px;color:var(--dap-muted);font-weight:500}.dap-card-value{margin-top:8px;font-size:28px;line-height:1.3;font-weight:650;letter-spacing:-.6px;color:var(--dap-text);font-variant-numeric:tabular-nums}.dap-card-hint{margin-top:6px;font-size:11px;line-height:1.6;color:var(--dap-muted)}
+.dap-workspace{display:flex;flex-direction:column;gap:16px;min-width:0}.dap-tabs{display:flex;gap:6px;border-bottom:1px solid var(--dap-border);padding:0 2px;overflow-x:auto}.dap-tab{display:inline-flex;align-items:center;justify-content:center;gap:8px;flex:none;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--dap-muted);font:inherit;font-size:13px;font-weight:500;padding:11px 14px 13px;cursor:pointer}.dap-tab[aria-selected=true]{border-bottom-color:var(--dap-accent);color:var(--dap-accent)}.dap-tab:hover{color:var(--dap-text)}.dap-tab-count{font-size:10px;line-height:18px;min-width:20px;text-align:center;padding:0 5px;border-radius:5px;background:color-mix(in srgb,var(--dap-muted) 9%,var(--dap-surface));color:var(--dap-muted)}.dap-tab[aria-selected=true] .dap-tab-count{background:var(--dap-soft);color:var(--dap-accent)}
+.dap-panel{min-width:0;border:1px solid var(--dap-border);border-radius:13px;background:var(--dap-surface)}.dap-panel-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:18px 20px 14px;flex-wrap:wrap}.dap-panel-title{margin:0;font-size:14px;font-weight:600;color:var(--dap-text)}.dap-panel-subtitle{font-size:11px;color:var(--dap-muted);margin:3px 0 0}.dap-panel-count{font-size:11px;color:var(--dap-muted)}
+.dap-toolbar{display:flex;gap:9px;flex-wrap:wrap;align-items:center;padding:0 20px 16px}.dap-toolbar .dap-input{max-width:100%;min-height:34px}.dap-toolbar .dap-check-label{margin-left:auto;color:var(--dap-muted);font-size:11px}.dap-search-box{position:relative;flex:1 1 240px;min-width:180px}.dap-search-box>.dap-icon{position:absolute;top:10px;left:10px;color:var(--dap-muted);pointer-events:none}.dap-search-box>.dap-search{width:100%;padding-left:34px}.dap-filter-meta{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-basis:100%;padding-top:3px;font-size:11px;color:var(--dap-muted)}.dap-pagination{border-top:1px solid var(--dap-border);padding:12px 20px;justify-content:space-between}.dap-pagination .dap-input{width:68px;min-height:30px}.dap-pagination .dap-check-label{margin-left:0}.dap-pagination-nav{display:flex;align-items:center;gap:10px}.dap-page-label{font-size:11px;color:var(--dap-muted)}
+.dap-table-wrap{max-width:100%;overflow-x:auto;border-radius:0 0 12px 12px}.dap-table{width:100%;border-collapse:collapse;font-size:12px;line-height:1.5}.dap-table th{text-align:left;font-weight:500;font-size:11px;color:var(--dap-muted);padding:11px 16px;background:color-mix(in srgb,var(--dap-muted) 4%,var(--dap-surface));border-block:1px solid var(--dap-border);white-space:nowrap}.dap-table td{padding:15px 16px;border-bottom:1px solid var(--dap-border);color:var(--dap-text);vertical-align:top}.dap-table tbody tr:last-child td{border-bottom:0}.dap-table tbody tr:hover{background:color-mix(in srgb,var(--dap-accent) 3%,var(--dap-surface))}.dap-table tr[data-selected=true]{background:var(--dap-soft)}.dap-account-table{min-width:850px}.dap-account-table .dap-cell-select{width:35px;padding-left:18px;padding-right:0}.dap-account-table .dap-cell-account{width:23%;min-width:170px}.dap-account-table .dap-cell-protocol{width:15%}.dap-account-table .dap-cell-status{width:14%}.dap-account-table .dap-cell-schedule{width:12%}.dap-account-table .dap-cell-activity{width:18%}.dap-account-table .dap-cell-actions{width:18%;white-space:nowrap}.dap-account-table th,.dap-account-table td{padding-left:12px;padding-right:12px}
+.dap-identity{display:flex;gap:10px;align-items:flex-start;min-width:0}.dap-avatar{display:grid;place-items:center;flex:none;width:32px;height:32px;border:1px solid var(--dap-border);background:var(--dap-base);color:var(--dap-accent);border-radius:9px;font-size:12px;font-weight:600}.dap-identity-copy{min-width:0}.dap-account-name{font-size:12px;font-weight:600;overflow-wrap:anywhere;max-width:240px}.dap-cell-meta{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:5px;font-size:11px;color:var(--dap-muted)}.dap-cell-stack{display:flex;flex-direction:column;gap:5px;font-size:11px}.dap-row-tags{display:flex;gap:4px;flex-wrap:wrap;margin-top:7px}.dap-tag{display:inline-block;padding:1px 6px;border:1px solid var(--dap-border);border-radius:5px;font-size:10px;color:var(--dap-muted);max-width:100%;overflow-wrap:anywhere}.dap-protocol{font-weight:500;font-size:12px}.dap-num{font-variant-numeric:tabular-nums;white-space:nowrap}.dap-mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px}.dap-dim{color:var(--dsw-alias-label-secondary,#7b8495)}.dap-note{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;line-height:1.6;margin-top:3px}.dap-pill{display:inline-flex;align-items:center;gap:5px;border-radius:6px;padding:2px 7px;font-size:11px;line-height:18px;white-space:nowrap;border:1px solid transparent;font-weight:500}.dap-pill::before{content:'';width:5px;height:5px;border-radius:50%;background:currentColor}.dap-pill-ready{color:var(--dsw-alias-state-success-primary,#208669);background:color-mix(in srgb,var(--dsw-alias-state-success-primary,#208669) 9%,transparent)}.dap-pill-cooling{color:var(--dsw-alias-state-warn-primary,#b78224);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#b78224) 10%,transparent)}.dap-pill-failed{color:var(--dsw-alias-state-error-primary,#d04f60);background:color-mix(in srgb,var(--dsw-alias-state-error-primary,#d04f60) 9%,transparent)}.dap-pill-idle{color:var(--dap-muted);background:color-mix(in srgb,var(--dap-muted) 9%,transparent)}
+.dap-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.dap-cell-actions .dap-btn{min-height:28px;padding:3px 8px;font-size:11px}.dap-more{position:relative;display:inline-block}.dap-more>summary{display:flex;align-items:center;justify-content:center;gap:4px;list-style:none;cursor:pointer;min-height:28px;border-radius:7px;padding:4px 6px;color:var(--dap-muted);font-size:11px}.dap-more>summary>span{font-size:20px;line-height:20px}.dap-more>summary::-webkit-details-marker{display:none}.dap-more[open]>summary,.dap-more>summary:hover{background:var(--dap-soft);color:var(--dap-accent)}.dap-more-menu{position:fixed;z-index:1000;min-width:176px;border:1px solid var(--dap-border);background:var(--dap-surface);border-radius:10px;padding:6px;box-shadow:0 8px 26px #00000016;display:flex;flex-direction:column;gap:2px}.dap-more-menu .dap-btn{justify-content:flex-start;width:100%;border:0;background:transparent;min-height:32px;padding:6px 9px;font-weight:400}.dap-more-menu .dap-btn-danger{border-top:1px solid var(--dap-border);border-radius:0 0 5px 5px;margin-top:3px}.dap-row-more{padding:0;border:0;background:transparent;color:var(--dap-muted);font:inherit;font-size:10px;cursor:pointer}.dap-row-more>summary{list-style:none}.dap-row-more>summary::-webkit-details-marker{display:none}.dap-row-more[open]>summary{color:var(--dap-accent);margin-bottom:8px}.dap-row-more .dap-quota{min-width:0;max-width:230px}
+.dap-batch{display:flex;flex-wrap:wrap;gap:7px;align-items:center;padding:13px 16px;margin:0 20px 16px;border:1px solid color-mix(in srgb,var(--dap-accent) 20%,var(--dap-border));border-radius:9px;background:var(--dap-soft)}.dap-batch-count{font-size:11px;color:var(--dap-accent);font-weight:600;margin-right:4px}.dap-status{padding:22px 20px;font-size:12px;color:var(--dap-muted);line-height:1.7}.dap-empty{display:flex;flex-direction:column;align-items:center;gap:12px;text-align:center;padding:48px 24px}.dap-empty-icon{display:grid;place-items:center;width:48px;height:48px;border:1px solid var(--dap-border);border-radius:14px;background:var(--dap-base);color:var(--dap-muted)}.dap-empty-icon>.dap-icon{width:23px;height:23px}
+.dap-state{display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;padding:56px 24px;border:1px solid var(--dap-border);border-radius:13px;background:var(--dap-surface)}.dap-state-title{margin:0;font-size:14px;font-weight:600;color:var(--dap-text)}.dap-state-hint{margin:0;max-width:52ch;font-size:12px;line-height:1.7;color:var(--dap-muted)}.dap-state-detail{margin:0;max-width:60ch;padding:9px 12px;border-radius:8px;background:var(--dap-base);border:1px solid var(--dap-border);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:1.7;color:var(--dsw-alias-state-error-primary,#d04f60);overflow-wrap:anywhere}.dap-state-icon{display:grid;place-items:center;width:48px;height:48px;border:1px solid var(--dap-border);border-radius:14px;background:var(--dap-base);color:var(--dap-muted)}.dap-state-icon>.dap-icon{width:23px;height:23px}.dap-state-error .dap-state-icon{border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary,#d04f60) 30%,var(--dap-border));color:var(--dsw-alias-state-error-primary,#d04f60)}
+.dap-spinner{width:26px;height:26px;border:2px solid color-mix(in srgb,var(--dap-accent) 22%,transparent);border-top-color:var(--dap-accent);border-radius:50%;animation:dap-spin .7s linear infinite}@keyframes dap-spin{to{transform:rotate(360deg)}}
+.dap-foot{font-size:11px;line-height:1.6;color:var(--dap-muted);padding:0 2px}
+.dap-form{border:1px solid var(--dap-border);border-radius:12px;background:var(--dap-surface);padding:22px;display:flex;flex-direction:column;gap:20px;margin:0 20px 20px;min-width:0}.dap-form-title{font-size:15px;font-weight:600;color:var(--dap-text);letter-spacing:-.1px}.dap-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.dap-form-section{margin:0;padding:18px 0 0;border:0;border-top:1px solid var(--dap-border);min-width:0}.dap-form-section>legend{padding:0 10px 0 0;font-size:12px;font-weight:600;color:var(--dap-text)}.dap-form-section .dap-form-grid{margin-top:3px}.dap-field{display:flex;flex-direction:column;gap:7px;min-width:0}.dap-field-label{font-size:11px;color:var(--dsw-alias-label-secondary,#7b8495);font-weight:500}.dap-input{border:1px solid var(--dsw-alias-border-l1,#e8ebf1);border-radius:8px;background:var(--dsw-alias-bg-base,#f7f8fb);color:var(--dsw-alias-label-primary,#202635);font:inherit;font-size:12px;line-height:20px;padding:8px 10px;min-width:0;max-width:100%;transition:border-color .15s}.dap-input::placeholder{color:var(--dsw-alias-label-secondary,#7b8495);opacity:.75}.dap-input:focus{border-color:var(--dsw-alias-brand-primary,#4263eb)}.dap-form .dap-input{width:100%}.dap-form .dap-dim{font-size:11px;line-height:1.7}.dap-form-actions{display:flex;justify-content:flex-end;gap:8px;border-top:1px solid var(--dap-border);padding-top:16px}.dap-form-actions .dap-btn{min-width:74px}.dap-textarea{min-height:170px;width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:1.7;white-space:pre;resize:vertical}.dap-detection{padding:16px;border-radius:10px;background:var(--dap-base);border:1px solid var(--dap-border);gap:12px}.dap-check-label{display:flex;gap:8px;align-items:center;font-size:12px;line-height:1.6}.dap-root input[type=checkbox]{width:14px;height:14px;flex:none;accent-color:var(--dap-accent);cursor:pointer;margin:0}.dap-check-prio{border:1px solid var(--dap-border);border-radius:6px;background:var(--dap-base);color:var(--dap-text);padding:5px 7px;width:110px;font:inherit;font-size:11px}.dap-group-options{display:flex;flex-wrap:wrap;gap:8px}.dap-group-options>label{display:flex;align-items:center;gap:7px;padding:8px 10px;border:1px solid var(--dap-border);border-radius:7px;background:var(--dap-base)}
+.dap-cred-set{color:var(--dsw-alias-state-success-primary,#208669);font-size:10px}.dap-cred-missing{color:var(--dsw-alias-state-warn-primary,#b78224);font-size:10px}.dap-error{font-size:11px;line-height:1.7;color:var(--dsw-alias-state-error-primary,#d04f60)}.dap-result{margin:0;padding:16px 20px;background:var(--dap-soft);border:1px solid color-mix(in srgb,var(--dap-accent) 18%,var(--dap-border));border-radius:10px;font-size:12px;line-height:1.8;white-space:pre-wrap;overflow-wrap:anywhere}.dap-result>strong{margin-right:12px}.dap-result>.dap-btn{float:right}.dap-result>div{margin-top:8px}
+.dap-group-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;padding:0 20px 20px}.dap-group-card{border:1px solid var(--dap-border);border-radius:11px;padding:18px;display:flex;flex-direction:column;gap:12px;min-width:0}.dap-group-heading{display:flex;gap:10px;align-items:center}.dap-group-heading .dap-avatar{background:var(--dap-soft);color:var(--dap-accent)}.dap-group-name{font-size:13px;font-weight:600;overflow-wrap:anywhere}.dap-group-meta{display:flex;flex-wrap:wrap;gap:7px;color:var(--dap-muted);font-size:11px}.dap-group-models{display:flex;gap:5px;flex-wrap:wrap;min-height:24px}.dap-group-footer{display:flex;justify-content:space-between;gap:8px;align-items:center;padding-top:12px;border-top:1px solid var(--dap-border);margin-top:auto}.dap-group-desc{font-size:11px;color:var(--dap-muted);margin:0;overflow-wrap:anywhere}
+.dap-quota{min-width:0;max-width:none;font-size:12px;line-height:1.65}.dap-quota-window{margin:7px 0;min-width:0}.dap-quota-window-head{display:flex;justify-content:space-between;gap:8px;align-items:baseline}.dap-quota-window-head>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dap-quota-window-head>strong{font-weight:600;font-size:11px}.dap-quota-window>progress{display:block;width:100%;height:5px;margin:5px 0;border:0;border-radius:6px;overflow:hidden;background:var(--dap-base);--dap-meter:var(--dsw-alias-state-success-primary,#208669);accent-color:var(--dap-meter)}.dap-quota-window>progress[data-tone=warn]{--dap-meter:var(--dsw-alias-state-warn-primary,#b78224)}.dap-quota-window>progress[data-tone=low]{--dap-meter:var(--dsw-alias-state-error-primary,#d04f60)}.dap-quota-window>progress::-webkit-progress-bar{background:var(--dap-base);border-radius:6px}.dap-quota-window>progress::-webkit-progress-value{background:var(--dap-meter);border-radius:6px}.dap-quota-window>progress::-moz-progress-bar{background:var(--dap-meter);border-radius:6px}.dap-quota-summary{min-width:140px;display:flex;flex-direction:column;align-items:stretch;gap:3px}.dap-quota-summary .dap-quota-window{margin:2px 0}.dap-quota-summary .dap-quota-window-head{font-size:10px}.dap-quota-summary .dap-quota-reset{font-size:9px;overflow-wrap:anywhere}.dap-quota-summary>.dap-error{font-size:10px}.dap-quota-plan{display:inline-flex;align-items:center;align-self:flex-start;justify-self:start;width:fit-content;max-width:100%;padding:1px 7px;border:1px solid var(--dap-border);border-radius:5px;color:var(--dap-accent);font-size:10px;font-weight:600;overflow-wrap:anywhere;background:var(--dap-soft)}.dap-usage-link{text-align:left;color:var(--dap-accent);font-size:11px;margin-top:4px;align-self:flex-start}.dap-usage-link:hover{text-decoration:underline}.dap-last-used{font-size:10px;overflow-wrap:anywhere}.dap-reset-count{font-size:10px;margin-top:3px}.dap-account-usage-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap}.dap-account-usage-head .dap-form-title{margin:0;overflow-wrap:anywhere}.dap-account-usage-head p{margin:6px 0 0}.dap-account-usage-grid{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);gap:22px}.dap-account-usage .dap-quota{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-content:start}.dap-account-usage .dap-quota>.dap-quota-plan,.dap-account-usage .dap-quota>.dap-dim,.dap-account-usage .dap-quota>.dap-error,.dap-quota-balance{grid-column:1/-1}.dap-account-usage .dap-quota-window{padding:12px;border:1px solid var(--dap-border);border-radius:9px;margin:0;background:var(--dap-base)}.dap-account-usage .dap-quota-window>progress{background:var(--dap-border);margin:10px 0}.dap-account-usage .dap-quota-window>progress::-webkit-progress-bar{background:var(--dap-border)}.dap-quota-balance{overflow-wrap:anywhere}.dap-reset-credits{display:flex;flex-direction:column;gap:10px;border-left:1px solid var(--dap-border);padding-left:22px;min-width:0;font-size:12px}.dap-reset-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}.dap-reset-heading>strong{font-size:13px}.dap-reset-credits p{margin:0;font-size:11px;line-height:1.7}.dap-reset-credits>.dap-btn{align-self:flex-start;margin-top:4px}.dap-reset-expiry{overflow-wrap:anywhere}.dap-reset-confirm{padding:14px;border:1px solid color-mix(in srgb,var(--dap-accent) 25%,var(--dap-border));border-radius:9px;background:var(--dap-soft);display:flex;flex-direction:column;gap:10px;min-width:0}.dap-reset-confirm>strong{font-size:12px;overflow-wrap:anywhere}.dap-reset-confirm .dap-actions{gap:8px}.dap-reset-confirm .dap-btn{white-space:normal;text-align:center}.dap-usage-summary{display:flex;gap:20px;flex-wrap:wrap;margin:0 20px 18px;padding:14px 16px;border-radius:9px;background:var(--dap-base);font-size:11px;color:var(--dap-muted)}.dap-usage-summary strong{display:block;font-size:17px;line-height:1.4;color:var(--dap-text);font-weight:600;font-variant-numeric:tabular-nums}
+.dap-upstream-models{display:flex;flex-direction:column;gap:10px;padding:12px;border:1px solid var(--dap-border);border-radius:8px}.dap-model-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 14px;max-height:220px;overflow:auto}.dap-model-option{display:flex;align-items:center;gap:7px;min-width:0;font-size:12px;overflow-wrap:anywhere}.dap-model-option input{flex:none}
+.dap-models-hint{font-size:11px;color:var(--dsw-alias-label-secondary,#7b8495)}
+@media(max-width:1100px){.dap-head{align-items:flex-start}.dap-head-actions{flex-basis:100%}.dap-cards{gap:10px}.dap-card{padding:15px}.dap-account-table .dap-cell-actions .dap-actions{gap:3px}}
+@media(max-width:760px){.dap-account-usage-grid{grid-template-columns:1fr;gap:18px}.dap-reset-credits{padding:18px 0 0;border-left:0;border-top:1px solid var(--dap-border)}.dap-root{gap:18px}.dap-cards{grid-template-columns:repeat(2,minmax(0,1fr))}.dap-card-value{font-size:25px}.dap-group-grid{grid-template-columns:1fr}.dap-panel-head{padding:16px}.dap-toolbar{padding-left:16px;padding-right:16px}.dap-batch,.dap-form{margin-left:16px;margin-right:16px}.dap-form{padding:18px}.dap-toolbar .dap-input{flex:1 1 120px}.dap-search-box{flex-basis:100%}.dap-tabs{gap:0}.dap-tab{padding-left:12px;padding-right:12px}.dap-usage-summary{margin-left:16px;margin-right:16px}}
+@media(max-width:580px){.dap-tabs{overflow-x:visible}.dap-tab{flex:1 1 0;min-width:0;gap:6px;padding:11px 6px}.dap-tab .dap-icon{width:15px;height:15px}.dap-tab-count{display:none}.dap-pagination .dap-check-label{white-space:nowrap}.dap-pagination .dap-input{flex:none;width:58px}.dap-title{font-size:22px}.dap-brand-mark{width:40px;height:40px;border-radius:12px}.dap-head-actions{gap:6px}.dap-head-actions>.dap-btn,.dap-head-actions>.dap-refresh{font-size:11px;padding:5px 9px}.dap-card-hint{font-size:10px}.dap-form-grid{grid-template-columns:1fr}.dap-account-table{display:block;min-width:0}.dap-account-table thead{display:none}.dap-account-table tbody{display:block}.dap-account-table tr{display:grid;grid-template-columns:1fr 1fr;gap:12px 18px;padding:20px 16px;border-top:1px solid var(--dap-border);position:relative}.dap-account-table td{display:block;padding:0!important;border:0;min-width:0;width:auto!important}.dap-account-table .dap-cell-select{position:absolute;right:18px;top:22px}.dap-account-table .dap-cell-account{grid-column:1/-1;min-width:0;padding-right:30px!important}.dap-account-table .dap-cell-activity{grid-column:1/-1}.dap-account-table .dap-cell-activity .dap-quota-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 14px}.dap-cell-activity .dap-quota-summary>.dap-quota-plan,.dap-cell-activity .dap-quota-summary>.dap-dim,.dap-cell-activity .dap-quota-summary>.dap-error,.dap-cell-activity .dap-quota-summary>.dap-usage-link{grid-column:1/-1}.dap-account-usage .dap-quota{grid-template-columns:1fr}.dap-account-usage-head>.dap-actions{width:100%}.dap-account-usage-head>.dap-actions>.dap-btn{flex:1}.dap-account-table .dap-cell-actions{grid-column:1/-1;border-top:1px solid var(--dap-border);padding-top:12px!important}.dap-account-table .dap-cell-actions .dap-actions{gap:7px}.dap-account-table .dap-cell-schedule::before{content:attr(data-label);display:block;color:var(--dap-muted);font-size:10px;margin-bottom:5px}.dap-account-name{max-width:none}.dap-more-menu{left:0;right:auto}.dap-table-wrap{overflow:visible}.dap-panel:has(.dap-usage-table) .dap-table-wrap{overflow-x:auto}.dap-usage-table{min-width:700px}.dap-note{max-width:230px}.dap-pagination{gap:12px}.dap-form-actions{justify-content:stretch}.dap-form-actions>.dap-btn{flex:1}.dap-status{padding:18px 16px}.dap-empty{padding:36px 20px}}
+@media(prefers-reduced-motion:reduce){.dap-btn,.dap-refresh,.dap-input{transition:none}.dap-spinner{animation-duration:2.4s}}
 `;
 
-		/** Insert this plugin's stylesheet once, from `apply`. */
-		function insertStyles(ctx) {
-			return ctx.effect(() => {
-				const element = document.createElement('style');
-				element.setAttribute('data-dsh-plugin', 'dsh-account-pool');
-				element.textContent = CSS;
-				document.head.appendChild(element);
-				return () => {
-					if (element.parentNode !== null) element.parentNode.removeChild(element);
-				};
-			}, 'account-pool: stylesheet');
+		// Each bundle owns its node. Older bundles restore before newer ones so
+		// a delayed cleanup/recovery during hot reload cannot override newer CSS.
+		const STYLE_GENERATION_KEY = Symbol.for('dsh-account-pool.styles.generation');
+		const styleGeneration = (window[STYLE_GENERATION_KEY] ?? 0) + 1;
+		window[STYLE_GENERATION_KEY] = styleGeneration;
+		let styleUsers = 0;
+		let styleElement = null;
+		let styleObserver = null;
+		let observedHead = null;
+
+		function ensureStyles() {
+			if (styleUsers === 0) return;
+			const head = document.head;
+			if (styleObserver !== null && observedHead !== head) {
+				styleObserver.disconnect();
+				// Also notice replacement of head, without observing body updates.
+				styleObserver.observe(document.documentElement, { childList: true });
+				if (head !== null) styleObserver.observe(head, { childList: true, characterData: true, subtree: true });
+				observedHead = head;
+			}
+			if (head === null) return;
+			if (styleElement.textContent !== CSS) styleElement.textContent = CSS;
+			if (styleElement.parentNode !== head) {
+				const newer = [...head.querySelectorAll('style[data-dsh-plugin="dsh-account-pool"]')]
+					.find((element) => Number(element.getAttribute('data-dap-style-generation')) > styleGeneration);
+				if (newer) head.insertBefore(styleElement, newer);
+				else head.appendChild(styleElement);
+			}
 		}
+
+		/** Plugin and mounted roots hold independent, idempotent style leases. */
+		function acquireStyles() {
+			styleUsers += 1;
+			if (styleElement === null) {
+				styleElement = document.createElement('style');
+				styleElement.setAttribute('data-dsh-plugin', 'dsh-account-pool');
+				styleElement.setAttribute('data-dap-style-generation', String(styleGeneration));
+				if (typeof MutationObserver !== 'undefined') {
+					styleObserver = new MutationObserver(ensureStyles);
+					styleObserver.observe(document.documentElement, { childList: true });
+				}
+			}
+			ensureStyles();
+			let released = false;
+			return () => {
+				if (released) return;
+				released = true;
+				styleUsers -= 1;
+				if (styleUsers !== 0) return;
+				styleObserver?.disconnect();
+				styleObserver = null;
+				observedHead = null;
+				if (styleElement.parentNode !== null) styleElement.parentNode.removeChild(styleElement);
+				styleElement = null;
+			};
+		}
+
+		function insertStyles(ctx) {
+			return ctx.effect(acquireStyles, 'account-pool: stylesheet');
+		}
+
+		function useStyles() {
+			React.useEffect(acquireStyles, []);
+		}
+
+		// =====================================================================
+		// § 4  Hooks — the only stateful code in the bundle. They are called from
+		//      `PoolSection` (and the two provider halves), never from a child
+		//      component, so the render tree stays pure and the offline test can
+		//      expand it without a hook runtime. In call order: useJson,
+		//      useAction, useResetCredits, useAccountQuotas, useMoreMenuDismissal,
+		//      useNow.
+		// =====================================================================
 
 		/** Read one Host route; `nonce` re-runs it. */
 		function useJson(route, nonce, t) {
@@ -361,9 +687,9 @@ window.__ModuleLoader__.load({
 		 * race would make the `prefer` ranking depend on arrival order.
 		 */
 		function useAction(refresh, t) {
-			const [state, setState] = React.useState({ pending: false, error: null });
+			const [state, setState] = React.useState({ pending: false, error: null, result: null });
 			const [busyId, setBusyId] = React.useState(null);
-			function run(id, action, extra) {
+			function run(id, action, extra, onResult, onFailure) {
 				setState({ pending: true, error: null });
 				setBusyId(id);
 				// Returns a promise resolving to whether it succeeded, so a form can
@@ -378,22 +704,197 @@ window.__ModuleLoader__.load({
 							body: JSON.stringify({ id, action, ...(extra ?? {}) }),
 						});
 						const body = await response.json().catch(() => null);
-						if (!response.ok || body === null || body.ok !== true) {
-							throw new Error(body?.error?.message ?? `HTTP ${String(response.status)}`);
+						const batchResult = action === 'batch' && Array.isArray(body?.done) && Array.isArray(body?.failed);
+						if (!response.ok || body === null || (body.ok !== true && !batchResult)) {
+							const failure = new Error(body?.error?.message ?? `HTTP ${String(response.status)}`);
+							failure.actionBody = body;
+							throw failure;
 						}
-						setState({ pending: false, error: null });
+						setState({ pending: false, error: null, result: body });
 						setBusyId(null);
+						onResult?.(body);
 						refresh();
 						return true;
 					} catch (error) {
 						setState({ pending: false, error: error instanceof Error ? error.message : String(error) });
 						setBusyId(null);
+						onFailure?.(error.actionBody ?? null);
 						return false;
 					}
 				})();
 			}
-			return { pending: state.pending, busyId, error: state.error, run };
+			return { pending: state.pending, busyId, error: state.error, result: state.result, dismiss: () => setState((previous) => ({ ...previous, result: null })), run };
 		}
+
+		/**
+		 * The reset-credit flow. A reset may have been applied by the provider even
+		 * when the reply never arrived, so the request id is persisted per account
+		 * and replayed on the next attempt instead of issuing a second reset.
+		 */
+		function useResetCredits(t, action, quotaData) {
+			const [confirmation, setConfirmation] = React.useState(null);
+			const [error, setError] = React.useState(null);
+			const sending = React.useRef(false);
+			const requests = React.useRef(null);
+			if (requests.current === null) {
+				try {
+					const saved = JSON.parse(globalThis.sessionStorage?.getItem('dsh-account-pool:pending-resets') || '{}');
+					requests.current = Object.fromEntries(Object.entries(saved).filter(([, value]) => RESET_ID_PATTERN.test(value?.requestId || '')).slice(-100));
+				} catch { requests.current = {}; }
+			}
+			function save() {
+				try { globalThis.sessionStorage?.setItem('dsh-account-pool:pending-resets', JSON.stringify(requests.current)); } catch { /* The in-memory ID still supports recovery if browser storage is unavailable. */ }
+			}
+			/** The confirmation to re-open when this account already has a live id. */
+			function restoreFor(account) {
+				const saved = requests.current[quotaAccountKey(account)];
+				return saved ? { ...saved, id: account.id, name: account.label || account.id, key: quotaAccountKey(account), dispatched: true } : null;
+			}
+			function begin(account, usagePending) {
+				if (!account || action.pending || usagePending) return;
+				setError(null);
+				const key = quotaAccountKey(account);
+				const saved = requests.current[key];
+				const requestId = saved?.requestId || globalThis.crypto?.randomUUID?.();
+				if (!requestId) { setError(t('resetCardCrypto')); return; }
+				setConfirmation({ id: account.id, name: account.label || account.id, key, requestId, dispatched: !!saved });
+			}
+			async function confirm(account, resetReady) {
+				if (!account || !confirmation || confirmation.id !== account.id || sending.current || action.pending || !resetReady) return;
+				const key = quotaAccountKey(account);
+				if (confirmation.key && confirmation.key !== key) return;
+				const requestId = confirmation.requestId;
+				sending.current = true;
+				setError(null);
+				requests.current[key] = { requestId, dispatched: true };
+				save();
+				try {
+					await action.run(account.id, 'quota-reset', { confirm: true, requestId }, (body) => {
+						delete requests.current[key]; save();
+						setConfirmation(null);
+						quotaData.applyResult(account, body);
+					}, (body) => {
+						const uncertain = !body || body.uncertain === true;
+						const restoredId = RESET_ID_PATTERN.test(body?.requestId || '') ? body.requestId : requestId;
+						if (uncertain) {
+							requests.current[key] = { requestId: restoredId, dispatched: true }; save();
+							setConfirmation({ id: account.id, name: account.label || account.id, key, requestId: restoredId, dispatched: true });
+						} else {
+							delete requests.current[key]; save(); setConfirmation(null);
+						}
+						setError(body?.error?.message || t('resetCardUncertain'));
+						if (body?.resetCredits) quotaData.applyResult(account, { quota: quotaData.forAccount(account).quota, resetCredits: body.resetCredits });
+					});
+				} finally { sending.current = false; }
+			}
+			function cancel() { setConfirmation(null); setError(null); }
+			return { confirmation, setConfirmation, error, setError, begin, confirm, cancel, restoreFor };
+		}
+
+		/**
+		 * The row "更多" menus are native `<details>`, which stay open when the user
+		 * clicks elsewhere. One listener pair closes them on an outside pointer,
+		 * Escape, scroll, or resize.
+		 */
+		function useMoreMenuDismissal() {
+			React.useEffect(() => {
+				const closeMenus = (event) => {
+					if (event.type === 'keydown' && event.key !== 'Escape') return;
+					for (const details of document.querySelectorAll('.dap-root .dap-more[open]')) {
+						if (event.type === 'pointerdown' && details.contains(event.target)) continue;
+						details.open = false;
+						if (event.type === 'keydown') details.querySelector('summary').focus();
+					}
+				};
+				document.addEventListener('pointerdown', closeMenus);
+				document.addEventListener('keydown', closeMenus);
+				document.addEventListener('scroll', closeMenus, true);
+				window.addEventListener?.('resize', closeMenus);
+				return () => {
+					document.removeEventListener('pointerdown', closeMenus);
+					document.removeEventListener('keydown', closeMenus);
+					document.removeEventListener('scroll', closeMenus, true);
+					window.removeEventListener?.('resize', closeMenus);
+				};
+			}, []);
+		}
+
+		/** A ticking clock, so "cooling for" counts down without a refetch. */
+		function useNow(intervalMs = 1000) {
+			const [now, setNow] = React.useState(() => Date.now());
+			React.useEffect(() => {
+				const timer = setInterval(() => setNow(Date.now()), intervalMs);
+				return () => clearInterval(timer);
+			}, [intervalMs]);
+			return now;
+		}
+
+		// Quota reads have a separate queue from account writes and a one-minute cache.
+		function useAccountQuotas(t) {
+			const [snapshots, setSnapshots] = React.useState({});
+			const [pendingIds, setPendingIds] = React.useState(() => new Set());
+			const refs = React.useRef({ alive: true, cache: new Map(), flights: new Map() });
+			React.useEffect(() => {
+				refs.current.alive = true;
+				return () => { refs.current.alive = false; for (const flight of refs.current.flights.values()) flight.controller.abort(); refs.current.flights.clear(); };
+			}, []);
+			function publish(account, body) {
+				const key = quotaAccountKey(account);
+				const snapshot = { key, quota: body.quota, resetCredits: body.resetCredits };
+				refs.current.cache.set(account.id, { key, at: Date.now(), snapshot });
+				if (refs.current.alive) setSnapshots((previous) => ({ ...previous, [account.id]: snapshot }));
+				return snapshot;
+			}
+			function applyResult(account, body) {
+				const previous = refs.current.flights.get(account.id);
+				if (previous) { refs.current.flights.delete(account.id); previous.controller.abort(); }
+				setPendingIds((current) => { const next = new Set(current); next.delete(account.id); return next; });
+				return publish(account, body);
+			}
+			async function load(account, force = false) {
+				if (!canQueryQuota(account) || !account.credential?.configured) return;
+				const key = quotaAccountKey(account);
+				const existing = refs.current.flights.get(account.id);
+				if (existing?.key === key) return existing.promise;
+				const cached = refs.current.cache.get(account.id);
+				if (!force && cached?.key === key && Date.now() - cached.at < 60000) return cached.snapshot;
+				if (existing) existing.controller.abort();
+				const flight = { key, controller: new AbortController() };
+				refs.current.flights.set(account.id, flight);
+				setPendingIds((current) => new Set([...current, account.id]));
+				flight.promise = (async () => {
+					const timer = setTimeout(() => flight.controller.abort(), 25000);
+					try {
+						const response = await fetch(ACTION_ROUTE, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, credentials: 'same-origin', signal: flight.controller.signal, body: JSON.stringify({ id: account.id, action: 'quota', force }) });
+						const body = await response.json().catch(() => null);
+						if (!response.ok || body?.ok !== true || !body.quota) throw new Error(body?.error?.message || t('quotaQueryFailed'));
+						if (refs.current.alive && refs.current.flights.get(account.id) === flight) return publish(account, body);
+					} catch (error) {
+						if (refs.current.alive && refs.current.flights.get(account.id) === flight) {
+							const old = cached?.key === key ? cached.snapshot : { quota: account.quota, resetCredits: account.resetCredits };
+							return publish(account, { quota: { ...(old.quota ?? {}), supported: true, ok: false, stale: !!old.quota?.ok || old.quota?.stale === true, message: error.name === 'AbortError' ? t('quotaQueryFailed') : error.message, windows: old.quota?.windows ?? [] }, resetCredits: old.resetCredits ? { ...old.resetCredits, ok: false, stale: true } : undefined });
+						}
+					} finally {
+						clearTimeout(timer);
+						if (refs.current.flights.get(account.id) === flight) {
+							refs.current.flights.delete(account.id);
+							if (refs.current.alive) setPendingIds((current) => { const next = new Set(current); next.delete(account.id); return next; });
+						}
+					}
+				})();
+				return flight.promise;
+			}
+			function forAccount(account) {
+				const snapshot = snapshots[account.id];
+				return snapshot?.key === quotaAccountKey(account) ? snapshot : { quota: account.quota, resetCredits: account.resetCredits };
+			}
+			return { load, applyResult, forAccount, pendingIds };
+		}
+
+		// =====================================================================
+		// § 5  Pure helpers — no React, no DOM. Exported so the offline test can
+		//      exercise the state derivation directly.
+		// =====================================================================
 
 		const WINDOWS = [
 			['rateLimitResetAt', 'reasonRateLimit'],
@@ -419,8 +920,32 @@ window.__ModuleLoader__.load({
 		function statusOf(account, now) {
 			if (account.status === 'error') return { key: 'statusError', tone: 'failed' };
 			if (account.status === 'disabled') return { key: 'statusDisabled', tone: 'idle' };
+			if (account.schedulable === false) return { key: 'statusPaused', tone: 'idle' };
+			if (account.autoPauseOnExpired !== false && account.expiresAt && Date.parse(account.expiresAt) <= now) return { key: 'statusExpired', tone: 'idle' };
 			if (coolingOf(account, now) !== null) return { key: 'statusCooling', tone: 'cooling' };
 			return { key: 'statusActive', tone: 'ready' };
+		}
+
+		function filterAccounts(accounts, filters, now) {
+			const query = (filters.query ?? '').trim().toLowerCase();
+			return accounts.filter((account) => {
+				if (filters.platform && account.platform !== filters.platform) return false;
+				if (filters.authMode && (account.authMode ?? 'api-key') !== filters.authMode) return false;
+				if (filters.status && statusOf(account, now).key !== filters.status) return false;
+				if (filters.group === '__ungrouped' && (account.groups ?? []).length > 0) return false;
+				if (filters.group && filters.group !== '__ungrouped' && !(account.groups ?? []).includes(filters.group)) return false;
+				return !query || [account.id, account.label, account.notes, account.baseUrl, ...(account.models ?? [])].join(' ').toLowerCase().includes(query);
+			}).sort((a, b) => {
+				if (filters.sort === 'name') return (a.label || a.id).localeCompare(b.label || b.id);
+				if (filters.sort === 'recent') return (Date.parse(b.lastUsedAt) || 0) - (Date.parse(a.lastUsedAt) || 0);
+				return (a.priority ?? 100) - (b.priority ?? 100) || a.id.localeCompare(b.id);
+			});
+		}
+
+		function localDateInput(value) {
+			if (!value || Number.isNaN(Date.parse(value))) return '';
+			const date = new Date(value);
+			return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
 		}
 
 		function formatRemaining(ms, t) {
@@ -439,88 +964,229 @@ window.__ModuleLoader__.load({
 			return `${(n / 1_000_000).toFixed(1)}M`;
 		}
 
+		// =====================================================================
+		// § 6  Primitives — the hook-free building blocks every panel reuses.
+		// =====================================================================
+
 		function Pill(props) {
 			return h('span', { className: `dap-pill dap-pill-${props.tone}` }, props.children);
 		}
 
+		function Icon({ name, className = '' }) {
+			const paths = {
+				pool: 'M5 4h14v5H5z M5 15h14v5H5z M8 6.5h.01 M8 17.5h.01 M12 9v6',
+				accounts: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M22 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75',
+				activity: 'M3 12h4l3-8 4 16 3-8h4',
+				link: 'M10 13a5 5 0 0 0 7 .5l3-3a5 5 0 0 0-7-7l-2 2 M14 11a5 5 0 0 0-7-.5l-3 3a5 5 0 0 0 7 7l2-2',
+				groups: 'M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z',
+				search: 'M10.5 18a7.5 7.5 0 1 0 0-15 7.5 7.5 0 0 0 0 15 M16 16l5 5',
+				plus: 'M12 5v14 M5 12h14',
+				refresh: 'M20 7v5h-5 M4 17v-5h5 M5.6 7a7.5 7.5 0 0 1 12.4-2L20 8 M4 16l2 3a7.5 7.5 0 0 0 12.4-2',
+				chevron: 'M7 10l5 5 5-5',
+			};
+			return h('svg', { className: `dap-icon ${className}`.trim(), viewBox: '0 0 24 24', 'aria-hidden': true, focusable: false }, h('path', { d: paths[name] ?? paths.pool }));
+		}
+
 		function Card(props) {
 			return h('div', { className: 'dap-card' }, [
-				h('div', { className: 'dap-card-label', key: 'l' }, props.label),
+				h('div', { className: 'dap-card-top', key: 'top' }, [
+					h('div', { className: 'dap-card-label', key: 'l' }, props.label),
+					h('span', { className: 'dap-card-icon', key: 'i' }, h(Icon, { name: props.icon || 'activity' })),
+				]),
 				h('div', { className: 'dap-card-value', key: 'v' }, props.value),
 				props.hint === undefined ? null : h('div', { className: 'dap-card-hint', key: 'h' }, props.hint),
 			]);
 		}
 
+		// =====================================================================
+		// § 7  Quota views — the rate-limit / reset-credit readouts, shared by the
+		//      account row, the usage panel and the action result.
+		// =====================================================================
+
+		function canQueryQuota(account) {
+			return account.authMode === 'oauth' && ['openai', 'anthropic', 'gemini'].includes(account.platform);
+		}
+
+		function quotaAccountKey(account) {
+			return JSON.stringify([account.id, account.platform, account.authMode, account.credentialRef, account.baseUrl, account.chatgptAccountId, account.projectId, account.credential?.configured]);
+		}
+
+		function quotaWindowLabel(window, t) {
+			const seconds = window.windowSeconds;
+			let duration = null;
+			if (seconds > 0 && seconds % 86400 === 0) duration = t('quotaWindowDays', { n: String(seconds / 86400) });
+			else if (seconds > 0 && seconds % 3600 === 0) duration = t('quotaWindowHours', { n: String(seconds / 3600) });
+			const id = String(window.id || '');
+			if (id === 'primary' || id === 'secondary') return duration || t(id === 'primary' ? 'quotaWindowPrimary' : 'quotaWindowSecondary');
+			if (id === 'five_hour' || id === 'seven_day') return t(id === 'five_hour' ? 'quotaWindowHours' : 'quotaWindowDays', { n: id === 'five_hour' ? '5' : '7' });
+			return window.label || duration || id;
+		}
+
+		function quotaPercent(window) {
+			if (Number.isFinite(window.remainingPercent)) return Math.max(0, Math.min(100, window.remainingPercent));
+			if (Number.isFinite(window.usedPercent)) return Math.max(0, Math.min(100, 100 - window.usedPercent));
+			return null;
+		}
+
+		function QuotaWindow({ window, t, now, compact: small = false }) {
+			const remaining = quotaPercent(window);
+			const label = quotaWindowLabel(window, t);
+			const resetMs = window.resetAt ? Date.parse(window.resetAt) : NaN;
+			const value = remaining !== null ? t(small ? 'quotaRemainingShort' : 'quotaRemaining', { n: String(Math.round(remaining * 10) / 10) }) : window.remainingAmount != null ? t('quotaAmount', { n: String(window.remainingAmount) }) : t('quotaUnknownValue');
+			return h('div', { className: 'dap-quota-window' }, [
+				h('div', { key: 'head', className: 'dap-quota-window-head' }, [h('span', { key: 'label', title: label }, label), h('strong', { key: 'value', className: 'dap-num' }, value)]),
+				remaining === null ? null : h('progress', { key: 'bar', max: 100, value: remaining, 'data-tone': remaining <= 10 ? 'low' : remaining <= 30 ? 'warn' : 'ready', 'aria-label': `${label}: ${value}` }),
+				Number.isFinite(resetMs) ? h('div', { key: 'reset', className: 'dap-dim dap-quota-reset', title: new Date(resetMs).toLocaleString() }, small ? (resetMs > now ? t('quotaResetsIn', { time: formatRemaining(resetMs - now, t) }) : t('quotaResetPending')) : t('quotaReset', { at: new Date(resetMs).toLocaleString() })) : null,
+			]);
+		}
+
+		function QuotaView({ quota, t, now = Date.now() }) {
+			if (!quota) return h('span', { className: 'dap-dim' }, t('quotaUnknown'));
+			if (quota.supported === false) return h('span', { className: 'dap-dim' }, t('quotaUnsupported'));
+			return h('div', { className: 'dap-quota' }, [
+				quota.plan ? h('div', { key: 'plan', className: 'dap-quota-plan' }, quota.plan) : null,
+				quota.stale ? h('div', { key: 'stale', className: 'dap-error' }, t('quotaStale')) : null,
+				quota.ok === false ? h('div', { key: 'error', className: 'dap-error' }, quota.message || quota.error?.message || quota.errorCode || t('quotaQueryFailed')) : null,
+				...(quota.windows ?? []).map((window, index) => h(QuotaWindow, { key: `${window.id}-${index}`, window, t, now })),
+				quota.ok && !quota.windows?.length ? h('div', { key: 'empty', className: 'dap-dim' }, t('quotaNoData')) : null,
+				quota.credits ? h('div', { key: 'credits', className: 'dap-quota-balance' }, t('quotaCredits', { n: quota.credits.unlimited ? t('quotaUnlimited') : quota.credits.balance ?? t('none') })) : null,
+				(quota.lastSuccessAt || quota.at) ? h('div', { key: 'at', className: 'dap-dim' }, `${t('quotaAt')}: ${new Date(quota.lastSuccessAt || quota.at).toLocaleString()}`) : null,
+			]);
+		}
+
+		function QuotaSummary({ account, quota, resetCredits, pending, t, now, onView }) {
+			return h('div', { className: 'dap-quota-summary', 'aria-busy': pending }, [
+				quota?.plan ? h('span', { key: 'plan', className: 'dap-quota-plan' }, quota.plan) : null,
+				!quota ? h('span', { key: 'empty', className: 'dap-dim' }, t(pending ? 'quotaLoading' : 'quotaUnknown')) : null,
+				quota?.stale || quota?.ok === false ? h('span', { key: 'error', className: 'dap-error' }, t(quota.stale ? 'quotaStale' : 'quotaQueryFailed')) : null,
+				...(quota?.windows ?? []).slice(0, 2).map((window, index) => h(QuotaWindow, { key: `${window.id}-${index}`, window, compact: true, t, now })),
+				quota?.ok && !quota.windows?.length ? h('span', { key: 'none', className: 'dap-dim' }, t('quotaNoData')) : null,
+				account.platform === 'openai' && resetCredits ? h('span', { key: 'cards', className: 'dap-dim dap-reset-count' }, `${t('resetCards')} · ${resetCredits.ok && Number.isFinite(resetCredits.availableCount) ? t('resetCardsCount', { n: String(resetCredits.availableCount) }) : t('resetCardsFailed')}`) : null,
+				h('button', { key: 'view', type: 'button', className: 'dap-row-more dap-usage-link', onClick: onView }, [t('viewAccountUsage'), ' ›']),
+			]);
+		}
+
+		function ResetCreditsView({ snapshot, ready, t, pending, configured, confirmation, onUse, onConfirm, onCancel, error }) {
+			const available = ready && snapshot?.ok === true && !snapshot.stale && Number.isFinite(snapshot.availableCount) && snapshot.availableCount > 0;
+			return h('div', { className: 'dap-reset-credits' }, [
+				h('div', { key: 'head', className: 'dap-reset-heading' }, [h('strong', { key: 'title' }, t('resetCards')), h('span', { key: 'count', className: 'dap-quota-plan' }, snapshot?.ok && Number.isFinite(snapshot.availableCount) ? t('resetCardsCount', { n: String(snapshot.availableCount) }) : '—')]),
+				!ready ? h('p', { key: 'restart', className: 'dap-dim' }, t('resetCardRestart')) : !snapshot ? h('p', { key: 'unknown', className: 'dap-dim' }, t('resetCardsUnknown')) : snapshot.ok === false || snapshot.stale ? h('p', { key: 'error', className: 'dap-error' }, snapshot.error?.message || t('resetCardsFailed')) : snapshot.availableCount === 0 ? h('p', { key: 'none', className: 'dap-dim' }, t('resetCardNone')) : null,
+				...(snapshot?.credits ?? []).filter((credit) => credit.expiresAt && Number.isFinite(Date.parse(credit.expiresAt))).map((credit, index) => h('div', { key: `expiry-${index}`, className: 'dap-dim dap-reset-expiry' }, `${t('resetCardsExpired')}: ${new Date(credit.expiresAt).toLocaleString()}`)),
+				(snapshot?.lastSuccessAt || snapshot?.at) ? h('div', { key: 'at', className: 'dap-dim' }, `${t('quotaAt')}: ${new Date(snapshot.lastSuccessAt || snapshot.at).toLocaleString()}`) : null,
+				confirmation ? h('div', { key: 'confirm', className: 'dap-reset-confirm', role: 'group', 'aria-label': t('resetCardConfirmTitle', { name: confirmation.name }) }, [
+					h('strong', { key: 'title' }, t('resetCardConfirmTitle', { name: confirmation.name })),
+					h('p', { key: 'hint' }, t(confirmation.dispatched ? 'resetCardUncertain' : 'resetCardConfirmHint')),
+					error ? h('p', { key: 'error', className: 'dap-error', role: 'alert' }, error) : null,
+					h('div', { key: 'actions', className: 'dap-actions' }, [h('button', { key: 'confirm', type: 'button', className: 'dap-btn dap-btn-primary', disabled: pending || !ready || !configured || (!confirmation.dispatched && !available), onClick: onConfirm }, t(pending ? 'actWorking' : confirmation.dispatched ? 'resetCardRetry' : 'resetCardConfirm')), h('button', { key: 'cancel', type: 'button', className: 'dap-btn', 'aria-label': t('resetCardCancel'), disabled: pending, onClick: onCancel }, t('cancel'))]),
+				]) : h('button', { key: 'use', type: 'button', className: 'dap-btn dap-btn-soft', disabled: pending || !configured || !available, onClick: onUse }, t('resetCardUse')),
+				!confirmation && error ? h('p', { key: 'action-error', className: 'dap-error', role: 'alert' }, error) : null,
+				h('p', { key: 'hint', className: 'dap-dim' }, t('resetCardRefreshHint')),
+			]);
+		}
+
+		// =====================================================================
+		// § 8  Row components — one account row and one usage row.
+		// =====================================================================
+
 		function AccountRow(props) {
-			const { account, now, t, action, pool } = props;
+			const { account, now, t, action, pool, selected, onSelect } = props;
 			const cooling = coolingOf(account, now);
 			const status = statusOf(account, now);
 			const busy = action.pending && action.busyId === account.id;
 			const disabled = account.status === 'disabled';
-			// The host sends a SUMMARY of the credential, never the secret itself.
+			// Only the credential summary is present in the browser payload.
 			const credential = account.credential ?? { configured: false, writable: false };
 			const confirming = pool.confirmingId === account.id;
-			return h('tr', null, [
-				h('td', { key: 'a' }, [
-					h('div', null, account.label === '' ? account.id : account.label),
-					account.label === '' ? null : h('div', { className: 'dap-mono dap-dim', key: 'id' }, account.id),
+			const quotaState = pool.quotaData.forAccount(account);
+			const quotaPending = pool.quotaData.pendingIds.has(account.id);
+			const name = account.label || account.id;
+			return h('tr', { 'data-selected': selected === true }, [
+				h('td', { key: 'sel', className: 'dap-cell-select' }, h('input', {
+					type: 'checkbox', className: 'dap-check-row', 'aria-label': `${t('colAccount')}: ${name}`,
+					checked: selected === true, disabled: action.pending, onChange: () => onSelect(account.id),
+				})),
+				h('td', { key: 'a', className: 'dap-cell-account' }, h('div', { className: 'dap-identity' }, [
+					h('span', { className: 'dap-avatar', key: 'avatar', 'aria-hidden': true }, (name || 'A').slice(0, 1).toUpperCase()),
+					h('div', { className: 'dap-identity-copy', key: 'copy' }, [
+						h('div', { className: 'dap-account-name', key: 'name' }, name),
+						account.label ? h('div', { className: 'dap-mono dap-dim', key: 'id' }, account.id) : null,
+						h('div', { className: 'dap-row-tags', key: 'groups' }, (account.groups ?? []).length === 0
+							? h('span', { className: 'dap-tag' }, t('noGroups'))
+							: account.groups.map((id) => h('span', { className: 'dap-tag', key: id }, id))),
+						account.notes ? h('div', { className: 'dap-dim dap-note', key: 'note', title: account.notes }, account.notes) : null,
+						account.errorMessage ? h('div', { className: 'dap-error dap-note', key: 'err', title: account.errorMessage }, account.errorMessage) : null,
+						account.lastTestAt ? h('div', { className: account.lastTestOk ? 'dap-cred-set dap-note' : 'dap-error dap-note', key: 'health', title: `${new Date(account.lastTestAt).toLocaleString()} · ${account.lastTestModel || ''}` }, account.lastTestOk ? t('testPassed', { ms: String(account.lastTestLatencyMs ?? 0) }) : t('testFailed', { message: account.lastTestMessage || account.lastTestErrorCode || t('failed') })) : null,
+					]),
+				])),
+				h('td', { key: 'p', className: 'dap-cell-protocol' }, [
+					h('div', { className: 'dap-protocol', key: 'platform' }, [account.platform, account.platform === 'anthropic' && account.mimicry === 'claude-code' ? ' · ' : null, account.platform === 'anthropic' && account.mimicry === 'claude-code' ? h('span', { className: 'dap-tag', key: 'cc' }, t('mimicryOn')) : null]),
+					h('div', { className: 'dap-cell-meta', key: 'type' }, [account.authMode === 'oauth' ? 'OAuth' : 'API Key', account.platform === 'anthropic' && account.mimicry === 'claude-code' ? h('span', { className: 'dap-tag', key: 'cc' }, t('mimicryOn')) : null]),
+					h('div', { className: 'dap-cell-meta', key: 'credential' }, h('span', {
+						className: credential.configured ? 'dap-cred-set' : 'dap-cred-missing',
+						title: credential.source === undefined ? '' : t('credSource', { source: credential.source }),
+					}, `${t(credential.configured ? 'credConfigured' : 'credMissing')}${credential.configured && credential.writable === false ? ` · ${t('credReadOnly')}` : ''}`)),
 				]),
-				h('td', { key: 'p', className: 'dap-dim' }, account.platform),
-				h('td', { key: 's' }, h(Pill, { tone: status.tone }, t(status.key))),
-				h('td', { key: 'g', className: 'dap-dim' }, (account.groups ?? []).length === 0
-					? t('noGroups')
-					: account.groups.join(', ')),
-				h('td', { key: 'pr', className: 'dap-num' }, String(account.priority)),
-				h('td', { key: 'c', className: 'dap-num' }, account.concurrency === 0 ? '∞' : String(account.concurrency)),
-				h('td', { key: 'w', className: 'dap-num' }, cooling === null
-					? t('none')
-					: `${formatRemaining(cooling.until - now, t)} · ${t(cooling.reasonKey)}`),
-				h('td', { key: 'f', className: 'dap-num' }, String(account.consecutiveFailures ?? 0)),
-				h('td', { key: 'cr' }, h('span', {
-					className: credential.configured ? 'dap-cred-set' : 'dap-cred-missing',
-					title: credential.source === undefined ? '' : t('credSource', { source: credential.source }),
-				}, `${t(credential.configured ? 'credConfigured' : 'credMissing')}${credential.configured && credential.writable === false ? ` · ${t('credReadOnly')}` : ''}`)),
-				h('td', { key: 'x' }, h('div', { className: 'dap-actions' }, [
-					h('button', {
-						key: 'toggle', type: 'button', className: 'dap-btn',
-						disabled: action.pending,
-						onClick: () => action.run(account.id, disabled ? 'enable' : 'disable'),
-					}, busy ? t('actWorking') : (disabled ? t('actEnable') : t('actDisable'))),
-					cooling === null ? null : h('button', {
-						key: 'clear', type: 'button', className: 'dap-btn',
-						disabled: action.pending,
-						onClick: () => action.run(account.id, 'clear-cooldown'),
-					}, t('actClear')),
-					props.preferred === true
-						? h('span', { key: 'is-preferred', className: 'dap-preferred' }, t('preferred'))
-						: h('button', {
-							key: 'prefer', type: 'button', className: 'dap-btn dap-btn-primary',
-							disabled: action.pending,
-							onClick: () => action.run(account.id, 'prefer'),
-						}, t('actPrefer')),
-					h('button', {
-						key: 'edit', type: 'button', className: 'dap-btn',
-						disabled: action.pending, onClick: () => pool.onEdit(account),
-					}, t('editAccount')),
-					h('button', {
-						key: 'delete', type: 'button', className: 'dap-btn',
-						disabled: action.pending, onClick: () => pool.onDelete(account),
-					}, confirming ? t('confirmDelete') : t('deleteAccount')),
+				h('td', { key: 's', className: 'dap-cell-status' }, [
+					h(Pill, { key: 'pill', tone: status.tone }, t(status.key)),
+					cooling === null ? null : h('div', { className: 'dap-cell-meta dap-num', key: 'cooling' }, `${formatRemaining(cooling.until - now, t)} · ${t(cooling.reasonKey)}`),
+					(account.consecutiveFailures ?? 0) === 0 ? null : h('div', { className: 'dap-cell-meta', key: 'failures' }, `${t('colFailures')} ${account.consecutiveFailures}`),
+				]),
+				h('td', { key: 'pr', className: 'dap-cell-schedule', 'data-label': t('colScheduling') }, h('div', { className: 'dap-cell-stack' }, [
+					h('span', { className: 'dap-num', key: 'priority' }, [h('span', { className: 'dap-dim', key: 'l' }, `${t('colPriority')} `), String(account.priority)]),
+					h('span', { className: 'dap-num', key: 'concurrency' }, [h('span', { className: 'dap-dim', key: 'l' }, `${t('colSlots')} `), account.concurrency === 0 ? '∞' : String(account.concurrency)]),
+					account.weight ? h('span', { className: 'dap-dim dap-num', key: 'weight' }, `${t('fieldWeight')} ${account.weight}`) : null,
+				])),
+				h('td', { key: 'used', className: 'dap-cell-activity' }, h('div', { className: 'dap-cell-stack' }, [
+					pool.quotaReady && canQueryQuota(account) ? h(QuotaSummary, { key: 'quota', account, ...quotaState, pending: quotaPending, t, now, onView: () => pool.onViewUsage(account) }) : null,
+					h('span', { className: 'dap-dim dap-last-used', key: 'at', title: account.lastUsedAt ? new Date(account.lastUsedAt).toLocaleString() : '' }, `${t('colLastUsed')} · ${account.lastUsedAt ? new Date(account.lastUsedAt).toLocaleDateString() : t('none')}`),
+					h('details', { className: 'dap-row-more', key: 'details' }, [
+						h('summary', { key: 'summary' }, [t('colExpires'), ' ›']),
+						h('div', { key: 'expiry', className: 'dap-cell-stack' }, h('span', null, account.expiresAt ? new Date(account.expiresAt).toLocaleString() : t('permanent'))),
+					]),
+				])),
+				h('td', { key: 'x', className: 'dap-cell-actions' }, h('div', { className: 'dap-actions' }, [
+					h('button', { key: 'edit', type: 'button', className: 'dap-btn dap-btn-soft', disabled: action.pending, onClick: () => pool.onEdit(account) }, t('editAccount')),
+					!pool.managementReady ? null : h('button', { key: 'test', type: 'button', className: 'dap-btn', disabled: action.pending || !credential.configured, onClick: () => pool.onTest(account) }, t('actTest')),
+					h('details', { key: 'more', className: 'dap-more', name: 'dap-account-actions', onToggle: positionMoreMenu }, [
+						h('summary', { key: 'summary', title: t('moreActions'), 'aria-label': `${t('moreActions')}: ${name}` }, h('span', { 'aria-hidden': true }, '⋯')),
+						h('div', { className: 'dap-more-menu', key: 'menu' }, [
+							!pool.quotaReady || !canQueryQuota(account) ? null : h('button', { key: 'quota', type: 'button', className: 'dap-btn', disabled: action.pending || quotaPending || !credential.configured, onClick: () => pool.onRefreshQuota(account) }, t('refreshAccountUsage')),
+							!pool.managementReady ? null : h('button', { key: 'schedule', type: 'button', className: 'dap-btn', disabled: action.pending, onClick: () => action.run(account.id, account.schedulable === false ? 'resume-scheduling' : 'pause-scheduling') }, t(account.schedulable === false ? 'actResume' : 'actPause')),
+							pool.managementReady && account.status === 'error' ? h('button', { key: 'reset', type: 'button', className: 'dap-btn', disabled: action.pending, onClick: () => action.run(account.id, 'reset-error') }, t('actResetError')) : null,
+							h('button', { key: 'toggle', type: 'button', className: 'dap-btn', disabled: action.pending, onClick: () => action.run(account.id, disabled ? 'enable' : 'disable') }, busy ? t('actWorking') : (disabled ? t('actEnable') : t('actDisable'))),
+							account.platform !== 'anthropic' ? null : h('button', { key: 'mimicry', type: 'button', className: 'dap-btn', disabled: action.pending, title: t('mimicryHint'), onClick: () => action.run(account.id, 'set-mimicry', { mimicry: account.mimicry === 'claude-code' ? 'off' : 'claude-code' }) }, account.mimicry === 'claude-code' ? t('actMimicryOff') : t('actMimicryOn')),
+							cooling === null ? null : h('button', { key: 'clear', type: 'button', className: 'dap-btn', disabled: action.pending, onClick: () => action.run(account.id, 'clear-cooldown') }, t('actClear')),
+							h('button', { key: 'delete', type: 'button', className: 'dap-btn dap-btn-danger', disabled: action.pending, onClick: () => pool.onDelete(account) }, confirming ? t('confirmDelete') : t('deleteAccount')),
+						]),
+					]),
 				])),
 			]);
+		}
+
+		// Fixed positioning keeps menus outside the table's horizontal scroll clip.
+		function positionMoreMenu(event) {
+			const details = event.currentTarget;
+			if (!details.open) return;
+			const menu = details.querySelector('.dap-more-menu');
+			const rect = details.querySelector('summary').getBoundingClientRect();
+			const inset = 10;
+			const width = menu.offsetWidth;
+			const height = menu.offsetHeight;
+			menu.style.left = `${Math.max(inset, Math.min(rect.right - width, window.innerWidth - width - inset))}px`;
+			menu.style.top = `${Math.max(inset, rect.bottom + height + 6 > window.innerHeight ? rect.top - height - 6 : rect.bottom + 6)}px`;
 		}
 
 		function UsageRow(props) {
 			const { row, t } = props;
 			return h('tr', null, [
-				h('td', { key: 't', className: 'dap-dim dap-num' }, row.at.slice(11, 19)),
+				h('td', { key: 't', className: 'dap-dim dap-num', title: row.at }, new Date(row.at).toLocaleString()),
 				h('td', { key: 'a', className: 'dap-mono' }, row.accountId === '' ? t('none') : row.accountId),
 				h('td', { key: 'm', className: 'dap-dim' }, row.model === '' ? t('none') : row.model),
-				h('td', { key: 'k', className: 'dap-num' }, [
+				h('td', { key: 'k', className: 'dap-num', title: t('cacheDetail', { write: compact(row.cacheWriteTokens), reasoning: compact(row.reasoningTokens) }) }, [
 					compact(row.inputTokens), ' / ', compact(row.outputTokens), ' / ', compact(row.cacheReadTokens),
 				]),
 				h('td', { key: 's', className: 'dap-num' }, String(row.accountSwitches)),
-				h('td', { key: 'r' }, h(Pill, { tone: row.ok ? 'ready' : 'failed' }, t(row.ok ? 'ok' : 'failed'))),
+				h('td', { key: 'r', title: row.errorCode || '' }, h(Pill, { tone: row.ok ? 'ready' : 'failed' }, t(row.ok ? 'ok' : 'failed'))),
 			]);
 		}
 
@@ -528,6 +1194,12 @@ window.__ModuleLoader__.load({
 		 * One labelled input. A plain function component (no hooks), so it is safe
 		 * for the offline test's tree expander to invoke.
 		 */
+		// =====================================================================
+		// § 9  Forms — supplier connect, account edit/create, group edit/create.
+		//      Each owns its own draft state; they are the only child components
+		//      that call hooks, and the test mounts them explicitly.
+		// =====================================================================
+
 		function Field(props) {
 			return h('label', { className: 'dap-field' }, [
 				h('span', { className: 'dap-field-label', key: 'l' }, props.label),
@@ -535,25 +1207,129 @@ window.__ModuleLoader__.load({
 					key: 'i',
 					className: 'dap-input',
 					type: props.type ?? 'text',
+					min: props.min,
+					max: props.max,
+					step: props.step,
 					value: props.value,
 					placeholder: props.placeholder,
+					'aria-label': props.label,
+					disabled: props.disabled,
 					onChange: (event) => props.onChange(event.target.value),
 				}),
 			]);
 		}
 
+		function OpenaiProtocolFields({ t, values, set, pending }) {
+			return h(React.Fragment, {}, [
+				h('label', { key: 'api', className: 'dap-field' }, [h('span', { className: 'dap-field-label' }, t('openaiApi')), h('select', { className: 'dap-input', 'aria-label': t('openaiApi'), value: values.openaiApi ?? 'chat-completions', disabled: pending, onChange: (event) => { set('openaiApi')(event.target.value); if (event.target.value !== 'responses') set('openaiTransport')('http'); } }, [h('option', { key: 'chat', value: 'chat-completions' }, t('openaiChat')), h('option', { key: 'responses', value: 'responses' }, t('openaiResponses'))])]),
+				h('label', { key: 'transport', className: 'dap-field' }, [h('span', { className: 'dap-field-label' }, t('openaiTransport')), h('select', { className: 'dap-input', 'aria-label': t('openaiTransport'), value: values.openaiTransport ?? 'http', disabled: pending, onChange: (event) => set('openaiTransport')(event.target.value) }, [h('option', { key: 'http', value: 'http' }, t('openaiHttp')), h('option', { key: 'websocket', value: 'websocket', disabled: values.openaiApi !== 'responses' }, t('openaiWebSocket'))]), values.openaiTransport === 'websocket' ? h('span', { className: 'dap-dim' }, t('openaiWebSocketHint')) : null]),
+			]);
+		}
+
+		const supplierModels = (text) => [...new Set(String(text ?? '').split(/[,\n\r]+/).map((value) => value.trim()).filter(Boolean))];
+		function SupplierForm({ t, groups, pending, error, onSave, onCancel, openaiProtocolReady }) {
+			const [values, setValues] = React.useState({ name: '', platform: 'anthropic', openaiApi: 'chat-completions', openaiTransport: 'http', baseUrl: '', models: '', groupId: '', mimicry: 'off', betas: '' });
+			const [credential, setCredential] = React.useState('');
+			const [discovery, setDiscovery] = React.useState({ pending: false, error: null, count: null });
+			const [validation, setValidation] = React.useState(null);
+			const operation = React.useRef(0);
+			const saving = React.useRef(false);
+			React.useEffect(() => () => { operation.current++; }, []);
+			const invalidate = () => { operation.current++; setDiscovery({ pending: false, error: null, count: null }); setValidation(null); };
+			const set = (key) => (value) => { invalidate(); setValues((previous) => ({ ...previous, [key]: value })); };
+			const setKey = (value) => { invalidate(); setCredential(value); };
+			const validUrl = () => { try { return (values.platform === 'openai' ? ['https:', 'http:', 'wss:', 'ws:'] : ['https:', 'http:']).includes(new URL(values.baseUrl.trim()).protocol); } catch { return false; } };
+			async function discover() {
+				if (pending || saving.current || discovery.pending || !credential.trim()) return;
+				if (!validUrl()) { setValidation(t('supplierUrlInvalid')); return; }
+				const seq = ++operation.current;
+				setDiscovery({ pending: true, error: null, count: null });
+				try {
+					const response = await fetch(ACTION_ROUTE, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify({ id: '', action: 'supplier-models', supplier: { platform: values.platform, baseUrl: values.baseUrl.trim(), ...(openaiProtocolReady && values.platform === 'openai' ? { openaiApi: values.openaiApi, openaiTransport: values.openaiTransport } : {}) }, credential: credential.trim() }) });
+					const body = await response.json();
+					if (seq !== operation.current) return;
+					if (!response.ok || body?.ok !== true || !Array.isArray(body.models)) throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+					const models = [...new Set(body.models.filter((value) => typeof value === 'string').map((value) => value.trim()).filter(Boolean))];
+					if (!models.length) { setDiscovery({ pending: false, error: t('supplierDiscoveryEmpty'), count: null }); return; }
+					setValues((previous) => ({ ...previous, models: models.join('\n') }));
+					setDiscovery({ pending: false, error: null, count: models.length });
+				} catch (failure) {
+					if (seq !== operation.current) return;
+					setDiscovery({ pending: false, error: t('supplierDiscoveryFailed', { message: failure instanceof Error ? failure.message : String(failure) }), count: null });
+				}
+			}
+			const models = supplierModels(values.models);
+			const valid = !!values.name.trim() && !!values.baseUrl.trim() && !!credential.trim() && models.length > 0;
+			async function submit() {
+				if (pending || saving.current) return;
+				if (!valid) { setValidation(t('supplierRequired')); return; }
+				if (!validUrl()) { setValidation(t('supplierUrlInvalid')); return; }
+				invalidate(); saving.current = true;
+				try {
+					const ok = await onSave({ supplier: { name: values.name.trim(), platform: values.platform, baseUrl: values.baseUrl.trim(), models, ...(openaiProtocolReady && values.platform === 'openai' ? { openaiApi: values.openaiApi, openaiTransport: values.openaiTransport } : {}), ...(values.groupId ? { groupId: values.groupId } : {}), ...(values.platform === 'anthropic' ? { mimicry: values.mimicry, betas: supplierModels(values.betas) } : {}) }, credential: credential.trim() });
+					if (ok) setCredential('');
+				} finally { saving.current = false; }
+			}
+			return h('form', { className: 'dap-form', onSubmit: (event) => { event.preventDefault(); return submit(); } }, [
+				h('div', { key: 'title', className: 'dap-form-title' }, t('supplierTitle')),
+				h('p', { key: 'hint', className: 'dap-intro' }, t('supplierHint')),
+				h('div', { key: 'fields', className: 'dap-form-grid' }, [
+					h(Field, { key: 'name', label: t('supplierName'), disabled: pending, value: values.name, onChange: set('name') }),
+					h('label', { key: 'platform', className: 'dap-field' }, [h('span', { className: 'dap-field-label' }, t('supplierProtocol')), h('select', { className: 'dap-input', 'aria-label': t('supplierProtocol'), value: values.platform, disabled: pending, onChange: (event) => set('platform')(event.target.value) }, SUPPLIER_PLATFORMS.map((value) => h('option', { key: value, value }, t({ anthropic: 'supplierAnthropic', openai: 'supplierOpenai', gemini: 'supplierGemini', custom: 'supplierCustom' }[value]))))]),
+					openaiProtocolReady && values.platform === 'openai' ? h(OpenaiProtocolFields, { key: 'openai-protocol', t, values, set, pending }) : null,
+					h(Field, { key: 'url', label: t('supplierAddress'), disabled: pending, placeholder: 'https://api.example.com', value: values.baseUrl, onChange: set('baseUrl') }),
+					h(Field, { key: 'key', type: 'password', label: t('supplierKey'), disabled: pending, value: credential, onChange: setKey }),
+				]),
+				h('label', { key: 'models', className: 'dap-field' }, [h('span', { className: 'dap-field-label' }, t('supplierModels')), h('textarea', { className: 'dap-input', rows: 4, 'aria-label': t('supplierModels'), value: values.models, disabled: pending, onChange: (event) => set('models')(event.target.value) }), h('span', { className: 'dap-dim' }, t('supplierModelsHint'))]),
+				h('button', { key: 'discover', type: 'button', className: 'dap-btn', disabled: pending || discovery.pending || !values.baseUrl.trim() || !credential.trim(), onClick: discover }, t(discovery.pending ? 'supplierDiscovering' : 'supplierDiscover')),
+				discovery.error ? h('div', { key: 'discovery-error', className: 'dap-error', role: 'status' }, discovery.error) : discovery.count !== null ? h('div', { key: 'discovery-count', className: 'dap-dim', role: 'status' }, t('supplierDiscoveryDone', { n: String(discovery.count) })) : null,
+				h('details', { key: 'advanced' }, [h('summary', {}, t('supplierAdvanced')), h('div', { className: 'dap-form-grid' }, [
+					h('label', { key: 'group', className: 'dap-field' }, [h('span', { className: 'dap-field-label' }, t('supplierGroup')), h('select', { className: 'dap-input', 'aria-label': t('supplierGroup'), value: values.groupId, disabled: pending, onChange: (event) => set('groupId')(event.target.value) }, [h('option', { key: '', value: '' }, t('supplierNewGroup')), ...groups.map((group) => h('option', { key: group.id, value: group.id }, group.label || group.id))]), h('span', { className: 'dap-dim' }, t('supplierGroupHint'))]),
+					values.platform !== 'anthropic' ? null : h('label', { key: 'mimicry', className: 'dap-field' }, [h('span', { className: 'dap-field-label' }, t('supplierClaudeCode')), h('select', { className: 'dap-input', 'aria-label': t('supplierClaudeCode'), value: values.mimicry, disabled: pending, onChange: (event) => set('mimicry')(event.target.value) }, MIMICRY_MODES.map((value) => h('option', { key: value, value }, t(value === 'off' ? 'mimicryOff' : 'mimicryClaudeCode'))))]),
+					values.platform !== 'anthropic' ? null : h(Field, { key: 'betas', label: t('supplierBeta'), disabled: pending, value: values.betas, onChange: set('betas') }),
+				])]),
+				validation || error ? h('div', { key: 'error', className: 'dap-error', role: 'alert' }, validation || error) : null,
+				h('div', { key: 'actions', className: 'dap-form-actions' }, [h('button', { type: 'submit', className: 'dap-btn dap-btn-primary', disabled: pending || !valid }, t(pending ? 'saving' : 'connectSupplier')), h('button', { type: 'button', className: 'dap-btn', disabled: pending, onClick: () => { invalidate(); setCredential(''); onCancel(); } }, t('cancel'))]),
+			]);
+		}
+
 		/** Add / edit form. The secret is write-only: it is never pre-filled. */
 		function AccountForm(props) {
-			const { t, mode, initial, configured, pending, error, onSave, onCancel, allGroups } = props;
+			const { t, mode, initial, configured, pending, error, onSave, onCancel, allGroups, managementReady, quotaReady, detectionReady, openaiProtocolReady } = props;
 			const [values, setValues] = React.useState(() => ({ ...initial }));
 			const [credential, setCredential] = React.useState('');
-			const set = (key) => (value) => setValues((previous) => ({ ...previous, [key]: value }));
+			const [validationError, setValidationError] = React.useState(null);
+			const set = (key) => (value) => { setValidationError(null); setValues((previous) => ({ ...previous, [key]: value })); };
 
 			function submit() {
+				const retries = Number(values.poolDetectionRetries ?? 2);
+				const delayMs = Number(values.poolDetectionRetryDelayMs ?? 1000);
+				const keywords = String(values.poolDetectionKeywords ?? POOL_DETECTION_KEYWORDS.join('\n')).split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+				if (detectionReady && (String(values.poolDetectionRetries ?? 2).trim() === '' || !Number.isInteger(retries) || retries < 0 || retries > 5
+					|| String(values.poolDetectionRetryDelayMs ?? 1000).trim() === '' || !Number.isInteger(delayMs) || delayMs < 100 || delayMs > 10000
+					|| keywords.length > 20 || keywords.some((value) => value.length > 200))) {
+					setValidationError(t('poolDetectionInvalid'));
+					return;
+				}
+				setValidationError(null);
 				onSave({
 					id: values.id,
 					account: {
 						label: values.label,
+						...(detectionReady ? {
+							poolDetectionRetry: values.poolDetectionRetry === true,
+							poolDetectionRetries: retries,
+							poolDetectionRetryDelayMs: delayMs,
+							poolDetectionKeywords: keywords,
+						} : {}),
+						...(quotaReady ? { projectId: values.projectId?.trim() || null, chatgptAccountId: values.chatgptAccountId?.trim() || null } : {}),
+						...(managementReady ? { notes: values.notes ?? '',
+						betas: String(values.betas ?? '').split(',').map((value) => value.trim()).filter(Boolean),
+						expiresAt: values.expiresAt ? new Date(values.expiresAt).toISOString() : null,
+						autoPauseOnExpired: values.autoPauseOnExpired !== false,
+						schedulable: values.schedulable !== false,
+						loadFactor: values.loadFactor === '' || values.loadFactor == null ? null : Number(values.loadFactor) } : {}),
+						...(openaiProtocolReady && ['openai', 'grok', 'custom'].includes(values.platform) && (values.authMode ?? 'api-key') === 'api-key' ? { openaiApi: values.openaiApi ?? 'chat-completions', openaiTransport: values.openaiTransport ?? 'http' } : openaiProtocolReady ? { openaiApi: 'chat-completions', openaiTransport: 'http' } : {}),
 						platform: values.platform,
 						baseUrl: values.baseUrl === '' ? null : values.baseUrl,
 						models: String(values.models).split(',').map((part) => part.trim()).filter((part) => part !== ''),
@@ -561,16 +1337,21 @@ window.__ModuleLoader__.load({
 						priority: Number(values.priority),
 						weight: Number(values.weight),
 						concurrency: Number(values.concurrency),
+						// Sent unconditionally, even for platforms where they cannot apply:
+						// an explicit "off" is a recorded decision, whereas omitting the
+						// field would leave a previously enabled disguise silently in place.
+						authMode: values.authMode ?? AUTH_MODES[0],
+						mimicry: values.mimicry ?? MIMICRY_MODES[0],
 					},
 					// `undefined` means "leave the stored secret alone".
 					credential: credential === '' ? undefined : credential,
+					// Per-pool priority overrides, sent alongside the account so one save
+					// expresses "this account, ranked this way in these pools".
+					groupPriorities: values.groupPriorities ?? {},
 				});
 			}
 
-			return h('div', { className: 'dap-form' }, [
-				h('div', { className: 'dap-form-title', key: 'title' },
-					mode === 'create' ? t('formCreate') : t('formEdit', { id: values.id })),
-				h('div', { className: 'dap-form-grid', key: 'grid' }, [
+			const fields = [
 					mode === 'create' ? h(Field, { key: 'id', label: t('fieldId'), value: values.id, onChange: set('id') }) : null,
 					h(Field, { key: 'label', label: t('fieldLabel'), value: values.label, onChange: set('label') }),
 					h('label', { className: 'dap-field', key: 'platform' }, [
@@ -580,6 +1361,29 @@ window.__ModuleLoader__.load({
 							onChange: (event) => set('platform')(event.target.value),
 						}, PLATFORMS.map((name) => h('option', { key: name, value: name }, name))),
 					]),
+			// OAuth and API-key classification is part of the account on every platform.
+			// The Claude Code mode selector remains Anthropic-only.
+					h('label', { className: 'dap-field', key: 'authMode' }, [
+						h('span', { className: 'dap-field-label', key: 'l' }, t('fieldAuthMode')),
+						h('select', {
+							key: 's', className: 'dap-input', value: values.authMode ?? AUTH_MODES[0],
+							onChange: (event) => set('authMode')(event.target.value),
+						}, AUTH_MODES.map((name) => h('option', { key: name, value: name },
+							t(name === 'oauth' ? 'authModeOauth' : 'authModeApiKey')))),
+					]),
+					values.platform !== 'anthropic' ? null : h('label', {
+						className: 'dap-field', key: 'mimicry', title: t('mimicryHint'),
+					}, [
+						h('span', { className: 'dap-field-label', key: 'l' }, t('fieldMimicry')),
+						h('select', {
+							key: 's', className: 'dap-input', value: values.mimicry ?? MIMICRY_MODES[0],
+							onChange: (event) => set('mimicry')(event.target.value),
+						}, MIMICRY_MODES.map((name) => h('option', { key: name, value: name },
+							t(name === 'claude-code' ? 'mimicryClaudeCode' : 'mimicryOff')))),
+					]),
+					!quotaReady || values.platform !== 'gemini' || values.authMode !== 'oauth' ? null : h(Field, { key: 'projectId', label: t('fieldProjectId'), value: values.projectId ?? '', onChange: set('projectId') }),
+					!quotaReady || values.platform !== 'openai' || values.authMode !== 'oauth' ? null : h(Field, { key: 'chatgptAccountId', label: t('fieldChatgptAccountId'), value: values.chatgptAccountId ?? '', onChange: set('chatgptAccountId') }),
+					openaiProtocolReady && ['openai', 'grok', 'custom'].includes(values.platform) && (values.authMode ?? 'api-key') === 'api-key' ? h(OpenaiProtocolFields, { key: 'openai-protocol', t, values, set, pending }) : null,
 					h(Field, { key: 'baseUrl', label: t('fieldBaseUrl'), value: values.baseUrl, onChange: set('baseUrl') }),
 					h(Field, {
 						key: 'credential', label: t('fieldCredential'), type: 'password', value: credential,
@@ -589,18 +1393,47 @@ window.__ModuleLoader__.load({
 					h(Field, { key: 'models', label: t('fieldModels'), value: values.models, onChange: set('models') }),
 					h(Field, { key: 'priority', label: t('fieldPriority'), value: values.priority, onChange: set('priority') }),
 					h(Field, { key: 'weight', label: t('fieldWeight'), value: values.weight, onChange: set('weight') }),
-					h(Field, { key: 'concurrency', label: t('fieldConcurrency'), value: values.concurrency, onChange: set('concurrency') }),
+					h(Field, { key: 'concurrency', type: 'number', label: t('fieldConcurrency'), value: values.concurrency, onChange: set('concurrency') }),
+					!managementReady ? null : h(Field, { key: 'loadFactor', type: 'number', label: t('fieldLoadFactor'), value: values.loadFactor ?? '', onChange: set('loadFactor') }),
+					!managementReady ? null : h(Field, { key: 'expiresAt', type: 'datetime-local', label: t('fieldExpiresAt'), value: values.expiresAt ?? '', onChange: set('expiresAt') }),
+					!managementReady ? null : h(Field, { key: 'notes', label: t('fieldNotes'), value: values.notes ?? '', onChange: set('notes') }),
+					!managementReady || values.platform !== 'anthropic' ? null : h(Field, { key: 'betas', label: t('fieldBetas'), value: values.betas ?? '', onChange: set('betas') }),
+					...(managementReady ? ['schedulable', 'autoPauseOnExpired'] : []).map((key) => h('label', { key, className: 'dap-check-label' }, [h('input', { type: 'checkbox', checked: values[key] !== false, onChange: (event) => setValues((previous) => ({ ...previous, [key]: event.target.checked })) }), t(key === 'schedulable' ? 'fieldSchedulable' : 'fieldAutoPause')])),
+			];
+			const schedulingKeys = new Set(['priority', 'weight', 'concurrency', 'loadFactor', 'expiresAt', 'schedulable', 'autoPauseOnExpired']);
+			const section = (key, label, scheduling) => h('fieldset', { className: 'dap-form-section', key }, [
+				h('legend', { key: 'title' }, t(label)),
+				h('div', { className: 'dap-form-grid', key: 'grid' }, fields.filter((field) => field && schedulingKeys.has(field.key ?? field.props.key) === scheduling)),
+			]);
+			return h('form', { className: 'dap-form', onSubmit: (event) => { event.preventDefault(); submit(); } }, [
+				h('div', { className: 'dap-form-title', key: 'title' }, mode === 'create' ? t('formCreate') : t('formEdit', { id: values.id })),
+				section('connection', 'sectionConnection', false),
+				section('scheduling', 'sectionScheduling', true),
+				!detectionReady ? h('div', { className: 'dap-dim', key: 'detection-restart' }, t('poolDetectionRestart')) : h('div', { className: 'dap-field dap-detection', key: 'detection' }, [
+					h('label', { className: 'dap-check-label', key: 'enabled' }, [h('input', { type: 'checkbox', 'aria-label': t('fieldPoolDetectionRetry'), checked: values.poolDetectionRetry === true, disabled: pending, onChange: (event) => set('poolDetectionRetry')(event.target.checked) }), t('fieldPoolDetectionRetry')]),
+					h('div', { className: 'dap-dim', key: 'hint' }, t('poolDetectionHint')),
+					h('div', { className: 'dap-form-grid', key: 'options' }, [
+						h(Field, { key: 'retries', type: 'number', min: 0, max: 5, step: 1, label: t('fieldPoolDetectionRetries'), value: values.poolDetectionRetries ?? '2', disabled: pending || values.poolDetectionRetry !== true, onChange: set('poolDetectionRetries') }),
+						h(Field, { key: 'delay', type: 'number', min: 100, max: 10000, step: 1, label: t('fieldPoolDetectionRetryDelayMs'), value: values.poolDetectionRetryDelayMs ?? '1000', disabled: pending || values.poolDetectionRetry !== true, onChange: set('poolDetectionRetryDelayMs') }),
+					]),
+					h('label', { className: 'dap-field', key: 'keywords' }, [
+						h('span', { className: 'dap-field-label' }, t('fieldPoolDetectionKeywords')),
+						h('textarea', { className: 'dap-input', rows: 3, 'aria-label': t('fieldPoolDetectionKeywords'), value: values.poolDetectionKeywords ?? POOL_DETECTION_KEYWORDS.join('\n'), disabled: pending || values.poolDetectionRetry !== true, onChange: (event) => set('poolDetectionKeywords')(event.target.value) }),
+						h('span', { className: 'dap-dim' }, t('poolDetectionKeywordsHint')),
+					]),
 				]),
+				validationError === null ? null : h('div', { className: 'dap-error', role: 'alert', key: 'validation' }, validationError),
 				// Membership is a set of checkboxes drawn from the groups that actually
 				// exist, so assigning one cannot introduce a typo the host would reject.
 				(allGroups ?? []).length === 0 ? null : h('div', { className: 'dap-field', key: 'groups' }, [
 					h('span', { className: 'dap-field-label', key: 'l' }, t('fieldGroups')),
-					h('div', { className: 'dap-actions', key: 'c' }, allGroups.map((group) => h(
+					h('div', { className: 'dap-group-options', key: 'c' }, allGroups.map((group) => h(
 						'label',
 						{ key: group.id, className: 'dap-models-hint' },
 						[
 							h('input', {
 								key: 'i',
+								className: 'dap-check-group',
 								type: 'checkbox',
 								checked: (values.groups ?? []).includes(group.id),
 								onChange: () => setValues((previous) => {
@@ -617,11 +1450,33 @@ window.__ModuleLoader__.load({
 						],
 					))),
 				]),
+				// Per-pool ranking. Inputs exist only for the pools this account actually
+				// belongs to, because an override is meaningless outside them.
+				(values.groups ?? []).length === 0 ? null : h('div', { className: 'dap-field', key: 'gprio' }, [
+					h('span', { className: 'dap-field-label', key: 'l' }, t('fieldGroupPriority')),
+					h('div', { className: 'dap-group-options', key: 'c' }, values.groups.map((groupId) => {
+						const group = (allGroups ?? []).find((candidate) => candidate.id === groupId);
+						return h('label', { key: groupId, className: 'dap-models-hint' }, [
+							h('span', { key: 'n' }, group === undefined || group.label === '' ? groupId : group.label),
+							h('input', {
+								key: 'i',
+								className: 'dap-check-prio',
+								type: 'number',
+								value: (values.groupPriorities ?? {})[groupId] ?? '',
+								placeholder: t('fieldGroupPriorityInherit'),
+								onChange: (event) => setValues((previous) => ({
+									...previous,
+									groupPriorities: { ...(previous.groupPriorities ?? {}), [groupId]: event.target.value },
+								})),
+							}),
+						]);
+					})),
+				]),
 				error === null ? null : h('div', { className: 'dap-error', key: 'err' }, error),
 				h('div', { className: 'dap-form-actions', key: 'actions' }, [
 					h('button', {
-						key: 'save', type: 'button', className: 'dap-btn dap-btn-primary',
-						disabled: pending, onClick: submit,
+						key: 'save', type: 'submit', className: 'dap-btn dap-btn-primary',
+						disabled: pending,
 					}, pending ? t('saving') : t('save')),
 					h('button', {
 						key: 'cancel', type: 'button', className: 'dap-btn',
@@ -638,36 +1493,739 @@ window.__ModuleLoader__.load({
 		 * renaming a group would silently change the route anyone had selected.
 		 */
 		function GroupForm(props) {
-			const { t, mode, initial, pending, error, onSave, onCancel } = props;
+			const { t, mode, initial, pending, error, onSave, onCancel, managementReady } = props;
 			const [values, setValues] = React.useState(() => ({ ...initial }));
+			const [discovery, setDiscovery] = React.useState({ pending: false, models: null, sources: [], error: null });
+			const [modelSearch, setModelSearch] = React.useState('');
+			const discoveryRequest = React.useRef(null);
+			React.useEffect(() => () => discoveryRequest.current?.abort(), []);
 			const set = (key) => (value) => setValues((previous) => ({ ...previous, [key]: value }));
+			const parseModels = (text) => [...new Set(String(text ?? '').split(/[\n,]/).map((part) => part.trim()).filter(Boolean))];
+			const selectedModels = parseModels(values.models);
+			async function fetchGroupModels() {
+				if (pending || discoveryRequest.current || mode !== 'edit') return;
+				const controller = new AbortController();
+				discoveryRequest.current = controller;
+				setDiscovery((previous) => ({ ...previous, pending: true, error: null }));
+				try {
+					const response = await fetch(ACTION_ROUTE, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json', accept: 'application/json' }, signal: controller.signal, body: JSON.stringify({ action: 'group-models', id: values.id }) });
+					const body = await response.json();
+					if (!response.ok || body?.ok !== true || !Array.isArray(body.models)) throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+					if (controller.signal.aborted) return;
+					const models = [...new Set(body.models.filter((model) => typeof model === 'string' && model.trim()).map((model) => model.trim()))];
+					setDiscovery({ pending: false, models, sources: body.sources ?? [], error: null });
+					// Keep existing manual entries; discovered models are selected for review.
+					setValues((previous) => ({ ...previous, models: [...new Set([...parseModels(previous.models), ...models])].join(', ') }));
+				} catch (error) {
+					if (!controller.signal.aborted) setDiscovery((previous) => ({ ...previous, pending: false, error: t('groupModelsFailed', { message: error.message }) }));
+				} finally { if (discoveryRequest.current === controller) discoveryRequest.current = null; }
+			}
 
 			function submit() {
+				if (pending || discoveryRequest.current) return;
 				onSave({
 					id: values.id,
 					group: {
 						label: values.label,
 						description: values.description,
-						models: String(values.models).split(',').map((part) => part.trim()).filter((part) => part !== ''),
+						...(managementReady ? { selectionMode: values.selectionMode ?? 'sticky', enabled: values.enabled !== false } : {}),
+						models: parseModels(values.models),
 					},
 				});
 			}
 
-			return h('div', { className: 'dap-form' }, [
+			return h('form', { className: 'dap-form', onSubmit: (event) => { event.preventDefault(); submit(); } }, [
 				h('div', { className: 'dap-form-title', key: 'title' },
 					mode === 'create' ? t('formGroupCreate') : t('formGroupEdit', { id: values.id })),
 				h('div', { className: 'dap-form-grid', key: 'grid' }, [
 					mode === 'create' ? h(Field, { key: 'id', label: t('fieldGroupId'), value: values.id, onChange: set('id') }) : null,
 					h(Field, { key: 'label', label: t('fieldGroupLabel'), value: values.label, onChange: set('label') }),
-					h(Field, { key: 'models', label: t('fieldGroupModels'), value: values.models, onChange: set('models') }),
+					h('label', { key: 'models', className: 'dap-field' }, [
+						h('span', { className: 'dap-field-label' }, t('fieldGroupModels')),
+						h('input', { className: 'dap-input', value: values.models, disabled: pending || discovery.pending, 'aria-label': t('fieldGroupModels'), onChange: (event) => set('models')(event.target.value) }),
+						mode !== 'edit' ? null : h('button', { type: 'button', className: 'dap-btn', disabled: pending || discovery.pending, onClick: fetchGroupModels }, t(discovery.pending ? 'groupFetchingModels' : 'groupFetchModels')),
+					]),
 					h(Field, { key: 'description', label: t('fieldGroupDescription'), value: values.description, onChange: set('description') }),
+					!managementReady ? null : h('label', { key: 'enabled', className: 'dap-check-label' }, [h('input', { type: 'checkbox', 'aria-label': t('fieldGroupEnabled'), checked: values.enabled !== false, disabled: pending, onChange: (event) => set('enabled')(event.target.checked) }), t('fieldGroupEnabled')]),
+					!managementReady ? null : h('label', { key: 'selectionMode', className: 'dap-field' }, [h('span', { className: 'dap-field-label' }, t('fieldSelectionMode')), h('select', { className: 'dap-input', value: values.selectionMode ?? 'sticky', onChange: (event) => set('selectionMode')(event.target.value) }, SELECTION_MODES.map(([value, key]) => h('option', { key: value, value }, t(key))))]),
+				]),
+				mode !== 'edit' ? null : h('p', { key: 'fetch-hint', className: 'dap-models-hint' }, t('groupModelsHint')),
+				discovery.error ? h('div', { key: 'fetch-error', className: 'dap-error', role: 'alert' }, discovery.error) : null,
+				discovery.models === null ? null : h('div', { key: 'discovered', className: 'dap-upstream-models' }, [
+					h('span', { key: 'count', className: 'dap-dim', role: 'status' }, t(discovery.models.length ? 'groupModelsFetched' : 'groupModelsEmpty', { n: String(discovery.models.length) })),
+					...discovery.sources.filter((source) => source.error).map((source) => h('span', { key: 'source-' + source.id, className: 'dap-error', role: 'status' }, (source.label || source.id) + ': ' + source.error)),
+					discovery.models.length === 0 ? null : h('div', { key: 'actions', className: 'dap-actions' }, [
+						h('input', { type: 'search', className: 'dap-input', 'aria-label': t('groupModelsSearch'), placeholder: t('groupModelsSearch'), value: modelSearch, onChange: (event) => setModelSearch(event.target.value) }),
+						h('button', { type: 'button', className: 'dap-btn', disabled: pending || discovery.pending, onClick: () => setValues((previous) => ({ ...previous, models: [...new Set([...parseModels(previous.models), ...discovery.models])].join(', ') })) }, t('groupModelsSelectAll')),
+						h('button', { type: 'button', className: 'dap-btn', disabled: pending || discovery.pending, onClick: () => set('models')('') }, t('groupModelsClear')),
+					]),
+					h('div', { key: 'options', className: 'dap-model-options' }, discovery.models.filter((model) => model.toLowerCase().includes(modelSearch.toLowerCase())).map((model) => h('label', { key: model, className: 'dap-model-option' }, [
+						h('input', { type: 'checkbox', checked: selectedModels.includes(model), 'aria-label': model, disabled: pending || discovery.pending, onChange: (event) => setValues((previous) => ({ ...previous, models: (event.target.checked ? [...new Set([...parseModels(previous.models), model])] : parseModels(previous.models).filter((selected) => selected !== model)).join(', ') })) }), model,
+					]))),
+					h('span', { key: 'selected', className: 'dap-models-hint' }, t('groupModelsSelected', { n: String(selectedModels.length) })),
 				]),
 				error === null ? null : h('div', { className: 'dap-error', key: 'err' }, error),
 				h('div', { className: 'dap-form-actions', key: 'actions' }, [
 					h('button', {
-						key: 'save', type: 'button', className: 'dap-btn dap-btn-primary',
-						disabled: pending, onClick: submit,
+						key: 'save', type: 'submit', className: 'dap-btn dap-btn-primary',
+						disabled: pending || discovery.pending,
 					}, pending ? t('saving') : t('save')),
+					h('button', {
+						key: 'cancel', type: 'button', className: 'dap-btn',
+						disabled: pending, onClick: () => { discoveryRequest.current?.abort(); onCancel(); },
+					}, t('cancel')),
+				]),
+			]);
+		}
+
+		/**
+		 * OAuth sign-in panel.
+		 *
+		 * Two ways to complete a login, and the panel shows which one applies rather
+		 * than pretending there is only one:
+		 *
+		 *   - the host bound its loopback listener, so the vendor redirects straight
+		 *     to it and this panel finds out by POLLING `/oauth-status` (the browser
+		 *     tab the operator signed in on cannot reach this page);
+		 *   - the vendor owns the redirect (Google's built-in client), or the port
+		 *     could not be bound, so the operator pastes the callback URL by hand.
+		 *
+		 * Polling only runs while a flow is pending, and stops the moment the flow
+		 * leaves `pending` — a timer that outlives its login is a leak, and one that
+		 * polls a finished flow is a request per interval for nothing.
+		 */
+		// =====================================================================
+		// § 10  OAuth panel — the provider directory and the live login flow.
+		// =====================================================================
+
+		function OAuthPanel(props) {
+			const { t, onClose, onChanged, providers, credentialsAvailable } = props;
+			const [provider, setProvider] = React.useState(() => (providers[0]?.id ?? ''));
+			const [flow, setFlow] = React.useState(null);
+			const [manual, setManual] = React.useState(false);
+			const [input, setInput] = React.useState('');
+			const [busy, setBusy] = React.useState(false);
+			const [error, setError] = React.useState(null);
+			const [done, setDone] = React.useState(null);
+			const [copied, setCopied] = React.useState(false);
+			/**
+			 * Which spelling of the loopback host the flow advertises. Only rendered
+			 * when a listener was bound, and only because a vendor that registered
+			 * one spelling will not accept the other.
+			 */
+			const [redirectHost, setRedirectHost] = React.useState('');
+			/** `oauth-check`'s verdict: a list of problems, or `null` before asking. */
+			const [problems, setProblems] = React.useState(null);
+			const activeFlow = React.useRef(null);
+			React.useEffect(() => () => { activeFlow.current = null; }, []);
+
+			/** One POST to the write route, with the same envelope `useAction` uses. */
+			async function post(id, action, extra) {
+				if (typeof fetch !== 'function') throw new Error(t('noConnection'));
+				const response = await fetch(ACTION_ROUTE, {
+					method: 'POST',
+					headers: { 'content-type': 'application/json', accept: 'application/json' },
+					credentials: 'same-origin',
+					body: JSON.stringify({ id, action, ...(extra ?? {}) }),
+				});
+				const body = await response.json().catch(() => null);
+				if (!response.ok || body === null) {
+					// The flow's own last words are more useful than a status code.
+					throw new Error(body?.error?.message ?? `HTTP ${String(response.status)}`);
+				}
+				return body;
+			}
+
+			async function poll(flowId) {
+				if (activeFlow.current?.id !== flowId || activeFlow.current.status === 'done') return;
+				try {
+					const body = await post('', 'oauth-status', { flow: flowId });
+					const current = body.flow;
+					if (current === null || current === undefined || activeFlow.current?.id !== flowId || activeFlow.current.status === 'done') return;
+					activeFlow.current = current;
+					setFlow(current);
+					if (current.status === 'done') {
+						if (current.manualOnly !== true) setManual(false);
+						setDone(current.accountId ?? '');
+						onChanged();
+					}
+					if (current.status === 'error') setError(current.error ?? t('oauthFailed', { message: '?' }));
+				} catch { /* a transient poll failure must not close the panel */ }
+			}
+
+			// The interval is set up ONCE per pending flow, keyed by the flow id and
+			// the manual flag, and torn down in the cleanup — so completing a login
+			// (which flips the status) stops it without a second timer.
+			const pollKey = flow !== null && flow.status === 'pending' && flow.manualOnly !== true ? flow.id : null;
+			React.useEffect(() => {
+				if (pollKey === null || typeof setInterval !== 'function') return undefined;
+				const timer = setInterval(() => { void poll(pollKey); }, 2000);
+				return () => { clearInterval(timer); };
+			}, [pollKey, t]);
+
+			async function start() {
+				activeFlow.current = null;
+				setInput('');
+				setBusy(true);
+				setError(null);
+				setDone(null);
+				setCopied(false);
+				setProblems(null);
+				try {
+					const body = await post('', 'oauth-start', {
+						provider,
+						// Omitted when unset, so the host keeps the provider default.
+						...(redirectHost === '' ? {} : { redirectHost }),
+					});
+					activeFlow.current = body.flow ?? null;
+					setFlow(body.flow ?? null);
+					setManual(body.manualOnly === true);
+					// Opening the tab is the whole point of the button; a blocked popup
+					// leaves the URL on screen to click instead.
+					if (body.flow?.authUrl !== undefined && typeof window !== 'undefined') {
+						try { window.open(body.flow.authUrl, '_blank', 'noopener'); } catch { /* the URL is on screen */ }
+					}
+				} catch (caught) {
+					setError(caught instanceof Error ? caught.message : String(caught));
+				} finally {
+					setBusy(false);
+				}
+			}
+
+			/** Ask the host which locally-provable parameters look wrong. */
+			async function check() {
+				if (flow === null) return;
+				setBusy(true);
+				try {
+					const body = await post('', 'oauth-check', { flow: flow.id });
+					setProblems(body.problems ?? []);
+				} catch (caught) {
+					setError(caught instanceof Error ? caught.message : String(caught));
+				} finally {
+					setBusy(false);
+				}
+			}
+
+			async function finish() {
+				if (flow === null) return;
+				setBusy(true);
+				setError(null);
+				try {
+					const body = await post('', 'oauth-finish', { flow: flow.id, input });
+					activeFlow.current = body.flow ?? flow;
+					setFlow(body.flow ?? flow);
+					setDone(body.flow?.accountId ?? '');
+					setInput('');
+					onChanged();
+				} catch (caught) {
+					setError(caught instanceof Error ? caught.message : String(caught));
+					void poll(flow.id);
+				} finally {
+					setBusy(false);
+				}
+			}
+
+			async function cancel() {
+				activeFlow.current = null;
+				if (flow !== null) {
+					try { await post('', 'oauth-cancel', { flow: flow.id }); } catch { /* nothing to undo */ }
+				}
+				setFlow(null);
+				setInput('');
+				setError(null);
+				setDone(null);
+				onClose();
+			}
+
+			function copy(url) {
+				try {
+					if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText !== undefined) {
+						void navigator.clipboard.writeText(url);
+						setCopied(true);
+					}
+				} catch { /* selecting the text by hand still works */ }
+			}
+
+			const current = providers.find((entry) => entry.id === provider);
+			const pending = flow !== null && flow.status === 'pending';
+			const expiredAt = flow === null ? null : Date.parse(flow.expiresAt);
+
+			if (done !== null) return h('div', { className: 'dap-form', key: 'oauth' }, [
+				h('div', { className: 'dap-form-title', key: 'title' }, t('oauthCompletedTitle')),
+				h('div', { className: 'dap-status', role: 'status', key: 'done' }, t('oauthDone', { id: done })),
+				h('p', { className: 'dap-intro', key: 'hint' }, t('oauthCompletedHint')),
+				h('div', { className: 'dap-form-actions', key: 'actions' }, [
+					h('button', { key: 'return', type: 'button', className: 'dap-btn dap-btn-primary', onClick: () => { activeFlow.current = null; onClose(); } }, t('oauthReturn')),
+					h('button', { key: 'another', type: 'button', className: 'dap-btn', onClick: () => { activeFlow.current = null; setFlow(null); setInput(''); setDone(null); setError(null); setProblems(null); setCopied(false); setManual(false); } }, t('oauthAddAnother')),
+				]),
+			]);
+
+			return h('div', { className: 'dap-form', key: 'oauth' }, [
+				h('div', { className: 'dap-form-title', key: 'title' }, t('oauthTitle')),
+				h('p', { className: 'dap-intro', key: 'hint' }, t('oauthHint')),
+				credentialsAvailable === false
+					? h('div', { className: 'dap-status dap-error', key: 'nocred' }, t('oauthNoCredential'))
+					: null,
+				providers.length === 0
+					? h('div', { className: 'dap-status', key: 'none' }, t('oauthEmptyProviders'))
+					: h('label', { className: 'dap-field', key: 'provider' }, [
+						h('span', { className: 'dap-field-label', key: 'l' }, t('oauthProvider')),
+						h('select', {
+							key: 's',
+							className: 'dap-input',
+							value: provider,
+							disabled: busy || pending,
+							onChange: (event) => {
+								setProvider(event.target.value);
+								setFlow(null);
+								setError(null);
+								setDone(null);
+							},
+						}, providers.map((entry) => h('option', { key: entry.id, value: entry.id },
+							entry.unverified === true ? `${entry.label} · ${t('oauthUnverified')}` : entry.label))),
+					]),
+				// The loopback spelling. Rendered only while nothing is live: it is an
+				// input to `oauth-start`, so changing it mid-flow would do nothing and
+				// imply otherwise.
+				flow !== null ? null : h('label', {
+					className: 'dap-field', key: 'redirectHost', title: t('oauthRedirectHostHint'),
+				}, [
+					h('span', { className: 'dap-field-label', key: 'l' }, t('oauthRedirectHost')),
+					h('select', {
+						key: 's', className: 'dap-input', value: redirectHost,
+						onChange: (event) => setRedirectHost(event.target.value),
+					}, [
+						h('option', { key: '__default', value: '' }, 'localhost'),
+						h('option', { key: '__ip', value: '127.0.0.1' }, '127.0.0.1'),
+					]),
+				]),
+				// The vendor's own hint about how the redirect comes back. Shown before
+				// the login starts, so the operator knows whether to keep the tab open.
+				flow === null
+					? (current?.manualOnly === true ? h('p', { className: 'dap-intro', key: 'manual-hint' }, t('oauthManual')) : null)
+					: (manual ? h('p', { className: 'dap-intro', key: 'manual' }, t('oauthManual')) : h('p', { className: 'dap-intro', key: 'auto' }, t('oauthCallback'))),
+				flow === null ? null : h('div', { className: 'dap-field', key: 'url' }, [
+					h('span', { className: 'dap-field-label', key: 'l' }, t('oauthOpen')),
+					h('div', { className: 'dap-actions', key: 'v' }, [
+						h('a', {
+							key: 'a', className: 'dap-models-hint', href: flow.authUrl, target: '_blank', rel: 'noopener noreferrer',
+						}, flow.authUrl),
+						h('button', {
+							key: 'c', type: 'button', className: 'dap-btn',
+							onClick: () => copy(flow.authUrl),
+						}, copied ? t('oauthCopied') : t('oauthCopy')),
+					]),
+					pending && expiredAt !== null && Number.isFinite(expiredAt)
+						? h('span', { key: 'e', className: 'dap-models-hint' },
+							t('oauthExpires', { time: formatRemaining(expiredAt - Date.now(), t) }))
+						: null,
+				]),
+				// The paste box is always available (a fixed-redirect provider needs
+				// it, and a broken listener is exactly when a manual path earns its
+				// keep) but it is only EMPHASISED when it is the only way through.
+				flow === null ? null : h('label', { className: 'dap-field', key: 'input' }, [
+					h('span', { className: 'dap-field-label', key: 'l' }, t('oauthInput')),
+					h('input', {
+						key: 'i', className: 'dap-input', type: 'text', value: input,
+						placeholder: t('oauthInputPlaceholder'),
+						onChange: (event) => setInput(event.target.value),
+					}),
+				]),
+				pending ? h('div', { className: 'dap-status', key: 'waiting' }, t('oauthWaiting')) : null,
+				done === null ? null : h('div', { className: 'dap-status', key: 'done' }, t('oauthDone', { id: done })),
+				flow !== null && flow.caveat !== null && flow.caveat !== undefined
+					? h('div', { className: 'dap-status', key: 'caveat' }, t('oauthCaveat', { text: flow.caveat }))
+					: null,
+				problems === null ? null : h(
+					'div',
+					{ className: problems.length === 0 ? 'dap-status' : 'dap-status dap-error', key: 'problems' },
+					problems.length === 0
+						? t('oauthCheckOk')
+						// A vendor error cannot be resolved from here, so the message says
+						// what WOULD be resolvable: the parameters this pool controls.
+						: t('oauthCheckProblems', { list: problems.join('; ') }),
+				),
+				error === null ? null : h('div', { className: 'dap-error', key: 'err' }, t('oauthFailed', { message: error })),
+				h('div', { className: 'dap-form-actions', key: 'actions' }, [
+					flow === null
+						? h('button', {
+							key: 'start', type: 'button', className: 'dap-btn dap-btn-primary',
+							disabled: busy || providers.length === 0 || credentialsAvailable === false,
+							onClick: start,
+						}, busy ? t('saving') : t('oauthStart'))
+						: h('button', {
+							key: 'finish', type: 'button', className: 'dap-btn dap-btn-primary',
+							disabled: busy || input.trim() === '',
+							onClick: finish,
+						}, busy ? t('saving') : t('oauthFinish')),
+					h('button', {
+						key: 'cancel', type: 'button', className: 'dap-btn', disabled: busy, onClick: cancel,
+					}, t('oauthCancel')),
+					// Only meaningful once a flow exists (there are parameters to check).
+					flow === null ? null : h('button', {
+						key: 'check', type: 'button', className: 'dap-btn', disabled: busy, onClick: check,
+					}, t('oauthCheck')),
+				]),
+			]);
+		}
+
+		// =====================================================================
+		// § 11  Page chrome — the header and the summary cards. Both are pure
+		//       functions of props: no hooks, no page state, so the offline test
+		//       can expand them without a hook runtime (see tools/client-test.mjs).
+		// =====================================================================
+
+		/** The first-load placeholder: the page has no data yet. */
+		function PoolLoadingState(props) {
+			const { t } = props;
+			return h('div', { className: 'dap-state', key: 'loading', role: 'status', 'aria-live': 'polite' }, [
+				h('span', { className: 'dap-spinner', key: 'spinner' }),
+				h('h4', { className: 'dap-state-title', key: 'title' }, t('loading')),
+				h('p', { className: 'dap-state-hint', key: 'hint' }, t('loadingHint')),
+			]);
+		}
+
+		/** The first-load failure: the Host never returned a body, so there is
+		 *  nothing to show. The raw message is kept verbatim — it is the only
+		 *  clue about which route or service failed. */
+		function PoolErrorState(props) {
+			const { t, message, onRetry } = props;
+			return h('div', { className: 'dap-state dap-state-error', key: 'error', role: 'alert' }, [
+				h('span', { className: 'dap-state-icon', key: 'icon' }, h(Icon, { name: 'refresh' })),
+				h('h4', { className: 'dap-state-title', key: 'title' }, t('loadFailedTitle')),
+				h('p', { className: 'dap-state-hint', key: 'hint' }, t('loadFailedHint')),
+				message ? h('p', { className: 'dap-state-detail', key: 'detail' }, message) : null,
+				h('button', { className: 'dap-btn dap-btn-primary', key: 'retry', type: 'button', onClick: onRetry }, t('retryLoad')),
+			]);
+		}
+
+		/** The "nothing here" body shared by the three panels: one icon and one
+		 *  line of explanation. Panels pass their own icon and copy. */
+		function PoolEmptyState(props) {
+			const { icon, message } = props;
+			return h('div', { className: 'dap-status dap-empty', key: 'empty' }, [
+				h('span', { className: 'dap-empty-icon', key: 'icon' }, h(Icon, { name: icon })),
+				message,
+			]);
+		}
+
+		/** Brand mark, title, and the row of page-level verbs. */
+		function PoolHeader(props) {
+			const { t, managementReady, supplierReady, pending, onExport, onToggleOauth, onToggleImport, onToggleSupplier, onAdvancedAdd, onRefresh } = props;
+			return h('div', { className: 'dap-head', key: 'head' }, [
+				h('div', { className: 'dap-head-text', key: 'text' }, [
+					h('span', { className: 'dap-brand-mark', key: 'icon' }, h(Icon, { name: 'pool' })),
+					h('div', { className: 'dap-heading-copy', key: 'copy' }, [
+						h('h3', { className: 'dap-title', key: 'title' }, t('title')),
+						h('p', { className: 'dap-intro', key: 'intro' }, t('intro')),
+					]),
+				]),
+				h('div', { className: 'dap-head-actions', key: 'actions' }, [
+					!managementReady ? null : h('button', { className: 'dap-refresh', key: 'export', type: 'button', title: t('exportHint'), onClick: onExport }, t('exportAction')),
+					h('button', { className: 'dap-refresh', key: 'oauth', type: 'button', onClick: onToggleOauth }, t('oauthAction')),
+					h('button', { className: 'dap-refresh', key: 'import', type: 'button', onClick: onToggleImport }, t('importAction')),
+					h('button', {
+						className: 'dap-btn dap-btn-primary', key: 'supplier', type: 'button', disabled: pending,
+						onClick: onToggleSupplier,
+					}, [h(Icon, { key: 'icon', name: 'plus' }), t(supplierReady ? 'connectSupplier' : 'addAccount')]),
+					supplierReady ? h('button', {
+						className: 'dap-refresh', key: 'add', type: 'button', disabled: pending, onClick: onAdvancedAdd,
+					}, t('advancedAdd')) : null,
+					h('button', { className: 'dap-refresh', key: 'refresh', type: 'button', onClick: onRefresh }, t('refresh')),
+				]),
+			]);
+		}
+
+		/** The four headline numbers above the tabs. */
+		function PoolCards(props) {
+			const { t, accountsBody, totalAccounts, groupCount, counts } = props;
+			return h('div', { className: 'dap-cards', key: 'cards' }, [
+				h(Card, {
+					key: 'a', icon: 'accounts', label: t('cardAccounts'), value: String(totalAccounts),
+					hint: t('cardAccountsHint', { ready: String(counts.ready), cooling: String(counts.cooling), failed: String(counts.failed) }),
+				}),
+				h(Card, {
+					key: 'r', icon: 'activity', label: t('cardRequests'), value: compact(accountsBody?.totalRequests ?? 0),
+					hint: t('cardRequestsHint'),
+				}),
+				h(Card, {
+					key: 'g', icon: 'groups', label: t('cardGroups'), value: String(groupCount),
+					hint: t('cardGroupsHint'),
+				}),
+				h(Card, {
+					key: 'b', icon: 'link', label: t('cardBindings'), value: String((accountsBody?.bindings ?? []).length),
+					hint: t('cardBindingsHint'),
+				}),
+			]);
+		}
+
+		// =====================================================================
+		// § 12  Panels — every tab body, form, and toolbar, as hook-free
+		//       components. PoolSection (§ 13) owns the state and hands each one
+		//       the values and callbacks it needs, so the offline test can expand
+		//       them without a hook runtime.
+		// =====================================================================
+
+		/** Search box, the five filter selects, and the result count / auto-refresh row. */
+		function PoolToolbar(props) {
+			const { t, filters, groups, shown, total, autoRefresh, onFilter, onClearFilters, onToggleAutoRefresh } = props;
+			return h('div', { className: 'dap-toolbar', key: 'filters' }, [
+				h('div', { className: 'dap-search-box', key: 'search' }, [
+					h(Icon, { name: 'search', key: 'icon' }),
+					h('input', { key: 'input', type: 'search', className: 'dap-input dap-search', placeholder: t('search'), 'aria-label': t('search'), value: filters.query, onChange: (event) => onFilter('query', event.target.value) }),
+				]),
+				...[
+					['platform', t('allPlatforms'), PLATFORMS.map((value) => [value, value])],
+					['authMode', t('colAuthMode'), [['api-key', 'API Key'], ['oauth', 'OAuth']]],
+					['status', t('allStates'), ['statusActive', 'statusCooling', 'statusError', 'statusDisabled', 'statusPaused', 'statusExpired'].map((value) => [value, t(value)])],
+					['group', t('allGroups'), [['__ungrouped', t('ungrouped')], ...groups.map((group) => [group.id, group.label || group.id])]],
+					['sort', null, [['priority', t('sortPriority')], ['name', t('sortName')], ['recent', t('sortRecent')]]],
+				].map(([key, label, choices]) => h('select', { key, className: 'dap-input', 'aria-label': label || t('sortPriority'), value: filters[key], onChange: (event) => onFilter(key, event.target.value) }, [label ? h('option', { key: '__all', value: '' }, label) : null, ...choices.map(([value, text]) => h('option', { key: value, value }, text))])),
+				h('div', { className: 'dap-filter-meta', key: 'meta' }, [
+					h('span', { key: 'count' }, t('shown', { n: String(shown), total: String(total) })),
+					['query', 'platform', 'authMode', 'status', 'group'].some((key) => filters[key]) ? h('button', { key: 'clear', type: 'button', className: 'dap-row-more', onClick: onClearFilters }, t('clearFilters')) : null,
+					h('label', { key: 'auto', className: 'dap-check-label' }, [h('input', { type: 'checkbox', checked: autoRefresh, onChange: (event) => onToggleAutoRefresh(event.target.checked) }), t('autoRefresh')]),
+				]),
+			]);
+		}
+
+		/** Page-size select and the prev/next pager. */
+		function PoolPagination(props) {
+			const { t, pageSize, currentPage, pageCount, onPageSize, onPrev, onNext } = props;
+			return h('div', { className: 'dap-toolbar dap-pagination', key: 'pagination' }, [
+				h('label', { key: 'size', className: 'dap-check-label' }, [t('pageSize'), h('select', { className: 'dap-input', 'aria-label': t('pageSize'), value: pageSize, onChange: (event) => onPageSize(Number(event.target.value)) }, [20, 50, 100].map((n) => h('option', { key: n, value: n }, String(n))))]),
+				h('div', { className: 'dap-pagination-nav', key: 'nav' }, [
+					h('button', { key: 'prev', className: 'dap-btn', type: 'button', disabled: currentPage === 0, onClick: onPrev }, t('pagePrev')),
+					h('span', { key: 'page', className: 'dap-page-label' }, t('pageOf', { page: String(currentPage + 1), total: String(pageCount) })),
+					h('button', { key: 'next', className: 'dap-btn', type: 'button', disabled: currentPage + 1 >= pageCount, onClick: onNext }, t('pageNext')),
+				]),
+			]);
+		}
+
+		/**
+		 * The tab strip. Roving-tabindex keyboard support is local to the strip
+		 * (arrow keys move focus and selection together), so it lives here rather
+		 * than in the page state.
+		 */
+		function PoolTabs(props) {
+			const { t, tabs, activeTab, onSelect } = props;
+			return h('div', { className: 'dap-tabs', role: 'tablist', 'aria-label': t('tabLabel'), key: 'tabs' }, tabs.map(([id, label, count, icon], index) => h('button', {
+				key: id, id: `dap-tab-${id}`, type: 'button', className: 'dap-tab', role: 'tab',
+				'aria-selected': activeTab === id, 'aria-controls': `dap-panel-${id}`, tabIndex: activeTab === id ? 0 : -1,
+				onClick: () => onSelect(id),
+				onKeyDown: (event) => {
+					const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : null;
+					if (next === null) return;
+					event.preventDefault(); onSelect(tabs[next][0]);
+					event.currentTarget.parentElement.querySelectorAll('[role="tab"]')[next].focus();
+				},
+			}, [h(Icon, { key: 'icon', name: icon }), t(label), h('span', { className: 'dap-tab-count', key: 'count' }, String(count))])));
+		}
+
+		/**
+		 * The outcome of the last action, rendered above the tabs. Every branch is
+		 * derived from the action result alone, so this stays a pure view.
+		 */
+		function ActionResultPanel(props) {
+			const { t, result, now, onDismiss } = props;
+			if (!result) return null;
+			return h('div', { className: 'dap-result', key: 'result', role: 'status' }, [
+				h('strong', { key: 'title' }, t('resultTitle')),
+				h('button', { key: 'dismiss', type: 'button', className: 'dap-btn', onClick: onDismiss }, t('resultDismiss')),
+				result.action === 'supplier-connect' && result.provider ? h('div', { key: 'supplier' }, [
+					h('strong', {}, t('supplierConnected', { name: result.provider.name })),
+					h('div', { className: 'dap-dim' }, `${t('supplierModels')}: ${(result.provider.models ?? []).join(', ')}`),
+					h('p', {}, t('supplierNext', { name: result.provider.name })),
+				]) : null,
+				result.reset ? h('div', { key: 'reset', className: 'dap-cred-set' }, t('resetCardSuccess', { n: String(result.reset.windowsReset) })) : null,
+				result.refreshError ? h('div', { key: 'refresh-error', className: 'dap-error' }, result.refreshError.message) : null,
+				result.syncError ? h('div', { key: 'sync-error', className: 'dap-error' }, result.syncError.message) : null,
+				result.quota && !result.reset ? h(QuotaView, { key: 'quota', quota: result.quota, t, now }) : null,
+				result.test ? h('div', { key: 'test', className: result.test.ok ? 'dap-cred-set' : 'dap-error' }, result.test.ok ? t('testPassed', { ms: String(result.test.latencyMs ?? 0) }) : t('testFailed', { message: result.test.message || result.test.error || 'Unknown error' })) : null,
+				Array.isArray(result.done) ? h('div', { key: 'done', className: 'dap-dim' }, `${t('ok')}: ${result.done.join(', ')}`) : null,
+				...(result.failed ?? []).map((entry, index) => h('div', { key: index, className: 'dap-error' }, `${entry.id}: ${entry.error?.message || entry.reason || entry.error || t('failed')}`)),
+				Array.isArray(result.created) ? h('div', { key: 'created', className: 'dap-dim' }, t('importDone', { created: String(result.created.length), errors: String(result.errors?.length ?? 0) })) : null,
+				Array.isArray(result.updated) ? h('div', { key: 'updated', className: 'dap-dim' }, `${t('editAccount')}: ${result.updated.join(', ')}`) : null,
+				result.errors?.length ? h('div', { key: 'import-errors', className: 'dap-error' }, JSON.stringify(result.errors)) : null,
+			]);
+		}
+
+		/** The group cards: one per group, with member count, strategy and model tags. */
+		function GroupsPanel(props) {
+			const { t, groups, groupCounts, managementReady, pending, form, onCreate, onEdit, onDelete } = props;
+			return h('div', { className: 'dap-panel', key: 'groups' }, [
+				h('div', { className: 'dap-panel-head', key: 'h' }, [
+					h('div', { key: 'copy' }, [h('h4', { className: 'dap-panel-title', key: 't' }, t('groupsTitle')), h('p', { className: 'dap-panel-subtitle', key: 'hint' }, t('groupsHint'))]),
+					h('button', { className: 'dap-btn dap-btn-primary', key: 'add', type: 'button', disabled: pending, onClick: onCreate }, [h(Icon, { name: 'plus', key: 'icon' }), t('groupAdd')]),
+				]),
+				form,
+				groups.length === 0
+					? h(PoolEmptyState, { key: 'empty', icon: 'groups', message: t('groupEmpty') })
+					: h('div', { className: 'dap-group-grid', key: 'list' }, groups.map((group) => h('div', { className: 'dap-group-card', key: group.id }, [
+						h('div', { className: 'dap-group-heading', key: 'heading' }, [
+							h('span', { className: 'dap-avatar', key: 'icon' }, h(Icon, { name: 'groups' })),
+							h('div', { key: 'name' }, [h('div', { className: 'dap-group-name', key: 'label' }, group.label || group.id), h('div', { className: 'dap-mono dap-dim', key: 'id' }, group.id)]),
+						]),
+						h('div', { className: 'dap-group-meta', key: 'meta' }, [
+							h('span', { key: 'members' }, t('groupMembers', { n: String(groupCounts.get(group.id) ?? 0) })),
+							!managementReady ? null : h('span', { className: 'dap-tag', key: 'strategy' }, t(SELECTION_MODES.find(([value]) => value === (group.selectionMode ?? 'sticky'))?.[1] ?? 'modeSticky')),
+						]),
+						group.description ? h('p', { className: 'dap-group-desc', key: 'description' }, group.description) : null,
+						h('div', { className: 'dap-group-models', key: 'models' }, (group.models ?? []).length === 0 ? h('span', { className: 'dap-tag' }, t('allModels')) : group.models.map((model) => h('span', { className: 'dap-tag', key: model, title: model }, model))),
+						h('div', { className: 'dap-group-footer', key: 'footer' }, [
+							h('span', { className: 'dap-mono dap-dim', key: 'route' }, `pool-${group.id}`),
+							h('div', { className: 'dap-actions', key: 'actions' }, [
+								h('button', { key: 'edit', type: 'button', className: 'dap-btn', disabled: pending, onClick: () => onEdit(group) }, t('editAccount')),
+								h('button', { key: 'delete', type: 'button', className: 'dap-btn dap-btn-danger', disabled: pending, onClick: () => onDelete(group) }, t('deleteAccount')),
+							]),
+						]),
+					]))),
+			]);
+		}
+
+		/** Recent request log: the two filters, the summary strip, and the table. */
+		function UsagePanel(props) {
+			const { t, list, rows, summary, filters, status, error, onFilter } = props;
+			return h('div', { className: 'dap-panel', key: 'usage' }, [
+				h('div', { className: 'dap-panel-head', key: 'h' }, h('div', null, [h('h4', { className: 'dap-panel-title', key: 'title' }, t('usageTitle')), h('p', { className: 'dap-panel-subtitle', key: 'hint' }, t('usageHint'))])),
+				h('div', { className: 'dap-toolbar', key: 'usage-filters' }, [
+					h('select', { className: 'dap-input', 'aria-label': t('usageAccount'), value: filters.account, onChange: (event) => onFilter('account', event.target.value) }, [h('option', { value: '', key: '__all' }, t('usageAccount')), ...list.map((account) => h('option', { value: account.id, key: account.id }, account.label || account.id))]),
+					h('input', { className: 'dap-input', type: 'search', 'aria-label': t('usageModel'), placeholder: t('usageModel'), value: filters.model, onChange: (event) => onFilter('model', event.target.value) }),
+				]),
+				status === 'error' ? h('div', { key: 'error', className: 'dap-status dap-error' }, error) : null,
+				h('div', { className: 'dap-usage-summary', key: 'summary', 'aria-label': t('usageSummary', { n: String(rows.length), ok: String(summary.ok), failed: String(summary.failed), input: compact(summary.input), output: compact(summary.output) }) }, [
+					['usageRequests', rows.length], ['usageSuccess', summary.ok], ['usageFailures', summary.failed], ['usageInput', compact(summary.input)], ['usageOutput', compact(summary.output)],
+				].map(([label, value]) => h('div', { key: label }, [h('strong', { key: 'n' }, String(value)), t(label)]))),
+				rows.length === 0
+					? h(PoolEmptyState, { key: 'empty', icon: 'activity', message: t('none') })
+					: h('div', { className: 'dap-table-wrap', key: 'table-wrap' }, h('table', { className: 'dap-table dap-usage-table', key: 'table' }, [
+						h('thead', { key: 'head' }, h('tr', null, [
+							h('th', { key: 't', scope: 'col' }, t('colTime')),
+							h('th', { key: 'a', scope: 'col' }, t('colAccount')),
+							h('th', { key: 'm', scope: 'col' }, t('colModel')),
+							h('th', { key: 'k', scope: 'col' }, t('colTokens')),
+							h('th', { key: 's', scope: 'col' }, t('colSwitches')),
+							h('th', { key: 'r', scope: 'col' }, t('colResult')),
+						])),
+						h('tbody', { key: 'body' }, rows.map((row, index) => h(UsageRow, { key: `${row.at}-${String(index)}`, row, t }))),
+					])),
+			]);
+		}
+
+		/**
+		 * The account tab. Everything inside it — the toolbar, the open forms, the
+		 * batch bar, the pager — is built by the caller and handed in as an already
+		 * rendered node, so this component only owns the header, the restart
+		 * notices, the selection table and the ordering between them.
+		 */
+		function AccountsPanel(props) {
+			const {
+				t, list, visible, selected, now, pool, action, pending,
+				managementReady, quotaReady, supplierReady,
+				toolbar, accountUsagePanel, supplierForm, form, testPanel, batchEditPanel,
+				importPanel, oauthPanel, batchBar, pagination, onToggleAll, onToggleOne,
+			} = props;
+			return h('div', { className: 'dap-panel', key: 'accounts' }, [
+				h('div', { className: 'dap-panel-head', key: 'h' }, [
+					h('div', { key: 'copy' }, [h('h4', { className: 'dap-panel-title', key: 'title' }, t('accountsTitle')), h('p', { className: 'dap-panel-subtitle', key: 'hint' }, t('accountsHint'))]),
+					h('span', { className: 'dap-panel-count', key: 'count' }, t('groupMembers', { n: String(list.length) })),
+				]),
+				!managementReady ? h('div', { className: 'dap-status', key: 'restart' }, t('restartRequired')) : null,
+				!quotaReady && managementReady ? h('div', { className: 'dap-status', key: 'quota-restart' }, t('quotaRestart')) : null,
+				toolbar,
+				accountUsagePanel,
+				!supplierReady ? h('div', { className: 'dap-status', key: 'supplier-restart' }, t('supplierRestart')) : null,
+				supplierForm,
+				form,
+				testPanel,
+				batchEditPanel,
+				importPanel,
+				oauthPanel,
+				batchBar,
+				visible.length === 0
+					? h(PoolEmptyState, {
+						key: 'empty', icon: list.length === 0 ? 'accounts' : 'search',
+						message: t(list.length === 0 ? 'empty' : 'noMatches'),
+					})
+					: h('div', { className: 'dap-table-wrap', key: 'table-wrap' }, h('table', { className: 'dap-table dap-account-table', key: 'table' }, [
+						h('thead', { key: 'head' }, h('tr', null, [
+							h('th', { key: 'sel', className: 'dap-cell-select', scope: 'col' }, h('input', {
+								type: 'checkbox', className: 'dap-check-all', 'aria-label': t('batchSelected', { n: String(visible.length) }),
+								checked: visible.length > 0 && visible.every((account) => selected.has(account.id)),
+								disabled: pending, onChange: () => onToggleAll(),
+							})),
+							h('th', { key: 'a', className: 'dap-cell-account', scope: 'col' }, t('colAccount')),
+							h('th', { key: 'p', className: 'dap-cell-protocol', scope: 'col' }, t('colConnection')),
+							h('th', { key: 's', className: 'dap-cell-status', scope: 'col' }, t('colStatus')),
+							h('th', { key: 'pr', className: 'dap-cell-schedule', scope: 'col' }, t('colScheduling')),
+							h('th', { key: 'used', className: 'dap-cell-activity', scope: 'col' }, t('colActivity')),
+							h('th', { key: 'x', className: 'dap-cell-actions', scope: 'col' }, t('colActions')),
+						])),
+						h('tbody', { key: 'body' }, visible.map((account) => h(AccountRow, {
+							key: account.id, account, now, t, action, pool,
+							selected: selected.has(account.id), onSelect: onToggleOne,
+						}))),
+					])),
+				pagination,
+			]);
+		}
+
+		/** One-off connectivity probe for a single account. */
+		function TestPanel(props) {
+			const { t, testing, pending, onModel, onRun, onCancel } = props;
+			return h('div', { className: 'dap-form', key: 'test' }, [
+				h('div', { className: 'dap-form-title', key: 'title' }, `${t('actTest')} · ${testing.label}`),
+				h(Field, { key: 'model', label: t('colModel'), value: testing.model, onChange: onModel }),
+				h('div', { className: 'dap-form-actions', key: 'actions' }, [
+					h('button', { type: 'button', className: 'dap-btn dap-btn-primary', disabled: pending || !testing.model.trim(), onClick: onRun }, t('actTest')),
+					h('button', { type: 'button', className: 'dap-btn', disabled: pending, onClick: onCancel }, t('cancel')),
+				]),
+			]);
+		}
+
+		/** Bulk edit of the scheduling fields across the current selection. */
+		function BatchEditPanel(props) {
+			const { t, values, pending, onValue, onSave } = props;
+			return h('div', { className: 'dap-form', key: 'batch-edit' }, [
+				h('p', { className: 'dap-intro' }, t('batchEditHint')),
+				h('div', { className: 'dap-form-grid' }, ['priority', 'concurrency', 'weight', 'models'].map((key) => h(Field, { key, label: t({ priority: 'fieldPriority', concurrency: 'fieldConcurrency', weight: 'fieldWeight', models: 'fieldModels' }[key]), type: key === 'models' ? 'text' : 'number', value: values[key], onChange: (value) => onValue(key, value) }))),
+				h('button', { type: 'button', className: 'dap-btn dap-btn-primary', disabled: pending || Object.values(values).every((value) => value.trim() === ''), onClick: onSave }, t('batchSave')),
+			]);
+		}
+
+		/** Paste-a-document import box, with an optional target group. */
+		function ImportPanel(props) {
+			const { t, groups, document: text, group, pending, onChange, onGroup, onRun, onCancel } = props;
+			return h('div', { className: 'dap-form', key: 'import' }, [
+				h('div', { className: 'dap-form-title', key: 'title' }, t('importTitle')),
+				h('p', { className: 'dap-intro', key: 'hint' }, t('importHint')),
+				groups.length === 0 ? null : h('label', { className: 'dap-field', key: 'target' }, [
+					h('span', { className: 'dap-field-label', key: 'l' }, t('importTarget')),
+					h('select', {
+						key: 's', className: 'dap-input', value: group,
+						onChange: (event) => onGroup(event.target.value),
+					}, [
+						h('option', { key: '__none', value: '' }, t('importTargetNone')),
+						...groups.map((entry) => h(
+							'option',
+							{ key: entry.id, value: entry.id },
+							entry.label === '' ? entry.id : entry.label,
+						)),
+					]),
+				]),
+				h('textarea', {
+					key: 'body',
+					className: 'dap-input dap-textarea',
+					value: text,
+					placeholder: t('importPlaceholder'),
+					onChange: (event) => onChange(event.target.value),
+				}),
+				h('div', { className: 'dap-form-actions', key: 'actions' }, [
+					h('button', {
+						key: 'run', type: 'button', className: 'dap-btn dap-btn-primary',
+						disabled: pending || text.trim() === '',
+						onClick: onRun,
+					}, pending ? t('saving') : t('importRun')),
 					h('button', {
 						key: 'cancel', type: 'button', className: 'dap-btn',
 						disabled: pending, onClick: onCancel,
@@ -676,24 +2234,148 @@ window.__ModuleLoader__.load({
 			]);
 		}
 
+		/**
+		 * The floating bar over a non-empty selection. It only issues verbs; the
+		 * host validates every id and reports per-account outcomes.
+		 */
+		function BatchBar(props) {
+			const { t, count, groups, group, confirming, pending, managementReady, onGroup, onRun, onDelete, onToggleEdit, onClear } = props;
+			return h('div', { className: 'dap-batch', key: 'batch' }, [
+				h('span', { className: 'dap-batch-count', key: 'n' }, t('batchSelected', { n: String(count) })),
+				h('button', { key: 'on', type: 'button', className: 'dap-btn', disabled: pending, onClick: () => onRun('enable') }, t('actEnable')),
+				h('button', { key: 'off', type: 'button', className: 'dap-btn', disabled: pending, onClick: () => onRun('disable') }, t('actDisable')),
+				h('button', { key: 'cool', type: 'button', className: 'dap-btn', disabled: pending, onClick: () => onRun('clear-cooldown') }, t('actClearCooldown')),
+				!managementReady ? null : h('button', { key: 'pause', type: 'button', className: 'dap-btn', disabled: pending, onClick: () => onRun('pause-scheduling') }, t('actPause')),
+				!managementReady ? null : h('button', { key: 'resume', type: 'button', className: 'dap-btn', disabled: pending, onClick: () => onRun('resume-scheduling') }, t('actResume')),
+				!managementReady ? null : h('button', { key: 'reset', type: 'button', className: 'dap-btn', disabled: pending, onClick: () => onRun('reset-error') }, t('actResetError')),
+				!managementReady ? null : h('button', { key: 'edit', type: 'button', className: 'dap-btn', disabled: pending, onClick: onToggleEdit }, t('batchEdit')),
+				groups.length === 0 ? null : h('select', {
+					key: 'pick', className: 'dap-input', value: group,
+					onChange: (event) => onGroup(event.target.value),
+				}, [
+					h('option', { key: '__none', value: '' }, t('batchPickGroup')),
+					...groups.map((entry) => h(
+						'option',
+						{ key: entry.id, value: entry.id },
+						entry.label === '' ? entry.id : entry.label,
+					)),
+				]),
+				groups.length === 0 ? null : h('button', {
+					key: 'join', type: 'button', className: 'dap-btn',
+					disabled: pending || group === '',
+					onClick: () => onRun('group-add', { group }),
+				}, t('batchJoin')),
+				groups.length === 0 ? null : h('button', {
+					key: 'leave', type: 'button', className: 'dap-btn',
+					disabled: pending || group === '',
+					onClick: () => onRun('group-remove', { group }),
+				}, t('batchLeave')),
+				// Two-step on purpose: deleting N accounts is irreversible, so the first
+				// click only ARMS it, and the label then names exactly how many would go.
+				h('button', {
+					key: 'del', type: 'button', className: 'dap-btn',
+					disabled: pending,
+					onClick: onDelete,
+				}, confirming
+					? t('batchConfirmDelete', { n: String(count) })
+					: t('batchDelete')),
+				h('button', { key: 'clear', type: 'button', className: 'dap-btn', onClick: onClear }, t('batchClear')),
+			]);
+		}
+		/**
+		 * The per-account quota drawer under the table. The reset-credit flow is
+		 * owned by PoolSection (it needs the request-id ledger), so it arrives here
+		 * as already-built handlers.
+		 */
+		function AccountUsagePanel(props) {
+			const {
+				t, account, snapshot, quotaReady, now, pending, usagePending, resetReady,
+				resetConfirmation, resetError, onRefresh, onClose, onUseReset, onConfirmReset, onCancelReset,
+			} = props;
+			if (!account || !quotaReady || !canQueryQuota(account)) return null;
+			const name = account.label || account.id;
+			return h('section', { className: 'dap-form dap-account-usage', key: 'account-usage', 'aria-label': t('accountUsageTitle', { name }) }, [
+				h('div', { key: 'head', className: 'dap-account-usage-head' }, [
+					h('div', { key: 'copy' }, [h('h4', { className: 'dap-form-title', tabIndex: -1, key: 'title' }, t('accountUsageTitle', { name })), h('p', { key: 'hint', className: 'dap-dim' }, t('accountUsageHint'))]),
+					h('div', { key: 'actions', className: 'dap-actions' }, [h('button', { key: 'refresh', type: 'button', className: 'dap-btn', disabled: pending || usagePending || !account.credential?.configured, onClick: onRefresh }, t(usagePending ? 'quotaRefreshing' : 'refreshAccountUsage')), h('button', { key: 'close', type: 'button', className: 'dap-btn', onClick: onClose }, t('resultDismiss'))]),
+				]),
+				h('div', { key: 'body', className: 'dap-account-usage-grid' }, [
+					h(QuotaView, { key: 'quota', quota: snapshot.quota, t, now }),
+					account.platform !== 'openai' ? null : h(ResetCreditsView, { key: 'cards', snapshot: snapshot.resetCredits, ready: resetReady, t, pending: pending || usagePending, configured: account.credential?.configured, confirmation: resetConfirmation?.id === account.id && resetConfirmation.key === quotaAccountKey(account) ? resetConfirmation : null, onUse: onUseReset, onConfirm: onConfirmReset, onCancel: onCancelReset, error: resetError }),
+				]),
+			]);
+		}
+
+		// =====================================================================
+		// § 13  PoolSection — the settings page. Owns all page state, fetches the
+		//       three Host routes, and assembles the panels below. Its own
+		//       render body is deliberately thin: the chrome is § 11, and the
+		//       remaining panels are built from hook-free components (§ 12).
+		// =====================================================================
+
 		function PoolSection(props) {
 			const { ctx, t } = props;
+			useStyles();
 
 			const [nonce, setNonce] = React.useState(0);
 			const action = useAction(() => setNonce((value) => value + 1), t);
 			const accounts = useJson(ACCOUNTS_ROUTE, nonce, t);
 			const usage = useJson(`${USAGE_ROUTE}?limit=${String(USAGE_LIMIT)}`, nonce, t);
-			const [now, setNow] = React.useState(() => Date.now());
+			// The OAuth provider directory is its own request, and deliberately not
+			// part of the accounts payload: the accounts route is on the hot path for
+			// every page render, while the provider list is static reference data.
+			const oauth = useJson(OAUTH_ROUTE, 0, t);
+			const now = useNow();
 			const [editing, setEditing] = React.useState(null);
 			const [confirmingId, setConfirmingId] = React.useState(null);
 			const [importing, setImporting] = React.useState(null);
 			const [importGroup, setImportGroup] = React.useState('');
+			const [oauthOpen, setOauthOpen] = React.useState(false);
 			const [editingGroup, setEditingGroup] = React.useState(null);
+			const [selected, setSelected] = React.useState(() => new Set());
+			const [batchGroup, setBatchGroup] = React.useState('');
+			// Arming state for the destructive batch verb, so one click never deletes.
+			const [confirmingBatch, setConfirmingBatch] = React.useState(false);
+			const [filters, setFilters] = React.useState({ query: '', platform: '', status: '', group: '', authMode: '', sort: 'priority' });
+			const [autoRefresh, setAutoRefresh] = React.useState(false);
+			const [testing, setTesting] = React.useState(null);
+			const [batchEditing, setBatchEditing] = React.useState(false);
+			const [batchValues, setBatchValues] = React.useState({ priority: '', concurrency: '', weight: '', models: '' });
+			const [exportError, setExportError] = React.useState(null);
+			const [usageFilters, setUsageFilters] = React.useState({ account: '', model: '' });
+			const [pageIndex, setPageIndex] = React.useState(0);
+			const [pageSize, setPageSize] = React.useState(50);
+			const [supplierOpen, setSupplierOpen] = React.useState(false);
+			const [activeTab, setActiveTab] = React.useState('accounts');
+			const quotaData = useAccountQuotas(t);
+			const [usageAccountId, setUsageAccountId] = React.useState(null);
+			const reset = useResetCredits(t, action, quotaData);
+			const { confirmation: resetConfirmation, error: resetError } = reset;
+			useMoreMenuDismissal();
+			const supplierReady = accounts.body?.supplierVersion >= 1;
+			const managementReady = accounts.body?.managementVersion >= 2;
+			const quotaReady = accounts.body?.quotaVersion >= 1;
+			const detectionReady = (accounts.body?.detectionVersion ?? 0) >= 1;
+			const openaiProtocolReady = (accounts.body?.openaiProtocolVersion ?? 0) >= 1;
 
 			/** Row-level handlers plus the pending delete confirmation. */
 			const pool = {
 				confirmingId,
+				managementReady,
+				quotaReady,
+				quotaData,
+				onViewUsage: (account) => {
+					setActiveTab('accounts');
+					setUsageAccountId(account.id);
+					reset.setError(null);
+					reset.setConfirmation(reset.restoreFor(account));
+					void quotaData.load(account);
+				},
+				onRefreshQuota: (account) => { void quotaData.load(account, true); },
+				onTest: (account) => { setActiveTab('accounts'); setTesting({ id: account.id, model: account.models?.[0] ?? '', label: account.label || account.id }); },
 				onEdit: (account) => {
+					setActiveTab('accounts');
+					setSupplierOpen(false);
 					setConfirmingId(null);
 					setEditing({
 						mode: 'edit',
@@ -702,13 +2384,33 @@ window.__ModuleLoader__.load({
 						initial: {
 							id: account.id,
 							label: account.label ?? '',
+							poolDetectionRetry: account.poolDetectionRetry === true,
+							poolDetectionRetries: String(account.poolDetectionRetries ?? 2),
+							poolDetectionRetryDelayMs: String(account.poolDetectionRetryDelayMs ?? 1000),
+							poolDetectionKeywords: (account.poolDetectionKeywords ?? POOL_DETECTION_KEYWORDS).join('\n'),
+							projectId: account.projectId ?? '', chatgptAccountId: account.chatgptAccountId ?? '', notes: account.notes ?? '', betas: (account.betas ?? []).join(', '), expiresAt: localDateInput(account.expiresAt),
+							autoPauseOnExpired: account.autoPauseOnExpired !== false, schedulable: account.schedulable !== false,
+							loadFactor: account.loadFactor == null ? '' : String(account.loadFactor),
 							platform: account.platform,
 							baseUrl: account.baseUrl ?? '',
+							openaiApi: account.openaiApi ?? 'chat-completions', openaiTransport: account.openaiTransport ?? 'http',
 							models: (account.models ?? []).join(', '),
 							groups: [...(account.groups ?? [])],
+							// The overrides that already exist for THIS account, so the form
+							// opens showing the real ranking rather than blanks.
+							groupPriorities: Object.fromEntries(
+								(accounts.body?.priorities ?? [])
+									.filter((entry) => entry.accountId === account.id)
+									.map((entry) => [entry.groupId, String(entry.priority)]),
+							),
 							priority: String(account.priority),
 							weight: String(account.weight ?? 0),
 							concurrency: String(account.concurrency ?? 0),
+							// Without these the selects would open on the defaults instead of
+							// on what is stored, and saving the form would then silently reset
+							// an enabled disguise.
+							authMode: account.authMode ?? AUTH_MODES[0],
+							mimicry: account.mimicry ?? MIMICRY_MODES[0],
 						},
 					});
 				},
@@ -722,6 +2424,7 @@ window.__ModuleLoader__.load({
 			};
 
 			function startCreate() {
+				setActiveTab('accounts');
 				setConfirmingId(null);
 				setEditing({
 					mode: 'create',
@@ -729,7 +2432,9 @@ window.__ModuleLoader__.load({
 					configured: false,
 					initial: {
 						id: '', label: '', platform: PLATFORMS[0], baseUrl: '',
+						poolDetectionRetry: false, poolDetectionRetries: '2', poolDetectionRetryDelayMs: '1000', poolDetectionKeywords: POOL_DETECTION_KEYWORDS.join('\n'),
 						models: '', groups: [], priority: '100', weight: '0', concurrency: '4',
+						authMode: AUTH_MODES[0], mimicry: MIMICRY_MODES[0],
 					},
 				});
 			}
@@ -742,11 +2447,28 @@ window.__ModuleLoader__.load({
 					// as "leave the stored secret alone".
 					...(payload.credential === undefined ? {} : { credential: payload.credential }),
 				});
-				if (ok) setEditing(null);
+				if (!ok) return;
+
+				// The per-pool priorities follow as their OWN requests, because the write
+				// route takes one action at a time. Awaiting each one means the first
+				// failure stops the rest and surfaces, instead of being swallowed.
+				// An empty box means "inherit the account's own priority", i.e. clear.
+				for (const [groupId, raw] of Object.entries(payload.groupPriorities ?? {})) {
+					const text = String(raw ?? '').trim();
+					const sent = text === ''
+						? await action.run(payload.id, 'priority-clear', { group: groupId })
+						: await action.run(payload.id, 'priority-set', { group: groupId, priority: Number(text) });
+					if (!sent) return;
+				}
+				setEditing(null);
 			}
 
 			const form = editing === null ? null : h(AccountForm, {
-				key: 'form',
+				// Keyed by the account id so switching straight from one account's editor
+				// to another's REMOUNTS the form. With a fixed key React reuses the same
+				// instance and preserves `useState` — the form would still show the
+				// previous account's values and then save them into the new account.
+				key: `form-${editing.id ?? ''}`,
 				t,
 				mode: editing.mode,
 				initial: editing.initial,
@@ -758,6 +2480,15 @@ window.__ModuleLoader__.load({
 				// Read inline: the `allGroups` const is declared further down, and a
 				// `const` does not hoist.
 				allGroups: accounts.body?.groups ?? [],
+				managementReady,
+				quotaReady,
+				detectionReady, openaiProtocolReady,
+			});
+
+			const supplierForm = !supplierOpen || !supplierReady ? null : h(SupplierForm, {
+				key: 'supplier-form', t, groups: accounts.body?.groups ?? [], pending: action.pending, error: action.error, openaiProtocolReady,
+				onSave: async (payload) => { const ok = await action.run('', 'supplier-connect', payload); if (ok) setSupplierOpen(false); return ok; },
+				onCancel: () => setSupplierOpen(false),
 			});
 
 			async function runImport() {
@@ -771,44 +2502,48 @@ window.__ModuleLoader__.load({
 				if (ok) setImporting(null);
 			}
 
-			const importPanel = importing === null ? null : h('div', { className: 'dap-form', key: 'import' }, [
-				h('div', { className: 'dap-form-title', key: 'title' }, t('importTitle')),
-				h('p', { className: 'dap-intro', key: 'hint' }, t('importHint')),
-				// Read the groups off the body inline: the `allGroups` const is declared
-				// further down and a `const` does not hoist.
-				(accounts.body?.groups ?? []).length === 0 ? null : h('label', { className: 'dap-field', key: 'target' }, [
-					h('span', { className: 'dap-field-label', key: 'l' }, t('importTarget')),
-					h('select', {
-						key: 's', className: 'dap-input', value: importGroup,
-						onChange: (event) => setImportGroup(event.target.value),
-					}, [
-						h('option', { key: '__none', value: '' }, t('importTargetNone')),
-						...accounts.body.groups.map((group) => h(
-							'option',
-							{ key: group.id, value: group.id },
-							group.label === '' ? group.id : group.label,
-						)),
-					]),
-				]),
-				h('textarea', {
-					key: 'body',
-					className: 'dap-input dap-textarea',
-					value: importing,
-					placeholder: t('importPlaceholder'),
-					onChange: (event) => setImporting(event.target.value),
-				}),
-				h('div', { className: 'dap-form-actions', key: 'actions' }, [
-					h('button', {
-						key: 'run', type: 'button', className: 'dap-btn dap-btn-primary',
-						disabled: action.pending || importing.trim() === '',
-						onClick: runImport,
-					}, action.pending ? t('saving') : t('importRun')),
-					h('button', {
-						key: 'cancel', type: 'button', className: 'dap-btn',
-						disabled: action.pending, onClick: () => setImporting(null),
-					}, t('cancel')),
-				]),
-			]);
+			const importPanel = importing === null ? null : h(ImportPanel, {
+				t, groups: accounts.body?.groups ?? [], document: importing, group: importGroup, pending: action.pending,
+				onChange: setImporting, onGroup: setImportGroup, onRun: runImport, onCancel: () => setImporting(null),
+			});
+
+			// --- batch ------------------------------------------------------------
+			// Selection is purely a view concern; the host still validates every id and
+			// reports per-account outcomes, so a stale selection cannot corrupt anything.
+			function toggleOne(accountId) {
+				setConfirmingBatch(false);
+				setSelected((previous) => {
+					const next = new Set(previous);
+					if (next.has(accountId)) next.delete(accountId);
+					else next.add(accountId);
+					return next;
+				});
+			}
+
+			function toggleAll() {
+				setConfirmingBatch(false);
+				setSelected((previous) => (visible.length > 0 && visible.every((account) => previous.has(account.id))
+					? new Set([...previous].filter((id) => !visible.some((account) => account.id === id)))
+					: new Set([...previous, ...visible.map((account) => account.id)])));
+			}
+
+			async function runBatch(verb, extra = {}) {
+				// Disarm FIRST: a stale armed state must never delete on a later click.
+				setConfirmingBatch(false);
+				const ok = await action.run('', 'batch', { ids: [...selected], verb, ...extra }, (body) => setSelected(new Set((body.failed ?? []).map((entry) => entry.id))));
+				if (ok) setBatchEditing(false);
+			}
+
+			const batchGroups = accounts.body?.groups ?? [];
+			const batchBar = selected.size === 0 ? null : h(BatchBar, {
+				t, count: selected.size, groups: batchGroups, group: batchGroup, confirming: confirmingBatch,
+				pending: action.pending, managementReady,
+				onGroup: setBatchGroup,
+				onRun: (verb, extra) => { void runBatch(verb, extra); },
+				onDelete: () => { if (!confirmingBatch) setConfirmingBatch(true); else void runBatch('delete'); },
+				onToggleEdit: () => setBatchEditing((value) => !value),
+				onClear: () => setSelected(new Set()),
+			});
 
 			// --- groups ----------------------------------------------------------
 			const allGroups = accounts.body?.groups ?? [];
@@ -836,6 +2571,8 @@ window.__ModuleLoader__.load({
 						label: group.label ?? '',
 						models: (group.models ?? []).join(', '),
 						description: group.description ?? '',
+						selectionMode: group.selectionMode ?? 'sticky',
+						enabled: group.enabled !== false,
 					},
 				});
 			}
@@ -847,7 +2584,9 @@ window.__ModuleLoader__.load({
 			}
 
 			const groupForm = editingGroup === null ? null : h(GroupForm, {
-				key: 'groupform',
+				// Same reason as the account form: a fixed key would leak one group's
+				// values into the next group's editor.
+				key: `groupform-${editingGroup.id ?? ''}`,
 				t,
 				mode: editingGroup.mode,
 				initial: editingGroup.initial,
@@ -855,49 +2594,40 @@ window.__ModuleLoader__.load({
 				error: action.error,
 				onSave: saveGroup,
 				onCancel: () => setEditingGroup(null),
+				managementReady,
 			});
 
-			const groupsPanel = h('div', { className: 'dap-panel', key: 'groups' }, [
-				h('div', { className: 'dap-panel-head', key: 'h' }, [
-					h('h4', { className: 'dap-panel-title', key: 't' }, t('groupsTitle')),
-					h('button', {
-						className: 'dap-refresh', key: 'add', type: 'button', onClick: startGroupCreate,
-					}, t('groupAdd')),
-				]),
-				groupForm,
-				allGroups.length === 0
-					? h('div', { className: 'dap-status', key: 'empty' }, t('groupEmpty'))
-					: h('div', { className: 'dap-status', key: 'list', style: undefined }, allGroups.map((group) => h(
-						'div',
-						{ className: 'dap-models-row', key: group.id },
-						[
-							h('span', { className: 'dap-models-name', key: 'n' }, group.label === '' ? group.id : group.label),
-							// Showing the real route makes it obvious what appears in the Models page.
-							h('span', { className: 'dap-mono dap-dim', key: 'r' }, `pool-${group.id}`),
-							h('span', { className: 'dap-models-hint', key: 'm' }, t('groupMembers', { n: String(groupCounts.get(group.id) ?? 0) })),
-							group.models.length === 0 ? null : h('span', { className: 'dap-models-hint', key: 'l' }, group.models.join(', ')),
-							h('button', {
-								key: 'e', type: 'button', className: 'dap-btn',
-								disabled: action.pending, onClick: () => startGroupEdit(group),
-							}, t('editAccount')),
-							h('button', {
-								key: 'd', type: 'button', className: 'dap-btn',
-								disabled: action.pending,
-								// One click, unlike account delete: a group owns no accounts, so
-								// deleting one is recoverable by recreating it.
-								onClick: () => { void action.run(group.id, 'group-delete'); },
-							}, t('deleteAccount')),
-						],
-					))),
-			]);
-
-			// Ticking clock so "cooling for" counts down without a refetch.
-			React.useEffect(() => {
-				const timer = setInterval(() => setNow(Date.now()), 1000);
-				return () => clearInterval(timer);
-			}, []);
+			const groupsPanel = h(GroupsPanel, {
+				t, groups: allGroups, groupCounts, managementReady, pending: action.pending, form: groupForm,
+				onCreate: startGroupCreate,
+				onEdit: startGroupEdit,
+				onDelete: (group) => { void action.run(group.id, 'group-delete'); },
+			});
 
 			const list = accounts.body?.accounts ?? [];
+			const filtered = filterAccounts(list, filters, now);
+			const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+			const currentPage = Math.min(pageIndex, pageCount - 1);
+			const visible = filtered.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
+			const visibleQuotaKey = visible.filter(canQueryQuota).map(quotaAccountKey).join('|');
+			React.useEffect(() => {
+				if (!quotaReady || accounts.status !== 'ready' || activeTab !== 'accounts') return;
+				let cancelled = false;
+				let index = 0;
+				const queue = visible.filter((account) => canQueryQuota(account) && account.credential?.configured);
+				async function worker() {
+					while (!cancelled && index < queue.length) await quotaData.load(queue[index++]);
+				}
+				void worker();
+				void worker();
+				return () => { cancelled = true; };
+			}, [visibleQuotaKey, accounts.body, accounts.status, quotaReady, activeTab]);
+			const usageAccount = list.find((account) => account.id === usageAccountId);
+			const usageSnapshot = usageAccount ? quotaData.forAccount(usageAccount) : null;
+			const resetReady = accounts.body?.resetCreditsVersion >= 1;
+			const usagePending = usageAccount ? quotaData.pendingIds.has(usageAccount.id) : false;
+			const beginReset = () => reset.begin(usageAccount, usagePending);
+			const confirmReset = () => reset.confirm(usageAccount, resetReady);
 			const counts = { ready: 0, cooling: 0, failed: 0 };
 			for (const account of list) {
 				const tone = statusOf(account, now).tone;
@@ -905,165 +2635,206 @@ window.__ModuleLoader__.load({
 				else if (tone === 'cooling') counts.cooling += 1;
 				else if (tone === 'failed') counts.failed += 1;
 			}
-			// The lowest priority value is the one the scheduler reaches first.
-			const best = list.reduce(
-				(lowest, account) => (Number.isFinite(account.priority) ? Math.min(lowest, account.priority) : lowest),
-				Number.POSITIVE_INFINITY,
-			);
+			// Each group is a separate provider route; ranking lives on its accounts.
 
-			const head = h('div', { className: 'dap-head', key: 'head' }, [
-				h('div', { className: 'dap-head-text', key: 'text' }, [
-					h('h3', { className: 'dap-title', key: 'title' }, t('title')),
-					h('p', { className: 'dap-intro', key: 'intro' }, t('intro')),
-				]),
-				h('div', { className: 'dap-head-actions', key: 'actions' }, [
-					h('button', {
-						className: 'dap-refresh', key: 'import', type: 'button',
-						onClick: () => setImporting((current) => (current === null ? '' : null)),
-					}, t('importAction')),
-					h('button', {
-						className: 'dap-refresh', key: 'add', type: 'button',
-						onClick: startCreate,
-					}, t('addAccount')),
-					h('button', {
-						className: 'dap-refresh', key: 'refresh', type: 'button',
-						onClick: () => setNonce((value) => value + 1),
-					}, t('refresh')),
-				]),
-			]);
+			React.useEffect(() => {
+				if (!autoRefresh || action.pending || resetConfirmation || supplierOpen || editing || editingGroup || importing !== null || oauthOpen || testing || batchEditing) return;
+				const timer = setInterval(() => setNonce((value) => value + 1), 15000);
+				return () => clearInterval(timer);
+			}, [autoRefresh, action.pending, resetConfirmation, supplierOpen, editing, editingGroup, importing, oauthOpen, testing, batchEditing]);
+			React.useEffect(() => {
+				if (!usageAccountId) return;
+				const panel = document.querySelector('.dap-account-usage');
+				panel?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+				panel?.querySelector('.dap-form-title')?.focus?.({ preventScroll: true });
+			}, [usageAccountId]);
+
+			const head = h(PoolHeader, {
+				key: 'head', t, managementReady, supplierReady, pending: action.pending,
+				onExport: async () => {
+					setExportError(null);
+					try {
+						const response = await fetch(ACTION_ROUTE, { method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ action: 'export', ...(selected.size ? { ids: [...selected] } : {}) }) });
+						const body = await response.json();
+						if (!response.ok) throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+						const url = URL.createObjectURL(new Blob([JSON.stringify(body.document, null, 2)], { type: 'application/json' }));
+						const link = document.createElement('a'); link.href = url; link.download = 'account-pool-config.json'; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+					} catch (error) { setExportError(error.message); }
+				},
+				onToggleOauth: () => { setActiveTab('accounts'); setOauthOpen((current) => !current); },
+				onToggleImport: () => { setActiveTab('accounts'); setImporting((current) => (current === null ? '' : null)); },
+				onToggleSupplier: () => { setActiveTab('accounts'); if (supplierReady) { setEditing(null); setSupplierOpen((current) => !current); } else startCreate(); },
+				onAdvancedAdd: () => { setSupplierOpen(false); startCreate(); },
+				onRefresh: () => setNonce((value) => value + 1),
+			});
 
 			if (accounts.status === 'loading' && accounts.body === null) {
-				return h('div', { className: 'dap-root' }, [head, h('div', { className: 'dap-status', key: 'loading' }, t('loading'))]);
+				return h('div', { className: 'dap-root' }, [head, h(PoolLoadingState, { key: 'loading', t })]);
 			}
 			if (accounts.status === 'error' && accounts.body === null) {
-				return h('div', { className: 'dap-root' }, [head, h('div', { className: 'dap-status', key: 'error' }, accounts.error)]);
+				return h('div', { className: 'dap-root' }, [
+					head,
+					h(PoolErrorState, {
+						key: 'error', t, message: accounts.error,
+						onRetry: () => setNonce((value) => value + 1),
+					}),
+				]);
 			}
 
-			const cards = h('div', { className: 'dap-cards', key: 'cards' }, [
-				h(Card, {
-					key: 'a', label: t('cardAccounts'), value: String(list.length),
-					hint: t('cardAccountsHint', { ready: String(counts.ready), cooling: String(counts.cooling), failed: String(counts.failed) }),
-				}),
-				h(Card, {
-					key: 'r', label: t('cardRequests'), value: compact(accounts.body?.totalRequests ?? 0),
-					hint: t('cardRequestsHint'),
-				}),
-				h(Card, {
-					key: 'b', label: t('cardBindings'), value: String((accounts.body?.bindings ?? []).length),
-					hint: t('cardBindingsHint'),
-				}),
-			]);
+			const cards = h(PoolCards, {
+				key: 'cards', t, accountsBody: accounts.body, totalAccounts: list.length,
+				groupCount: allGroups.length, counts,
+			});
 
-			const accountPanel = h('div', { className: 'dap-panel', key: 'accounts' }, [
-				h('div', { className: 'dap-panel-head', key: 'h' }, h('h4', { className: 'dap-panel-title' }, t('accountsTitle'))),
-				action.error === null ? null : h('div', { className: 'dap-status dap-error', key: 'err' }, t('actFailed', { message: action.error })),
-				form,
-				importPanel,
-				list.length === 0
-					? h('div', { className: 'dap-status', key: 'empty' }, t('empty'))
-					: h('table', { className: 'dap-table', key: 'table' }, [
-						h('thead', { key: 'head' }, h('tr', null, [
-							h('th', { key: 'a' }, t('colAccount')),
-							h('th', { key: 'p' }, t('colPlatform')),
-							h('th', { key: 's' }, t('colStatus')),
-							h('th', { key: 'g' }, t('colGroups')),
-							h('th', { key: 'cr' }, t('colCredential')),
-							h('th', { key: 'pr' }, t('colPriority')),
-							h('th', { key: 'c' }, t('colSlots')),
-							h('th', { key: 'w' }, t('colCooling')),
-							h('th', { key: 'f' }, t('colFailures')),
-							h('th', { key: 'x' }, t('colActions')),
-						])),
-						h('tbody', { key: 'body' }, list.map((account) => h(AccountRow, {
-							key: account.id,
-							account,
-							now,
-							t,
-							action,
-							pool,
-							preferred: Number.isFinite(account.priority) && account.priority === best,
-						}))),
-					]),
-			]);
+			const oauthPanel = oauthOpen !== true ? null : h(OAuthPanel, {
+				// Remounted per open, so a half-finished login from a previous visit is
+				// not resurrected into a form that no longer matches the server's flows.
+				key: 'oauth-panel',
+				t,
+				providers: oauth.body?.providers ?? [],
+				credentialsAvailable: oauth.body?.credentialsAvailable,
+				onClose: () => setOauthOpen(false),
+				// A new account changes the table, the group member counts and the
+				// routes; one refresh covers all three.
+				onChanged: () => setNonce((value) => value + 1),
+			});
 
-			const rows = usage.body?.rows ?? [];
-			const usagePanel = h('div', { className: 'dap-panel', key: 'usage' }, [
-				h('div', { className: 'dap-panel-head', key: 'h' }, h('h4', { className: 'dap-panel-title' }, t('usageTitle'))),
-				rows.length === 0
-					? h('div', { className: 'dap-status', key: 'empty' }, t('none'))
-					: h('table', { className: 'dap-table', key: 'table' }, [
-						h('thead', { key: 'head' }, h('tr', null, [
-							h('th', { key: 't' }, t('colTime')),
-							h('th', { key: 'a' }, t('colAccount')),
-							h('th', { key: 'm' }, t('colModel')),
-							h('th', { key: 'k' }, t('colTokens')),
-							h('th', { key: 's' }, t('colSwitches')),
-							h('th', { key: 'r' }, t('colResult')),
-						])),
-						h('tbody', { key: 'body' }, rows.map((row, index) => h(UsageRow, { key: `${row.at}-${String(index)}`, row, t }))),
-					]),
-			]);
+			const setFilter = (key, value) => { setPageIndex(0); setConfirmingBatch(false); setFilters((previous) => ({ ...previous, [key]: value })); };
+			const toolbar = h(PoolToolbar, {
+				key: 'filters', t, filters, groups: allGroups, shown: filtered.length, total: list.length, autoRefresh,
+				onFilter: setFilter,
+				onClearFilters: () => { setFilters({ query: '', platform: '', status: '', group: '', authMode: '', sort: 'priority' }); setPageIndex(0); setConfirmingBatch(false); },
+				onToggleAutoRefresh: setAutoRefresh,
+			});
+			const pagination = h(PoolPagination, {
+				key: 'pagination', t, pageSize, currentPage, pageCount,
+				onPageSize: (size) => { setPageSize(size); setPageIndex(0); setConfirmingBatch(false); },
+				onPrev: () => { setPageIndex(currentPage - 1); setConfirmingBatch(false); },
+				onNext: () => { setPageIndex(currentPage + 1); setConfirmingBatch(false); },
+			});
+			const testPanel = testing === null ? null : h(TestPanel, {
+				t, testing, pending: action.pending,
+				onModel: (model) => setTesting((previous) => ({ ...previous, model })),
+				onRun: async () => { if (await action.run(testing.id, 'test', { model: testing.model.trim() })) setTesting(null); },
+				onCancel: () => setTesting(null),
+			});
+			const batchEditPanel = !batchEditing || selected.size === 0 ? null : h(BatchEditPanel, {
+				t, values: batchValues, pending: action.pending,
+				onValue: (key, value) => setBatchValues((previous) => ({ ...previous, [key]: value })),
+				onSave: () => {
+					const account = {};
+					for (const [key, value] of Object.entries(batchValues)) if (value.trim() !== '') account[key] = key === 'models' ? value.split(',').map((part) => part.trim()).filter(Boolean) : Number(value);
+					void runBatch('update', { account });
+				},
+			});
+			const resultPanel = h(ActionResultPanel, { t, result: action.result, now, onDismiss: action.dismiss });
+
+			const accountUsagePanel = h(AccountUsagePanel, {
+				t, account: usageAccount, snapshot: usageSnapshot, quotaReady, now,
+				pending: action.pending, usagePending, resetReady, resetConfirmation, resetError,
+				onRefresh: () => { void quotaData.load(usageAccount, true); },
+				onClose: () => { setUsageAccountId(null); reset.cancel(); },
+				onUseReset: beginReset,
+				onConfirmReset: confirmReset,
+				onCancelReset: () => { if (resetConfirmation?.dispatched) setUsageAccountId(null); reset.cancel(); },
+			});
+			const accountPanel = h(AccountsPanel, {
+				t, list, visible, selected, now, pool, action, pending: action.pending,
+				managementReady, quotaReady, supplierReady,
+				toolbar, accountUsagePanel, supplierForm, form, testPanel, batchEditPanel,
+				importPanel, oauthPanel, batchBar, pagination, onToggleAll: toggleAll, onToggleOne: toggleOne,
+			});
+			const recentRows = usage.body?.rows ?? [];
+			const rows = recentRows.filter((row) => (!usageFilters.account || row.accountId === usageFilters.account) && (!usageFilters.model || row.model.toLowerCase().includes(usageFilters.model.toLowerCase())));
+			const summary = rows.reduce((value, row) => ({ ok: value.ok + (row.ok ? 1 : 0), failed: value.failed + (row.ok ? 0 : 1), input: value.input + (row.inputTokens || 0), output: value.output + (row.outputTokens || 0) }), { ok: 0, failed: 0, input: 0, output: 0 });
+			const usagePanel = h(UsagePanel, {
+				t, list, rows, summary, filters: usageFilters, status: usage.status, error: usage.error,
+				onFilter: (key, value) => setUsageFilters((previous) => ({ ...previous, [key]: value })),
+			});
+
+			const tabs = [['accounts', 'tabAccounts', list.length, 'accounts'], ['groups', 'tabGroups', allGroups.length, 'groups'], ['usage', 'tabUsage', recentRows.length, 'activity']];
+			const tabBar = h(PoolTabs, { t, tabs, activeTab, onSelect: setActiveTab });
 
 			return h('div', { className: 'dap-root' }, [
-				head, cards, accountPanel, groupsPanel, usagePanel,
+				head, cards,
+				h('div', { className: 'dap-workspace', key: 'workspace' }, [
+					tabBar,
+					action.error === null ? null : h('div', { className: 'dap-error dap-result', role: 'alert', key: 'action-error' }, t('actFailed', { message: action.error })),
+					exportError ? h('div', { className: 'dap-error dap-result', role: 'alert', key: 'export-error' }, exportError) : null,
+					resultPanel,
+					...[['accounts', accountPanel], ['groups', groupsPanel], ['usage', usagePanel]].map(([id, panel]) => h('div', {
+						key: id, id: `dap-panel-${id}`, role: 'tabpanel', 'aria-labelledby': `dap-tab-${id}`, hidden: activeTab !== id,
+					}, panel)),
+				]),
 				h('div', { className: 'dap-foot', key: 'foot' }, t('footer')),
 			]);
 		}
 
 		/**
-		 * The 「号池管理」 card in the Models page footer — the seat the official
-		 * slot description reserves for exactly this ("ordered extension area after
-		 * the provider rows and the add controls"). It is a switching surface: one
-		 * click makes an account preferred, without leaving the Models page.
+		 * `pool-<groupId>` → the group id; the default `pool` (or anything else) →
+		 * `undefined`, which means "the whole pool". Mirrors `groupOfProvider` in
+		 * lib/adapter.js: this bundle is hand-written with no import step, so the
+		 * two have to agree by construction — the tests pin the shape.
 		 */
-		function ModelsPoolCard(props) {
-			const { ctx, t } = props;
-			const [nonce, setNonce] = React.useState(0);
-			const action = useAction(() => setNonce((value) => value + 1), t);
-			const accounts = useJson(ACCOUNTS_ROUTE, nonce, t);
-			const list = accounts.body?.accounts ?? [];
-			const now = Date.now();
+		// =====================================================================
+		// § 14  Provider card + registration — the Models-page summary row and the
+		//       `apply()` entry point that seats both slots.
+		// =====================================================================
 
-			if (accounts.status === 'error' && accounts.body === null) {
-				return h('div', { className: 'dap-models' }, h('div', { className: 'dap-error' }, accounts.error));
-			}
+		const groupOfRoute = (route) => (
+			typeof route === 'string' && route.startsWith('pool-') && route.length > 'pool-'.length
+				? route.slice('pool-'.length)
+				: undefined
+		);
 
-			// The lowest priority value is the one the scheduler reaches first.
-			const best = list.reduce(
-				(lowest, account) => (Number.isFinite(account.priority) ? Math.min(lowest, account.priority) : lowest),
-				Number.POSITIVE_INFINITY,
-			);
-
-			return h('div', { className: 'dap-models' }, [
-				h('div', { className: 'dap-models-head', key: 'head' }, [
-					h('span', { className: 'dap-models-title', key: 'title' }, t('modelsTitle')),
-					h('span', { className: 'dap-models-hint', key: 'hint' }, t('modelsHint')),
-				]),
-				action.error === null ? null : h('div', { className: 'dap-error', key: 'err' }, t('actFailed', { message: action.error })),
-				list.length === 0
-					? h('div', { className: 'dap-models-hint', key: 'empty' }, t('modelsEmpty'))
-					: h('div', { key: 'list' }, list.map((account) => {
-						const status = statusOf(account, now);
-						const isPreferred = Number.isFinite(account.priority) && account.priority === best;
-						return h('div', { className: 'dap-models-row', key: account.id }, [
-							h('span', { className: 'dap-models-name', key: 'n' }, account.label === '' ? account.id : account.label),
-							h(Pill, { key: 's', tone: status.tone }, t(status.key)),
-							isPreferred ? h('span', { className: 'dap-preferred', key: 'p' }, t('preferred')) : null,
-							h('button', {
-								key: 'b', type: 'button', className: 'dap-btn dap-btn-primary',
-								disabled: action.pending || isPreferred,
-								onClick: () => action.run(account.id, 'prefer'),
-							}, t('actPrefer')),
-						]);
-					})),
-			]);
-		}
-
-		/** Summary line rendered on the `pool` provider's own Models card. */
+		/**
+		 * Summary line rendered under a provider row this plugin owns: the pool
+		 * itself, plus one row per group. The ROW's route decides the scope, so a
+		 * group row never reports the whole pool's numbers.
+		 */
 		function ProviderPoolCard(props) {
-			const { t } = props;
-			const accounts = useJson(ACCOUNTS_ROUTE, 0, t);
-			const list = accounts.body?.accounts ?? [];
+			const { t, provider } = props;
+			useStyles();
+			const groupId = groupOfRoute(provider?.provider);
+			const [revision, setRevision] = React.useState(0);
+			const [editing, setEditing] = React.useState(false);
+			const [confirming, setConfirming] = React.useState(false);
+			const accounts = useJson(ACCOUNTS_ROUTE, revision, t);
+			const action = useAction(() => setRevision((value) => value + 1), t);
+			const group = accounts.body?.groups?.find((entry) => entry.id === groupId);
+			const cardRef = React.useRef(null);
+			React.useEffect(() => {
+				if (!groupId) return;
+				const card = cardRef.current;
+				const row = card?.closest('li');
+				const editButton = row?.querySelector('button');
+				if (!editButton) return;
+				card.dataset.nativeEdit = 'true';
+				const edit = (event) => { event.preventDefault(); event.stopImmediatePropagation(); setEditing((value) => !value); setConfirming(false); };
+				editButton.addEventListener('click', edit, true);
+				// Reuse the surrounding Models page's button styles and action row.
+				const document = card.ownerDocument;
+				const removeButton = document.createElement('button');
+				const nativeRemove = [...row.parentElement.querySelectorAll('button')].find((button) => button !== editButton && button.textContent.trim() === t('deleteAccount'));
+				removeButton.type = 'button';
+				removeButton.className = nativeRemove?.className || 'dap-btn dap-btn-danger';
+				removeButton.textContent = t('deleteAccount');
+				removeButton.setAttribute('aria-label', `${t('deleteAccount')} ${group?.label || groupId}`);
+				removeButton.disabled = action.pending || accounts.status !== 'ready';
+				const remove = () => { setConfirming(true); setEditing(false); };
+				removeButton.addEventListener('click', remove);
+				editButton.parentElement.append(removeButton);
+				const dot = document.createElement('span');
+				dot.className = 'dap-provider-dot';
+				dot.dataset.enabled = String(group?.enabled !== false);
+				dot.setAttribute('role', 'img');
+				dot.setAttribute('aria-label', t(group?.enabled === false ? 'providerDisabled' : 'providerEnabled'));
+				dot.title = dot.getAttribute('aria-label');
+				row.firstElementChild?.firstElementChild?.append(dot);
+				return () => { editButton.removeEventListener('click', edit, true); removeButton.remove(); dot.remove(); };
+			}, [groupId, group?.label, group?.enabled, accounts.status, action.pending]);
+			const all = accounts.body?.accounts ?? [];
+			const list = groupId === undefined ? all : all.filter((account) => (account.groups ?? []).includes(groupId));
 			const now = Date.now();
 			const counts = { ready: 0, cooling: 0 };
 			for (const account of list) {
@@ -1071,9 +2842,30 @@ window.__ModuleLoader__.load({
 				if (tone === 'ready') counts.ready += 1;
 				else if (tone === 'cooling') counts.cooling += 1;
 			}
-			return h('div', { className: 'dap-models-hint' }, t('providerHint', {
-				total: String(list.length), ready: String(counts.ready), cooling: String(counts.cooling),
-			}));
+			const disabled = action.pending || accounts.status !== 'ready';
+			return h('div', { ref: cardRef, className: 'dap-root dap-models-provider', 'data-expanded': editing || confirming || !!accounts.error || !!action.error, 'data-pool-provider': provider?.provider }, [
+				h('div', { className: 'dap-models-toolbar', key: 'toolbar' }, [
+					h('span', { className: 'dap-dim', key: 'summary' }, t('providerHint', { total: String(list.length), ready: String(counts.ready), cooling: String(counts.cooling) })),
+					!group ? null : h('span', { className: 'dap-actions', key: 'actions' }, [
+						h('span', { key: 'state', role: 'status', className: 'dap-provider-state', 'data-enabled': group.enabled !== false }, t(group.enabled === false ? 'providerDisabled' : 'providerEnabled')),
+						h('button', { key: 'edit', type: 'button', className: 'dap-btn dap-provider-edit-fallback', disabled, 'aria-label': `${t('editAccount')} ${group.label || group.id}`, onClick: () => { setEditing(!editing); setConfirming(false); } }, t('editAccount')),
+						h('button', { key: 'toggle', type: 'button', className: 'dap-btn', disabled, onClick: () => action.run(groupId, 'group-update', { group: { enabled: group.enabled === false } }) }, t(group.enabled === false ? 'actEnable' : 'actDisable')),
+						h('button', { key: 'delete', type: 'button', className: 'dap-btn dap-btn-danger', disabled, onClick: () => { setConfirming(true); setEditing(false); } }, t('deleteAccount')),
+					]),
+				]),
+				accounts.error ? h('p', { key: 'read-error', className: 'dap-error', role: 'alert' }, accounts.error) : null,
+				!editing && action.error ? h('p', { key: 'error', className: 'dap-error', role: 'alert' }, action.error) : null,
+				confirming && group ? h('div', { key: 'confirmation', className: 'dap-form', role: 'group' }, [
+					h('p', { key: 'hint' }, t('providerDeleteHint', { name: group.label || group.id })),
+					h('div', { className: 'dap-actions', key: 'buttons' }, [h('button', { key: 'delete', type: 'button', className: 'dap-btn dap-btn-danger', disabled, onClick: () => action.run(groupId, 'group-delete', {}, () => setConfirming(false)) }, t('confirmDelete')), h('button', { key: 'cancel', type: 'button', className: 'dap-btn', disabled, onClick: () => setConfirming(false) }, t('cancel'))]),
+				]) : null,
+				!editing || !group ? null : h(GroupForm, {
+					key: `provider-form-${group.id}`, t, mode: 'edit', managementReady: true,
+					initial: { ...group, models: (group.models ?? []).join(', ') }, pending: action.pending, error: action.error,
+					onCancel: () => setEditing(false),
+					onSave: ({ id, group: edits }) => action.run(id, 'group-update', { group: edits }, () => setEditing(false)),
+				}),
+			]);
 		}
 
 		function apply(ctx) {
@@ -1094,21 +2886,25 @@ window.__ModuleLoader__.load({
 				label: () => t('title'),
 			}, (props) => h(PoolSection, { ctx, t, close: props.close })));
 
-			// 2. The switching card next to "add a model provider".
-			slots.inject(FOOTER_SLOT, () => slots.register({
-				name: FOOTER_SLOT,
-				id: SECTION_ID,
-				order: FOOTER_ORDER,
-				locale: NS,
-				label: () => t('modelsTitle'),
-			}, (props) => h(ModelsPoolCard, { ctx, t, close: props.close })));
-
-			// 3. The `pool` provider's own card, keyed by the Loader entry id — the
-			//    same value the Host half declares as `settingsNs`.
-			slots.inject(PROVIDER_CARD_SLOT, () => slots.register({
-				name: PROVIDER_CARD_SLOT,
-				key: ENTRY_ID,
-			}, (props) => h(ProviderPoolCard, { ctx, t, close: props.close })));
+			// 2. One card under every provider row this plugin owns — the pool and each
+			//    group — keyed by the Loader entry id, the same value the Host half
+			//    declares as `settingsNs`. The row's own route travels in the owner's
+			//    `provider` prop, so a group row must be handed it or every row would
+			//    report the whole pool's numbers.
+			slots.inject(PROVIDER_CARD_SLOT, () => {
+				const abort = new AbortController();
+				let unregister;
+				let disposed = false;
+				fetch(ACCOUNTS_ROUTE, { credentials: 'same-origin', signal: abort.signal })
+					.then((response) => { if (!response.ok) throw new Error(`HTTP ${response.status}`); return response.json(); })
+					.then((body) => {
+						if (disposed) return;
+						const key = body.settingsNs || ENTRY_ID;
+						unregister = slots.register({ name: PROVIDER_CARD_SLOT, key }, (props) => h(ProviderPoolCard, { ctx, t, provider: props.provider }));
+					})
+					.catch((error) => { if (!abort.signal.aborted) console.error('account-pool provider management:', error); });
+				return () => { disposed = true; abort.abort(); unregister?.(); };
+			});
 		}
 
 		exports.name = 'dsh-account-pool';
@@ -1116,7 +2912,6 @@ window.__ModuleLoader__.load({
 		exports.apply = apply;
 		exports.SECTION_ID = SECTION_ID;
 		exports.SECTION_ORDER = SECTION_ORDER;
-		exports.FOOTER_SLOT = FOOTER_SLOT;
 		exports.PROVIDER_CARD_SLOT = PROVIDER_CARD_SLOT;
 		exports.ENTRY_ID = ENTRY_ID;
 		exports.ACTION_ROUTE = ACTION_ROUTE;
@@ -1125,6 +2920,8 @@ window.__ModuleLoader__.load({
 		// derivation without a renderer.
 		exports.coolingOf = coolingOf;
 		exports.statusOf = statusOf;
+		exports.filterAccounts = filterAccounts;
+		exports.localDateInput = localDateInput;
 		exports.formatRemaining = formatRemaining;
 		exports.compact = compact;
 		exports.WINDOWS = WINDOWS;

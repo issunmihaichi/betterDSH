@@ -12,9 +12,73 @@
  *     wrapped as `{data: {accounts: [...]}}` (a bare `{accounts: [...]}`, a bare
  *     array, and a single account are all accepted).
  *   - CPA      docs/src/converter.mjs of gtxx3600/CPA2sub2API
- *     `{type: "codex"|"claude"|"antigravity"|"gemini", access_token,
+ *     `{type: "codex"|"claude"|"antigravity", access_token,
  *       refresh_token, id_token, account_id, email, plan_type, project_id, ...}`
+ *     or `{type: "gemini", token: {access_token, refresh_token, expiry}, project_id}`.
  */
+
+import { accountSchema, groupSchema, prioritySchema } from './domain.js';
+
+export const METADATA_FORMAT = 'dsh-account-pool-metadata';
+export const METADATA_ACCOUNT_FIELDS = [
+  'id', 'label', 'notes', 'platform', 'status', 'schedulable', 'groups', 'priority',
+  'weight', 'loadFactor', 'concurrency', 'models', 'expiresAt', 'autoPauseOnExpired',
+  'authMode', 'openaiApi', 'openaiTransport', 'mimicry', 'betas', 'projectId', 'createdAt', 'updatedAt',
+  'poolDetectionRetry', 'poolDetectionRetries', 'poolDetectionRetryDelayMs', 'poolDetectionKeywords',
+];
+
+/** Validate the entire restore before writing; no credential material is planned. */
+export function planMetadataImport(document, { accounts = [], groups = [], now } = {}) {
+  if (document?.format !== METADATA_FORMAT || document.version !== 1
+    || !Array.isArray(document.accounts) || !Array.isArray(document.groups) || !Array.isArray(document.priorities)) {
+    throw new RangeError('invalid metadata document or unsupported version');
+  }
+  const pick = (record, fields) => Object.fromEntries(fields
+    .filter((field) => Object.hasOwn(record, field)).map((field) => [field, record[field]]));
+  const currentAccounts = new Map(accounts.map((record) => [record.id, record]));
+  const currentGroups = new Map(groups.map((record) => [record.id, record]));
+  const unique = (records, key) => {
+    const seen = new Set();
+    for (const record of records) {
+      if (record === null || typeof record !== 'object' || Array.isArray(record)) throw new RangeError('metadata records must be objects');
+      const id = key(record);
+      if (seen.has(id)) throw new RangeError('metadata contains duplicate records');
+      seen.add(id);
+    }
+  };
+  unique(document.groups, (record) => record.id);
+  unique(document.accounts, (record) => record.id);
+  unique(document.priorities, (record) => `${record.accountId}|${record.groupId}`);
+  const groupRecords = document.groups.map((record) => groupSchema.parse({
+    ...pick(record, ['id', 'label', 'description', 'enabled', 'models', 'selectionMode']),
+    createdAt: currentGroups.get(record.id)?.createdAt ?? now, updatedAt: now,
+  }));
+  const knownGroups = new Set([...currentGroups.keys(), ...groupRecords.map((record) => record.id)]);
+  const accountRecords = document.accounts.map((record) => {
+    const existing = currentAccounts.get(record.id);
+    const fields = pick(record, METADATA_ACCOUNT_FIELDS.filter((field) => !['createdAt', 'updatedAt'].includes(field)));
+    if (existing !== undefined && ['platform', 'authMode', 'mimicry'].some((field) => field in fields && fields[field] !== existing[field])) {
+      throw new RangeError('metadata cannot change an existing account platform or authentication mode');
+    }
+    const parsed = accountSchema.parse({
+      ...existing, ...fields,
+      ...(existing === undefined ? { schedulable: false } : { status: existing.status }),
+      credentialRef: existing?.credentialRef ?? null,
+      createdAt: existing?.createdAt ?? now, updatedAt: now,
+    });
+    if (parsed.groups.some((groupId) => !knownGroups.has(groupId))) throw new RangeError('metadata account references an unknown group');
+    return parsed;
+  });
+  const knownAccounts = new Set([...currentAccounts.keys(), ...accountRecords.map((record) => record.id)]);
+  const priorityRecords = document.priorities.map((record) => {
+    const parsed = prioritySchema.parse({ ...pick(record, ['accountId', 'groupId', 'priority']), updatedAt: now });
+    if (!knownAccounts.has(parsed.accountId) || !knownGroups.has(parsed.groupId)) throw new RangeError('metadata priority references an unknown account or group');
+    return parsed;
+  });
+  return { format: METADATA_FORMAT, accounts: accountRecords, groups: groupRecords, priorities: priorityRecords,
+    created: accountRecords.filter((record) => !currentAccounts.has(record.id)).map((record) => record.id),
+    updated: accountRecords.filter((record) => currentAccounts.has(record.id)).map((record) => record.id) };
+}
 
 /** Foreign platform names mapped onto this pool's enum. */
 export const PLATFORM_MAP = {
@@ -43,6 +107,64 @@ const CPA_METADATA_KEYS = new Set(['type', 'email', 'expired', 'expires_at', 'ex
 
 /** Keys that may carry the bearer this pool sends upstream, in priority order. */
 const TOKEN_KEYS = ['access_token', 'accessToken', 'api_key', 'apiKey', 'key', 'token'];
+
+/**
+ * A UUID-shaped identifier.
+ *
+ * Used to recognise an account uuid in an imported record so the disguise can
+ * carry the REAL upstream account uuid in `metadata.user_id` instead of a derived
+ * stand-in. Only matched when it genuinely looks like one — a CPA `account_id` is
+ * sometimes an email or a bare id, and pinning a non-UUID there would produce a
+ * `user_id` that the upstream's own parser rejects.
+ */
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/** The account uuid an imported record carries, when it has a well-formed one. */
+function importedAccountUuid(raw) {
+  for (const key of ['account_uuid', 'account_id', 'accountId']) {
+    const value = raw?.[key];
+    if (typeof value === 'string' && UUID_RE.test(value.trim())) return value.trim();
+  }
+  return null;
+}
+
+/** Only public connection ids are copied into account rows. */
+function publicId(raw, keys) {
+  for (const key of keys) {
+    const value = raw?.[key];
+    if (typeof value === 'string' && value.trim() !== '') return value.trim();
+  }
+  return null;
+}
+
+function connectionIds(raw, platform) {
+  return {
+    projectId: platform === 'gemini' ? publicId(raw, ['project_id', 'projectId', 'project']) : null,
+    chatgptAccountId: platform === 'openai' ? publicId(raw, ['chatgpt_account_id', 'chatgptAccountId', 'account_id', 'accountId']) : null,
+  };
+}
+
+/**
+ * Which header an imported credential must travel in.
+ *
+ * A declared type wins. Otherwise it is inferred from the credential bundle: an
+ * `access_token` with no API key is an OAuth grant. The inference matters because
+ * sub2api backups do not always carry `type`, and defaulting those to `'api-key'`
+ * would send a subscription token in the wrong header — a silent failure that
+ * only shows up as an upstream 401.
+ */
+function importedAuthMode(raw) {
+  const declared = String(raw?.type ?? raw?.authMode ?? '').trim().toLowerCase();
+  if (declared === 'oauth') return 'oauth';
+  if (declared === 'apikey' || declared === 'api-key' || declared === 'key') return 'api-key';
+  const credentials = raw?.credentials;
+  if (credentials !== null && typeof credentials === 'object') {
+    const hasApiKey = typeof credentials.api_key === 'string' || typeof credentials.apiKey === 'string';
+    const hasAccessToken = typeof credentials.access_token === 'string';
+    if (hasAccessToken && !hasApiKey) return 'oauth';
+  }
+  return 'api-key';
+}
 
 /** Normalize one foreign platform name. */
 export function normalizePlatform(value) {
@@ -120,14 +242,21 @@ export function decodeBundle(stored) {
   }
 }
 
+/** CPA Gemini stores its OAuth token under `token`; other providers use flat fields. */
+function isCpaRecord(record) {
+  return typeof record?.access_token === 'string'
+    || (String(record?.type ?? '').trim().toLowerCase() === 'gemini'
+      && record?.token !== null && typeof record?.token === 'object' && !Array.isArray(record.token));
+}
+
 /** Which upstream format a parsed document looks like. */
 export function detectFormat(document) {
   if (document === null || document === undefined) return 'unknown';
-  const list = Array.isArray(document) ? document : [document];
-  if (list.some((entry) => entry !== null && typeof entry === 'object' && typeof entry.access_token === 'string')) {
-    return 'cpa';
-  }
-  if (document?.data?.accounts !== undefined || document?.accounts !== undefined || document?.platform !== undefined) {
+  if (document?.format === METADATA_FORMAT) return METADATA_FORMAT;
+  const list = extractAccounts(document);
+  if (list.some(isCpaRecord)) return 'cpa';
+  if (list.some((entry) => typeof entry.platform === 'string')
+    || document?.data?.accounts !== undefined || document?.accounts !== undefined || document?.platform !== undefined) {
     return 'sub2api';
   }
   return 'unknown';
@@ -147,7 +276,7 @@ export function extractAccounts(document) {
     return document.accounts.filter((entry) => entry !== null && typeof entry === 'object');
   }
   // A single account document.
-  if (typeof document.platform === 'string' || typeof document.access_token === 'string') return [document];
+  if (typeof document.platform === 'string' || isCpaRecord(document)) return [document];
   return [];
 }
 
@@ -171,10 +300,23 @@ function cpaSecrets(record) {
 export function toDraft(raw, options = {}) {
   const index = options.index ?? 0;
 
+  // CPA Gemini's token object is flattened for the existing credential readers.
+  // Keep the top-level project id and normalize OAuth aliases without changing input.
+  if (String(raw?.type ?? '').trim().toLowerCase() === 'gemini'
+    && raw?.token !== null && typeof raw?.token === 'object' && !Array.isArray(raw.token)) {
+    const { token, ...record } = raw;
+    raw = {
+      ...token, ...record,
+      access_token: publicId(token, ['access_token', 'accessToken']) ?? '',
+      refresh_token: publicId(token, ['refresh_token', 'refreshToken']),
+      expired: record.expired ?? record.expires_at ?? token.expiry ?? token.expires_at ?? token.expiration ?? token.expires_in_abs,
+    };
+  }
+
   // --- CPA ------------------------------------------------------------------
   if (typeof raw?.access_token === 'string') {
     if (raw.access_token.trim() === '') return { ok: false, reason: 'cpa record has an empty access_token' };
-    const platform = CPA_TYPE_MAP[String(raw.type ?? '').toLowerCase()] ?? 'custom';
+    const platform = CPA_TYPE_MAP[String(raw.type ?? '').trim().toLowerCase()] ?? 'custom';
     if (platform === 'custom') return { ok: false, reason: `unsupported CPA type '${String(raw.type)}'` };
     const label = String(raw.email ?? raw.account_id ?? raw.name ?? `${raw.type}-${String(index + 1)}`);
     const credential = encodeBundle(cpaSecrets(raw));
@@ -186,6 +328,15 @@ export function toDraft(raw, options = {}) {
         label,
         nameHint: label,
         platform,
+        // A CPA record with an `access_token` IS an OAuth credential, so the auth
+        // mode is a FACT and is set here. `mimicry` is deliberately left at its
+        // default: whether to impersonate the CLI is the operator's choice, and
+        // silently rewriting someone's system prompt because of the file they
+        // imported would be exactly the kind of quiet overreach this pool refuses
+        // elsewhere (cf. `enable` not clearing a cooldown).
+        authMode: 'oauth',
+        ...connectionIds(raw, platform),
+        mimicryAccountUuid: importedAccountUuid(raw),
         expiresAt: toInstant(raw.expired ?? raw.expires_at),
         priority: options.priority ?? 100,
         concurrency: options.concurrency ?? 4,
@@ -207,8 +358,15 @@ export function toDraft(raw, options = {}) {
       credential,
       draft: {
         label,
+        notes: typeof raw.notes === 'string' ? raw.notes : '',
         nameHint: label,
         platform,
+        authMode: importedAuthMode(raw),
+        baseUrl: publicId(raw.credentials, ['base_url', 'baseUrl']) ?? publicId(raw, ['base_url', 'baseUrl']),
+        ...connectionIds(raw.credentials, platform),
+        loadFactor: Number.isInteger(raw.load_factor) && raw.load_factor > 0 ? raw.load_factor : null,
+        schedulable: raw.schedulable !== false,
+        mimicryAccountUuid: importedAccountUuid(raw) ?? importedAccountUuid(raw.extra ?? {}),
         concurrency: Number.isInteger(raw.concurrency) && raw.concurrency >= 0 ? raw.concurrency : 4,
         priority: Number.isInteger(raw.priority) ? raw.priority : 100,
         expiresAt: toInstant(raw.expires_at),

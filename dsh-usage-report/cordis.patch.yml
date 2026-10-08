@@ -1,27 +1,5 @@
-# dsh-usage-report bundle: naming this package in a profile's
-# `dsh.profile.bundles` composes both halves in one step — the Host half that
-# folds local session logs into per-day token buckets, and the Client half that
-# registers the 「用量」 page in the settings panel (slot `settings.section`).
-#
-# Entry name: this install is a machine-local `link:` to a workspace directory,
-# and the Loader memoizes an imported host module per specifier, so the row names
-# the Host file by ABSOLUTE PATH. That is what makes an edit to lib/host.js take
-# effect on the next loader reload without restarting the app. For a normally
-# installed copy (published package or plain node_modules), replace the row with
-# the portable form below — it resolves through package.json "exports" and is
-# read once, at process start:
-#
-#   - insert:
-#       - id: usage-report
-#         name: dsh-usage-report
-#
-# All config keys are optional:
-#   cacheTtlMs       re-fold interval, default 60000
-#   maxSessions      newest sessions to scan, default 500
-#   readConcurrency  parallel session reads, default 4
-#   debugDumpPath    write one report + this process's authenticated loopback
-#                    URL to that file (local diagnosis only; off by default)
-
+# Portable release entry. Restart DSH after updating host modules.
+# Local debug paths and operator accounts are not included in release defaults.
 - insert:
     - id: usage-report
-      name: D:/Backup/Documents/deepseek-harness/default-workspace/dsh-usage-report/lib/host.js
+      name: dsh-usage-report
