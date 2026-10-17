@@ -27,6 +27,7 @@ import {
 } from '../lib/upstream.js';
 import { createPoolAdapter } from '../lib/adapter.js';
 import { makeAccount } from '../lib/domain.js';
+import { createCodexReplayCodec } from '../lib/native/codex-replay.js';
 
 const T0 = Date.parse('2026-01-01T00:00:00.000Z');
 const iso = (ms) => new Date(ms).toISOString();
@@ -638,14 +639,15 @@ await check('native: missing Codex identity does not cool accounts or failover',
 });
 await check('native: Codex transport retains encrypted reasoning and restores reserved tool names', async () => {
   let turn=0, nextBody;
-  const upstream=createHttpUpstream({resolveCredential:()=>({access_token:'tool-token',chatgpt_account_id:'tool-workspace'}),fetchImpl:async(url,init)=>{
+  const upstream=createHttpUpstream({codexReplayCodec:createCodexReplayCodec(Buffer.alloc(32,5)),resolveCredential:()=>({access_token:'tool-token',chatgpt_account_id:'tool-workspace'}),fetchImpl:async(url,init)=>{
     const body=JSON.parse(init.body);if(turn++===0){const name=body.tools[0].name;assert.notEqual(name,'python');return new Response(`data: ${JSON.stringify({type:'response.completed',response:{status:'completed',output:[{id:'rs_1',type:'reasoning',encrypted_content:'opaque-reasoning',summary:[]},{id:'fc_1',type:'function_call',call_id:'call_python',name,arguments:'{}',status:'completed'}]}})}\n\n`);}nextBody=body;return codexStream('done');
   }});
   const account=makeAccount({id:'codex-tool-integration',platform:'openai',authMode:'oauth'}),tools=[{name:'python',parameters:{type:'object'}}];
-  const first=await collect(upstream.stream(account,{model:'gpt-5',tools}));
+  const first=await collect(upstream.stream(account,{model:'gpt-5',sessionId:'transport-continuity',tools}));
   const call=first.find(c=>c.type==='block-end'&&c.block.type==='tool-call').block;
   assert.equal(call.name,'python');
-  await collect(upstream.stream(account,{model:'gpt-5',tools,messages:[{role:'assistant',content:[call]},{role:'tool',toolCallId:call.id,content:[{type:'text',text:'ok'}]}]}));
+  assert.ok(first.at(-1).replayState);assert.equal(JSON.stringify(first).includes('opaque-reasoning'),false);
+  await collect(upstream.stream(account,{model:'gpt-5',sessionId:'transport-continuity',tools,messages:[{role:'assistant',content:[call],source:{replayState:JSON.parse(JSON.stringify(first.at(-1).replayState))}},{role:'tool',toolCallId:call.id,content:[{type:'text',text:'ok'}]}]}));
   const reasoning=nextBody.input.find(i=>i.type==='reasoning');assert.equal(reasoning.encrypted_content,'opaque-reasoning');assert.equal(reasoning.id,undefined);
   assert.equal(nextBody.input.find(i=>i.type==='function_call').name,nextBody.tools[0].name);
 });

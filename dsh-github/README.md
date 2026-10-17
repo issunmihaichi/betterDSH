@@ -14,6 +14,12 @@
 
 ![仓库选择器](docs/screenshots/04-repository-picker.png)
 
+## 0.1.3 独立运行与加载顺序
+
+无需安装 `dsh-mcp-skills`、账号池或其他 betterDSH 功能插件。GitHub MCP 桥是本包声明的 DSH 官方 MCP client，不是 MCP 管理界面插件。`commands` 缺失只影响 `/github`，不阻塞设置 API；服务后加载、卸载和重载会随子生命周期注册/注销命令。工作区注册表在使用时读取，后加载或替换后不再持有旧对象。
+
+可运行 `node tools/lifecycle-test.mjs` 验证缺失→迟加载→替换→卸载；使用临时本地目录和模拟服务，不访问 GitHub、不克隆仓库、不修改 live profile。它不等同于真实 Cordis/浏览器验收。
+
 ## 设置向导（第一次打开就是它）
 
 没配好之前，这一页只给向导，不给一堆待填的表单：
@@ -98,12 +104,12 @@ GitHub REST / `git` / `ctx.tools` → JSON。MCP 连接本身由 MCP 客户端�
 状态路由永远不返回令牌本体，只返回 `ghp_…abcd (n 字符)` 这种掩码；返回给浏览器的下载计划
 也从不包含带令牌的地址。
 
-## 已安装位置（本机现状）
+## 历史安装记录（本轮未检查或修改）
 
 `plugin_manager` 已装进 `desktop` profile（就是当前这个应用）：
 
-- `C:\Users\Administrator\.dsh\profiles\desktop\package.json`
-  - `dependencies`：`"dsh-github": "link:D:/Backup/Documents/deepseek-harness/default-workspace/dsh-github"`
+- `<DSH_HOME>/profiles/desktop/package.json`
+  - `dependencies`：`"dsh-github": "link:D:/path/to/dsh-github"`
   - `dsh.profile.bundles`：追加 `dsh-github`
 - 本 bundle 的 `cordis.patch.yml` 插入两行：`github-mcp`（MCP 客户端，初始 `disabled: true`，
   没配令牌前不发任何外部连接）与 `github`（本插件的 Host 半边，按绝对路径名条目）
@@ -115,7 +121,7 @@ GitHub REST / `git` / `ctx.tools` → JSON。MCP 连接本身由 MCP 客户端�
 # 卸载（插件页里移除该 bundle 亦可）
 plugin_manager remove_bundle  target = "dsh-github"
 # 重新安装
-plugin_manager install_bundle target = "D:\Backup\Documents\deepseek-harness\default-workspace\dsh-github"
+plugin_manager install_bundle target = "D:/path/to/betterDSH/dsh-github"
 ```
 
 ## 怎么用
@@ -135,35 +141,73 @@ plugin_manager install_bundle target = "D:\Backup\Documents\deepseek-harness\def
 
 之后从输入栏也能做同样的事：`/github remote` 列仓库，`/github clone <owner/repo> --yes` 下载。
 
+## 本轮并发与失败体验改进（仅离线源码）
+
+本轮只修改 `betterDSH/dsh-github`，不修改 live 配置、不安装或重新加载插件、不推送，
+不执行 e2e / UI live 脚本。仍然是一个 `window.__ModuleLoader__.load` 客户端，无构建步骤。
+
+- **设置保存不会互相丢字段**：同一 Host 实例中，read → merge → save → cache publish 整段串行；
+  首次读设置共享一个 Promise；失败写入不发布到缓存，也不阻塞后续保存。
+- **确认的就是显示的下载目标**：计划含 `dir`；HTTP 确认请求必须携带
+  `expected: { fullName, cloneUrl, dest, branch, depth }`。Host 重新计算后逐项匹配，缺失确认描述返回
+  `409 confirmation-required`，变更返回 `409 plan-changed`，都不启动 git。确认面同时显示历史深度；
+  变更时清掉旧计划，必须重新选择并确认；自定义目录不会在确认时丢失。
+- **旧请求不会改写新选择**：仓库搜索（包括 debounce 等待期间）、分页、计划与工具调用使用
+  request generation；选择另一仓库/工具、编辑手动仓库、取消或卸载使旧结果/错误/`finally` 失效。
+  传输卡只保存脏字段，状态刷新仅同步未改字段，保存途中继续编辑也不会被旧确认覆盖。
+- **进度查询不会重叠或无限静默重试**：收到上一轮响应后才安排下一轮；404、网络失败或异常状态
+  明确停止跟踪，显示「下载可能仍在后台进行」，提供「重试进度查询」。重试只 GET 任务状态，
+  不重复 POST 下载；结束时停止跟踪并刷新。确认请求进行中禁用取消/选仓库，快速双击只提交一次。
+- **失败在原处可见**：统一检查 HTTP 状态、JSON 与 `ok:false`；令牌来源/环境变量自动保存、
+  重新运行向导都有 catch；保存失败保留输入/脏字段，向导只有成功保存完成标记后才离开。
+  状态刷新失败保留已加载卡片并显示错误；「刷新列表」发送 `refresh=1` 绕过仓库页缓存。
+
+边界：串行化只覆盖同一个 Host 实例，不提供跨进程文件锁，也未把 MCP apply、令牌文件写入与
+设置写入做成一个全局事务；generation guard 不取消已经发出的 Host 工具/网络请求；clone job
+仍在内存中，重启后会丢失；没有取消下载、跨页恢复跟踪、fetch 超时或服务端确认幂等键。
+本轮没有做真实浏览器/网络/实际 git 克隆验证，不声称 live 已生效。旧 e2e 脚本的确认请求未适配
+新的 `expected` 协议（本轮未改、未执行）；将来运行前要先更新它。旧客户端配新 Host 会被安全拒绝，
+需要 Host/Client 同步部署。`/github clone --yes` 仍是直接授权本次命令，不绑定上一条命令的旧计划；
+同一次命令内部的重算已经按其当前快照核验。
+
+## 0.1.2 发行安装修复
+
+恢复可移植 bundle 中必须存在的 `github-mcp` 桥接行，使用宿主自带 MCP client，默认禁用、无凭据。此前发行清理遗漏该行会让新安装或升级后的 GitHub 设置页找不到其配置目标。已有 profile 对该行的启用/连接配置仍覆盖默认值，不要求清除令牌或重新初始化用户设置；发行契约现在检查桥接存在且不携带凭据。
+
 ## 验证
+
+以下离线数字是本轮重新运行的结果；live / 截图行是历史记录，本轮未重跑。
 
 | 项目 | 结果 |
 | --- | --- |
 | `node tools/pure-test.mjs` | **59/59**：设置归一化（含向导标记）、MCP config 生成（两种传输、令牌、无残留字段）、仓库地址解析、指令解析（含 JSON 参数原样保留）、文本输出、客户端静态检查（路由表完整性、不 import Harness 包） |
-| `node tools/host-test.mjs` | **61/61**：7 条路由契约、令牌保存/清除/**先校验后落盘**（拒绝时不写任何东西）、连接与断开（含禁用行时的延迟写入）、工具调用与 409、仓库列表与上游错误映射、带令牌克隆与 origin 擦除、**已下载仓库的 `workspaceId` 归属**（未注册时字段不出现）、全部指令分支 |
-| `node tools/client-test.mjs` | **33/33**：把真实 `lib/client.js` 装进假 module loader + 极简 React 里求值——注册形态、向导「该从第几步开始」的 6 种状态、每步渲染出的文案与控件（含"就是圆钮开关不是原生 checkbox"）、卡片的各种空/有状态、**「打开工作区」按钮的有/无与拒绝路径** |
+| `node tools/host-test.mjs` | **70/70**：真实 Fetch `Request` 覆盖路由；原令牌/连接/工具/克隆/工作区/指令契约，加 deferred 并发保存、失败队列恢复、首次加载合并、缺失/变更确认的 409、目标/深度/分支/仓库核验、自定义目录不丢失、真实 store 错误映射为 500 |
+| `node tools/client-test.mjs` | **55/55**：原 33 项注册/向导/控件/工作区渲染，加 22 项真实 client 事件/持久 hooks/effect cleanup + 原生 `Request`/`Response` + deferred 回归：HTTP 错误、query/分页/plan/tool 乱序、卸载、dirty 编辑与失败、确认协议和双击、单飞 poll、404/网络停止与只 GET 重试；不依赖源字符串断言 |
 | `node tools/e2e-check.mjs --clone` | **23/23**（真实运行中的 DSH + 真实 git）：路由可认证、指令已注册、无令牌时拒绝、坏仓库提前拒绝、确认后真下载、**工作区注册成功**、进度流式回传、origin 不含凭据 |
 | `node tools/ui-check.mjs --stub-fresh` | 真实页面无头渲染向导首启态：`第 2/4 步 · 访问令牌`，控制台**零错误** |
 | `node tools/ui-check.mjs --stub` | 同上渲染已连接态：`第 4/4 步 · 下载仓库` + 账号行 + 仓库列表；`settings.section` 出现 `{registrant:"dsh-github", id:"github", order:16, active:true}`（贡献页序号阶梯：12 思考强度 / 13 用量 / 14 账号池 / 15 MCP 与技能 / 16 GitHub） |
 | `node tools/bundle-check.mjs` | 运行中的应用**确实**在发最新 revision 的客户端包（按 rev 校验内容） |
 | 截图 | `docs/screenshots/`：向导两步、改前/改后控件、未连接、已连接、仓库选择器、下载确认 |
 
-合计 **153** 项离线断言 + 23 项真实运行断言。`tools/` 下的脚本都是本机自检工具，只访问
-loopback：它们用 harness 自己保存的 browser-session 签名密钥现签一个会话 cookie
-（与浏览器持有的那个同构，密钥不落盘、不打印），以便在真实页面 / 真实路由上做端到端验证。
+本轮合计 **184** 项离线用例通过（59 pure + 70 host + 55 client），全程不读 live 凭据、不访问
+网络、不运行实际 git。Host 与 Client 测试使用内存依赖、原生 Request/Response、可控 deferred
+和定时器；不是只验证源代码含某个字符串。
+
+上表 23 项真实运行断言与截图是历史记录，不属于本轮验证。live 自检脚本会读 harness 的
+browser-session 签名密钥、访问 loopback，且 token/clone 选项可能进一步访问 GitHub 或下载仓库；
+本轮均未执行。
 
 ## 已知限制
 
-- **本轮联动的生效方式**：客户端半边（序号 16、已下载仓库的「打开工作区」按钮）刷新页面即可见；
-  宿主半边（`repos[].workspaceId`）与所有 Host 改动一样**要重启应用**——重启前页面不会渲染那个按钮，
-  其余功能不受影响。
+- **部署边界**：本轮仅改此源码副本，不检查 live 链接、不安装、不重启、不刷新运行中的应用。
+  需要部署时，应一起更新 Host 与 Client；客户端无构建步骤，Host 模块需要宿主重新加载。
+  未经部署与实际验证，不能把离线测试通过等同于 live 已生效。
 - **`openWorkspace` 之后**：切工作区由外壳完成，本插件不接管后续（不自动开会话、不切模型）。工作区若
   在别处被移除，按钮会给出「打不开」的提示而不是静默失败。
 - **Host 半边的改动需要重启应用**：加载器按 specifier 记忆已导入的宿主模块，
   开关 bundle 不会重新导入同一个文件。客户端半边按 rev 提供，刷新页面即可见。
-  本次新增的 `/api/github.remote`（列仓库）与 `/api/github.token` 的 `verify` 分支都属于
-  这一类：代码已装好、已验证，重启应用后生效。重启前向导仍然可用——第 2 步退化成
-  「只保存不校验」，第 4 步会提示列表读取失败。
+  本轮确认协议的 `expected` 核验同属 Host 改动；旧客户端不带该字段会被新 Host 安全拒绝。
+  本轮未部署，不推断运行中模块的版本。
 - **MCP 握手需要真令牌**：`/github`、工具清单、`/github call` 都要先完成第 2 步；
   没有令牌时页面与指令都会明确告诉你缺什么，而不是静默失败。
 - 仓库列表来自 `/user/repos?affiliation=owner,collaborator,organization_member`，

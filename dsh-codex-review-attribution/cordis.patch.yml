@@ -1,0 +1,9 @@
+# Portable host-only companion. Disabled by default; this does NOT disable the
+# official experimental-auto-review entry. Operator must run deployment preflight
+# against the canonical installed ASAR module before making an atomic replacement.
+- insert:
+    - id: codex-review-attribution
+      name: dsh-codex-review-attribution
+      disabled: true
+      config:
+        originalModulePath: ''

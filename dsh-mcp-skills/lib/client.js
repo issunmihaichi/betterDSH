@@ -52,6 +52,8 @@ window.__ModuleLoader__.load({
 			emptySkills: '技能库是空的：既没有内置技能，也没有在技能根目录下发现 SKILL.md。',
 			enabled: '已启用',
 			disabled: '已停用',
+			mcpToggleLabel: '{name}：启用 MCP 服务器',
+			skillToggleLabel: '{name}：模型可调用',
 			phaseActive: '运行中',
 			phaseLoading: '加载中',
 			phasePending: '等待中',
@@ -100,6 +102,8 @@ window.__ModuleLoader__.load({
 			emptySkills: 'The skill registry is empty: no bundled skills and no SKILL.md found under the skill roots.',
 			enabled: 'Enabled',
 			disabled: 'Disabled',
+			mcpToggleLabel: 'Enable MCP server {name}',
+			skillToggleLabel: 'Model-invocable skill {name}',
 			phaseActive: 'running',
 			phaseLoading: 'loading',
 			phasePending: 'pending',
@@ -188,6 +192,7 @@ window.__ModuleLoader__.load({
 		function Button({ children, onClick, disabled, kind }) {
 			const primary = kind === 'primary';
 			return h('button', {
+				type: 'button',
 				onClick,
 				disabled: disabled === true,
 				style: {
@@ -203,8 +208,12 @@ window.__ModuleLoader__.load({
 			}, children);
 		}
 
-		function Toggle({ checked, onChange, disabled }) {
+		function Toggle({ checked, onChange, disabled, label }) {
 			return h('button', {
+				type: 'button',
+				role: 'switch',
+				'aria-checked': checked === true,
+				'aria-label': label,
 				onClick: () => { if (disabled !== true) onChange(!checked); },
 				disabled: disabled === true,
 				style: {
@@ -264,7 +273,15 @@ window.__ModuleLoader__.load({
 			return h('div', { style: { color: C.faint, fontSize: 12, padding: '10px 2px' } }, text);
 		}
 
-		function Modal({ title, hint, children, onClose, t }) {
+		function Modal({ id, title, hint, children, onClose, t }) {
+			const dialog = React.useRef(null);
+			React.useEffect(() => {
+				const previous = document.activeElement;
+				dialog.current?.focus();
+				return () => {
+					if (previous?.isConnected !== false) previous?.focus?.();
+				};
+			}, []);
 			return h('div', {
 				style: {
 					position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)',
@@ -272,7 +289,32 @@ window.__ModuleLoader__.load({
 				},
 				onClick: onClose,
 			}, h('div', {
+				ref: dialog,
+				role: 'dialog',
+				'aria-modal': true,
+				'aria-labelledby': id + '-title',
+				tabIndex: -1,
 				onClick: (event) => event.stopPropagation(),
+				onKeyDown: (event) => {
+					if (event.key === 'Escape') {
+						event.preventDefault();
+						event.stopPropagation();
+						onClose();
+						return;
+					}
+					if (event.key !== 'Tab' || dialog.current === null) return;
+					const controls = Array.from(dialog.current.querySelectorAll('button, a[href], input, textarea, select, [tabindex]'))
+						.filter((node) => node.tabIndex >= 0 && node.disabled !== true && node.getClientRects().length > 0);
+					const first = controls[0];
+					const last = controls[controls.length - 1];
+					const active = document.activeElement;
+					if (first === undefined || active === dialog.current
+						|| (event.shiftKey ? active === first : active === last)) {
+						event.preventDefault();
+						const target = (event.shiftKey ? last : first) ?? dialog.current;
+						target.focus();
+					}
+				},
 				style: {
 					background: 'var(--dsw-alias-bg-base, #fff)', border: '1px solid ' + C.border,
 					borderRadius: 12, padding: 16, width: 'min(760px, 92vw)', maxHeight: '82vh',
@@ -280,7 +322,7 @@ window.__ModuleLoader__.load({
 				},
 			}, [
 				h('div', { key: 'head', style: { display: 'flex', alignItems: 'center', gap: 8 } }, [
-					h('div', { key: 'title', style: { fontSize: 14, fontWeight: 600, color: C.text, flex: 1 } }, title),
+					h('h3', { id: id + '-title', key: 'title', style: { margin: 0, fontSize: 14, fontWeight: 600, color: C.text, flex: 1 } }, title),
 					h(Button, { key: 'close', onClick: onClose }, t('cancel')),
 				]),
 				hint === undefined ? null : h('div', { key: 'hint', style: { fontSize: 12, color: C.faint } }, hint),
@@ -318,6 +360,7 @@ window.__ModuleLoader__.load({
 					h(Toggle, {
 						key: 'toggle',
 						checked: row.enabled,
+						label: fill(t('mcpToggleLabel'), { name: row.serverName }),
 						disabled: busy || row.entryId === null,
 						onChange: (next) => onToggle(row, next),
 					}),
@@ -337,7 +380,7 @@ window.__ModuleLoader__.load({
 					h('span', { key: 'tools', style: { fontSize: 12, color: C.dim } }, t('tools') + ': ' + fill(t('toolCount'), { count: row.toolCount })),
 					row.toolCount === 0 ? null : h('span', { key: 'tokens', style: { fontSize: 12, color: C.faint } }, fill(t('toolTokens'), { tokens: formatTokens(row.toolTokens) })),
 					row.tools.length === 0 ? null : h(Button, { key: 'expand', onClick: () => setOpen(!open) }, open ? t('hideTools') : t('showTools')),
-					h(Button, { key: 'edit', onClick: () => onEdit(row), disabled: row.editable !== true }, t('editConfig')),
+					h(Button, { key: 'edit', onClick: () => onEdit(row), disabled: busy || row.editable !== true }, t('editConfig')),
 				]),
 				row.error === null || row.error === undefined ? null : h('div', { key: 'err', style: { fontSize: 12, color: C.err } }, row.error),
 				open ? h('div', {
@@ -355,6 +398,7 @@ window.__ModuleLoader__.load({
 					canToggle ? h(Toggle, {
 						key: 'toggle',
 						checked: item.modelInvocable,
+						label: fill(t('skillToggleLabel'), { name: item.name }),
 						disabled: busy,
 						onChange: (next) => onToggle(item, next),
 					}) : null,
@@ -363,7 +407,7 @@ window.__ModuleLoader__.load({
 						h('div', { style: { fontSize: 12, color: C.dim } }, item.description),
 					]),
 					h(Badge, { key: 'src', text: item.source, tone: 'muted' }),
-					h(Button, { key: 'view', onClick: () => onView(item) }, t('skillView')),
+					h(Button, { key: 'view', onClick: () => onView(item), disabled: busy }, t('skillView')),
 				]),
 				h('div', { key: 'meta', style: { fontSize: 11, color: C.faint, display: 'flex', gap: 10, flexWrap: 'wrap' } }, [
 					h('span', { key: 'provider' }, t('skillProvider') + ': ' + (item.provider === '' ? '—' : item.provider)),
@@ -382,12 +426,16 @@ window.__ModuleLoader__.load({
 			const [tab, setTab] = React.useState('mcp');
 			const [note, setNote] = React.useState(null);
 			const [config, setConfig] = React.useState(null);
+			const [configError, setConfigError] = React.useState(null);
 			const [skill, setSkill] = React.useState(null);
 			/** Second-click gate for a row another bundle owns. */
 			const [armed, setArmed] = React.useState(false);
 			const alive = React.useRef(true);
 
-			React.useEffect(() => () => { alive.current = false; }, []);
+			React.useEffect(() => {
+				alive.current = true;
+				return () => { alive.current = false; };
+			}, []);
 
 			const load = React.useCallback(async () => {
 				try {
@@ -403,18 +451,21 @@ window.__ModuleLoader__.load({
 
 			React.useEffect(() => { void load(); }, [load]);
 
-			const run = async (fn) => {
+			const run = async (fn, reportError = setError) => {
 				setBusy(true);
 				setNote(null);
+				setError(null);
+				reportError(null);
 				try {
 					const outcome = await fn();
+					if (!alive.current) return undefined;
 					if (outcome !== undefined && outcome.status !== undefined) setData(outcome.status);
 					return outcome;
 				} catch (err) {
-					setError(err?.message ?? String(err));
+					if (alive.current) reportError(err?.message ?? String(err));
 					return undefined;
 				} finally {
-					setBusy(false);
+					if (alive.current) setBusy(false);
 				}
 			};
 
@@ -424,6 +475,7 @@ window.__ModuleLoader__.load({
 					headers: { 'content-type': 'application/json' },
 					body: JSON.stringify({ entryId: row.entryId, patchId: row.patchId, enabled: next }),
 				});
+				if (!alive.current) return undefined;
 				setNote(row.serverName + ': ' + (next ? t('enabled') : t('disabled')));
 				return outcome;
 			}).catch(() => undefined);
@@ -431,24 +483,24 @@ window.__ModuleLoader__.load({
 			const openConfig = (row) => run(async () => {
 				const body = await readJson(ROUTE_MCP_CONFIG + '?patchId=' + encodeURIComponent(row.patchId));
 				const owner = body.ownedBy === undefined ? row.owner : body.ownedBy;
+				if (!alive.current) return undefined;
 				setArmed(false);
+				setConfigError(null);
 				setConfig({ row: { ...row, owner }, text: body.text ?? JSON.stringify(body.config ?? {}, null, 2) });
 				return undefined;
 			}).catch(() => undefined);
 
 			const saveConfig = () => run(async () => {
-				// A row another bundle writes gets one confirming click first: the
-				// save replaces that plugin's whole config, so a stray click must not
-				// be able to do it.
-				if (saveGate(config.row, armed) === 'confirm') {
-					setArmed(true);
-					return undefined;
-				}
 				let parsed;
 				try {
 					parsed = JSON.parse(config.text);
 				} catch {
-					setError(t('badJson'));
+					setConfigError(t('badJson'));
+					return undefined;
+				}
+				// Confirmation is for this exact draft. Edits reset the gate below.
+				if (saveGate(config.row, armed) === 'confirm') {
+					setArmed(true);
 					return undefined;
 				}
 				const outcome = await readJson(ROUTE_MCP_CONFIG, {
@@ -456,11 +508,13 @@ window.__ModuleLoader__.load({
 					headers: { 'content-type': 'application/json' },
 					body: JSON.stringify({ patchId: config.row.patchId, config: parsed }),
 				});
+				if (!alive.current) return undefined;
 				setArmed(false);
 				setConfig(null);
+				setConfigError(null);
 				setNote(t('saved'));
 				return outcome;
-			}).catch(() => undefined);
+			}, setConfigError).catch(() => undefined);
 
 			const toggleSkill = (item, next) => run(async () => {
 				const outcome = await readJson(ROUTE_SKILL_TOGGLE, {
@@ -468,12 +522,14 @@ window.__ModuleLoader__.load({
 					headers: { 'content-type': 'application/json' },
 					body: JSON.stringify({ path: item.path, modelInvocable: next }),
 				});
+				if (!alive.current) return undefined;
 				setNote(item.name + ': ' + (next ? t('skillModel') + ' ✓' : t('skillModel') + ' ✗'));
 				return outcome;
 			}).catch(() => undefined);
 
 			const viewSkill = (item) => run(async () => {
 				const body = await readJson(ROUTE_SKILL_GET + '?name=' + encodeURIComponent(item.name));
+				if (!alive.current) return undefined;
 				if (body.ok === true) setSkill(body.skill);
 				else setError(body.message ?? 'failed');
 				return undefined;
@@ -502,13 +558,14 @@ window.__ModuleLoader__.load({
 				tabButton('mcp', t('tabMcp')),
 				tabButton('skills', t('tabSkills')),
 				h('div', { key: 'spacer', style: { flex: 1 } }),
-				note === null ? null : h('span', { key: 'note', style: { fontSize: 12, color: C.ok } }, note),
+				note === null ? null : h('span', { key: 'note', role: 'status', 'aria-live': 'polite', style: { fontSize: 12, color: C.ok } }, note),
 				h(Button, { key: 'refresh', onClick: () => { void load(); }, disabled: busy }, t('refresh')),
 			]);
 
 			const body = [];
-			if (data === null) body.push(h(Empty, { key: 'loading', text: t('loading') }));
-			else if (tab === 'mcp') {
+			if (data === null) {
+				if (error === null) body.push(h(Empty, { key: 'loading', text: t('loading') }));
+			} else if (tab === 'mcp') {
 				body.push(h('div', { key: 'sum', style: { fontSize: 12, color: C.dim } }, fill(t('mcpSummary'), {
 					total: data.mcp.total, enabled: data.mcp.enabled, disabled: data.mcp.disabled,
 					tools: data.mcp.toolTotal, tokens: formatTokens(data.mcp.toolTokens),
@@ -542,9 +599,10 @@ window.__ModuleLoader__.load({
 				overlays.push(h(Modal, {
 					key: 'config',
 					t,
+					id: 'dsh-mcp-config-dialog',
 					title: fill(t('configTitle'), { name: config.row.serverName }),
 					hint: t('configHint'),
-					onClose: () => { setArmed(false); setConfig(null); },
+					onClose: () => { setArmed(false); setConfig(null); setConfigError(null); },
 				}, [
 					isOwnedRow(config.row)
 						? h('div', {
@@ -555,10 +613,21 @@ window.__ModuleLoader__.load({
 							},
 						}, fill(t('ownerWarn'), { owner: config.row.owner }))
 						: null,
+					configError === null ? null : h('div', {
+						key: 'config-error', id: 'dsh-mcp-config-error', role: 'alert',
+						style: { fontSize: 12, color: C.err },
+					}, configError),
 					h('textarea', {
 						key: 'ta',
+						'aria-label': fill(t('configTitle'), { name: config.row.serverName }),
+						'aria-invalid': configError === null ? undefined : true,
+						'aria-describedby': configError === null ? undefined : 'dsh-mcp-config-error',
 						value: config.text,
-						onChange: (event) => setConfig({ ...config, text: event.target.value }),
+						onChange: (event) => {
+							setArmed(false);
+							setConfigError(null);
+							setConfig({ ...config, text: event.target.value });
+						},
 						spellCheck: false,
 						style: {
 							width: '100%', minHeight: '38vh', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
@@ -571,13 +640,14 @@ window.__ModuleLoader__.load({
 							kind: 'primary',
 							onClick: () => { void saveConfig(); },
 							disabled: busy,
-						}, busy ? t('saving') : (saveGate(config.row, armed) === 'confirm' ? t('ownerConfirm') : t('save')))),
+						}, busy ? t('saving') : (isOwnedRow(config.row) && armed === true ? t('ownerConfirm') : t('save')))),
 				]));
 			}
 			if (skill !== null) {
 				overlays.push(h(Modal, {
 					key: 'skill',
 					t,
+					id: 'dsh-skill-dialog',
 					title: fill(t('skillTitle'), { name: skill.name }),
 					hint: skill.description,
 					onClose: () => setSkill(null),
@@ -592,7 +662,7 @@ window.__ModuleLoader__.load({
 
 			return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, padding: '4px 2px' } }, [
 				header,
-				error === null ? null : h('div', { key: 'error', style: { fontSize: 12, color: C.err } }, fill(t('failed'), { message: error })),
+				error === null ? null : h('div', { key: 'error', role: 'alert', style: { fontSize: 12, color: C.err } }, fill(t('failed'), { message: error })),
 				toolbar,
 				h('div', { key: 'body', style: { display: 'flex', flexDirection: 'column', gap: 8 } }, body),
 				...overlays,
@@ -633,6 +703,9 @@ window.__ModuleLoader__.load({
 		// The row component is exported for the same reason dsh-github exports its
 		// cards: the bundle test renders it through a minimal React stub.
 		exports.McpRow = McpRow;
+		exports.SkillRow = SkillRow;
+		exports.Modal = Modal;
+		exports.Panel = Panel;
 
 		module.exports = exports;
 		return module.exports;

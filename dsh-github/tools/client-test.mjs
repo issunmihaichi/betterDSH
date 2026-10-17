@@ -5,6 +5,7 @@
 // right step, and asks for the copy it should ask for.
 // usage: node tools/client-test.mjs
 import assert from 'node:assert/strict';
+import { deferred, jsonResponse, interceptFetch, fakeTimers, drain, mountComponent } from './client-runtime.mjs';
 
 let passed = 0;
 const failures = [];
@@ -42,6 +43,7 @@ const React = {
   },
   useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
   useEffect: () => {},
+  useRef: (initial) => ({ current: initial }),
   useCallback: (fn) => fn,
   useMemo: (fn) => fn(),
 };
@@ -422,6 +424,382 @@ check('a refusing navigation face never throws out of the click', () => {
 
 check('fill interpolates and keeps unknown placeholders', () => {
   assert.equal(fill('a {x} b {y}', { x: 1 }), 'a 1 b {y}');
+});
+
+// ---------------------------------------------- deferred real-client event tests ---
+
+async function checkAsync(label, fn) {
+  try { await fn(); passed += 1; }
+  catch (error) { failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`); }
+}
+
+const buttonNamed = (tree, key) => elementsOf(tree).find((node) => node.type === 'button' && textOf(node) === `t:${key}`);
+const inputNamed = (tree, key) => elementsOf(tree).find((node) => node.type === 'input' && node.props.key === key);
+const repoRow = (tree, name) => byClass(tree, 'dsg-repo-row').find((node) => node.props.key === name);
+const remoteRepo = (name) => ({ fullName: `octocat/${name}`, defaultBranch: 'main', description: '', language: '', private: false });
+const remoteBody = (names, extra = {}) => ({ ok: true, items: names.map(remoteRepo), page: 1, hasMore: false, account: { login: 'octocat' }, ...extra });
+const planFor = (name) => ({ fullName: `octocat/${name}`, cloneUrl: `https://github.com/octocat/${name}.git`, dest: `C:\\repos\\${name}`, dir: name, branch: 'main', depth: 7 });
+const readyStatus = () => baseStatus({ token: { present: true, preview: 'masked' } });
+
+async function withComponent(Component, props, handler, test) {
+  const timers = fakeTimers();
+  const transport = interceptFetch(handler);
+  let mounted;
+  try {
+    mounted = mountComponent(React, Component, props);
+    await test(mounted, timers, transport);
+  } finally {
+    mounted?.unmount();
+    transport.restore();
+    timers.restore();
+  }
+}
+
+await checkAsync('HTTP errors reject even when their JSON claims ok, and preserve readable metadata', async () => {
+  const transport = interceptFetch(() => jsonResponse({ ok: true, message: 'gateway unavailable' }, 503));
+  try {
+    await assert.rejects(client.request(client.ROUTES.settings, { body: { settings: { readOnly: true } } }), (error) => error.status === 503 && error.message === 'gateway unavailable');
+    assert.ok(transport.calls[0] instanceof Request);
+    assert.equal(transport.calls[0].method, 'POST');
+    assert.deepEqual(await transport.calls[0].json(), { settings: { readOnly: true } });
+  } finally { transport.restore(); }
+});
+
+await checkAsync('invalid JSON and HTTP-success business failures never count as saved', async () => {
+  const transport = interceptFetch((request, index) => index === 1
+    ? new Response('not json', { status: 200 })
+    : jsonResponse({ ok: false, applied: { message: 'MCP apply failed' } }));
+  try {
+    await assert.rejects(client.request(client.ROUTES.status), /HTTP 200/);
+    await assert.rejects(client.request(client.ROUTES.settings), /MCP apply failed/);
+  } finally { transport.restore(); }
+});
+
+for (const order of ['during debounce', 'after latest query']) {
+  await checkAsync(`repository response from old query cannot win ${order}`, async () => {
+    const old = deferred();
+    await withComponent(client.RepoCard, { t, data: readyStatus(), onChanged: () => {} },
+      (request) => new URL(request.url).searchParams.get('q') === '' ? old.promise : jsonResponse(remoteBody(['new'])),
+      async (mounted, timers) => {
+        timers.runNext(); // initial query remains pending
+        inputNamed(mounted.tree, 'search').props.onChange({ target: { value: 'new' } });
+        mounted.render();
+        if (order === 'during debounce') { old.resolve(jsonResponse(remoteBody(['old']))); await drain(); mounted.render(); }
+        assert.equal(repoRow(mounted.tree, 'octocat/old'), undefined);
+        timers.runNext();
+        await drain(); mounted.render();
+        assert.ok(repoRow(mounted.tree, 'octocat/new'));
+        if (order === 'after latest query') { old.resolve(jsonResponse(remoteBody(['old']))); await drain(); mounted.render(); }
+        assert.equal(repoRow(mounted.tree, 'octocat/old'), undefined);
+        assert.ok(repoRow(mounted.tree, 'octocat/new'));
+      });
+  });
+}
+
+await checkAsync('stale page append and its errors cannot alter a new repository search', async () => {
+  const append = deferred();
+  await withComponent(client.RepoCard, { t, data: readyStatus(), onChanged: () => {} }, (request) => {
+    const url = new URL(request.url);
+    if (url.searchParams.get('page') === '2') return append.promise;
+    return jsonResponse(remoteBody([url.searchParams.get('q') || 'first'], { hasMore: url.searchParams.get('q') === '' }));
+  }, async (mounted, timers) => {
+    timers.runNext(); await drain(); mounted.render();
+    const more = buttonNamed(mounted.tree, 'loadMore').props.onClick();
+    inputNamed(mounted.tree, 'search').props.onChange({ target: { value: 'latest' } });
+    mounted.render(); timers.runNext(); await drain(); mounted.render();
+    append.reject(new Error('old page failure'));
+    await more; mounted.render();
+    assert.ok(repoRow(mounted.tree, 'octocat/latest'));
+    assert.ok(!textOf(mounted.tree).includes('old page failure'));
+  });
+});
+
+await checkAsync('refresh button explicitly bypasses the host repository page cache', async () => {
+  await withComponent(client.RepoCard, { t, data: readyStatus(), onChanged: () => {} }, () => jsonResponse(remoteBody(['A'])), async (mounted, timers, transport) => {
+    timers.runNext(); await drain(); mounted.render();
+    await buttonNamed(mounted.tree, 'refreshList').props.onClick();
+    assert.equal(new URL(transport.calls.at(-1).url).searchParams.get('refresh'), '1');
+  });
+});
+
+await checkAsync('late clone plan A cannot replace selected B or clear B busy state', async () => {
+  const plans = { A: deferred(), B: deferred() };
+  await withComponent(client.RepoCard, { t, data: readyStatus(), onChanged: () => {} }, async (request) => {
+    if (request.method === 'GET') return jsonResponse(remoteBody(['A', 'B']));
+    const body = await request.json();
+    return plans[body.repo.split('/')[1]].promise;
+  }, async (mounted, timers) => {
+    timers.runNext(); await drain(); mounted.render();
+    repoRow(mounted.tree, 'octocat/A').props.onClick();
+    mounted.render();
+    repoRow(mounted.tree, 'octocat/B').props.onClick();
+    mounted.render();
+    plans.A.resolve(jsonResponse({ ok: true, plan: planFor('A') }));
+    await drain(); mounted.render();
+    assert.equal(byClass(mounted.tree, 'dsg-overlay').length, 0);
+    plans.B.resolve(jsonResponse({ ok: true, plan: planFor('B') }));
+    await drain(); mounted.render();
+    assert.equal(repoRow(mounted.tree, 'octocat/B').props['aria-pressed'], 'true');
+    assert.equal(repoRow(mounted.tree, 'octocat/A').props['aria-pressed'], 'false');
+    assert.equal(buttonNamed(mounted.tree, 'confirmGo').props.disabled, false);
+  });
+});
+
+await checkAsync('confirmation sends displayed target/depth and changed-plan rejection dismisses stale plan', async () => {
+  let confirmed;
+  let changed = 0;
+  const plan = { ...planFor('A'), dir: 'custom', dest: 'D:\\custom' };
+  await withComponent(client.RepoCard, { t, data: readyStatus(), onChanged: () => { changed += 1; } }, async (request) => {
+    if (request.method === 'GET') return jsonResponse(remoteBody(['A']));
+    const body = await request.json();
+    if (!body.confirm) return jsonResponse({ ok: true, plan });
+    confirmed = body;
+    return jsonResponse({ ok: false, reason: 'plan-changed', message: 'Reconfirm changed target' }, 409);
+  }, async (mounted, timers) => {
+    timers.runNext(); await drain(); mounted.render();
+    repoRow(mounted.tree, 'octocat/A').props.onClick(); await drain(); mounted.render();
+    await buttonNamed(mounted.tree, 'confirmGo').props.onClick(); mounted.render();
+    assert.deepEqual(confirmed.expected, { fullName: plan.fullName, cloneUrl: plan.cloneUrl, dest: plan.dest, branch: plan.branch, depth: plan.depth });
+    assert.equal(confirmed.dir, 'custom');
+    assert.equal(byClass(mounted.tree, 'dsg-overlay').length, 0);
+    assert.ok(textOf(mounted.tree).includes('Reconfirm changed target'));
+    assert.equal(changed, 0);
+  });
+});
+
+await checkAsync('editing manual repository invalidates a still-pending plan', async () => {
+  const planned = deferred();
+  await withComponent(client.RepoCard, { t, data: readyStatus(), onChanged: () => {} }, (request) => request.method === 'GET' ? jsonResponse(remoteBody([])) : planned.promise,
+    async (mounted, timers) => {
+      timers.runNext(); await drain(); mounted.render();
+      buttonNamed(mounted.tree, 'manualToggle').props.onClick(); mounted.render();
+      inputNamed(mounted.tree, 'manual').props.onChange({ target: { value: 'octocat/A' } }); mounted.render();
+      const asking = buttonNamed(mounted.tree, 'connectRepo').props.onClick();
+      inputNamed(mounted.tree, 'manual').props.onChange({ target: { value: 'octocat/B' } }); mounted.render();
+      planned.resolve(jsonResponse({ ok: true, plan: planFor('A') }));
+      await asking; mounted.render();
+      assert.equal(byClass(mounted.tree, 'dsg-overlay').length, 0);
+    });
+});
+
+await checkAsync('repository and plan requests settled after unmount cause no state writes', async () => {
+  const listing = deferred();
+  await withComponent(client.RepoCard, { t, data: readyStatus(), onChanged: () => {} }, () => listing.promise, async (mounted, timers) => {
+    timers.runNext(); mounted.unmount();
+    listing.resolve(jsonResponse(remoteBody(['late'])));
+    await drain();
+    assert.equal(mounted.unmountedWrites, 0);
+  });
+});
+
+await checkAsync('tool A result and finally cannot overwrite B result or busy indicator', async () => {
+  const tools = ['A', 'B'].map((shortName) => ({ name: `mcp__github__${shortName}`, shortName, description: '', parameters: {} }));
+  const pending = { A: deferred(), B: deferred() };
+  await withComponent(client.ToolCard, { t, data: baseStatus({ tools }) }, async (request) => pending[(await request.json()).name].promise,
+    async (mounted) => {
+      byClass(mounted.tree, 'dsg-tool')[0].props.onClick(); mounted.render();
+      const callA = buttonNamed(mounted.tree, 'call').props.onClick(); mounted.render();
+      byClass(mounted.tree, 'dsg-tool')[1].props.onClick(); mounted.render();
+      const callB = buttonNamed(mounted.tree, 'call').props.onClick(); mounted.render();
+      pending.A.resolve(jsonResponse({ ok: true, text: 'result A' }));
+      await callA; mounted.render();
+      assert.equal(buttonNamed(mounted.tree, 'calling').props.disabled, true);
+      assert.ok(!textOf(mounted.tree).includes('result A'));
+      pending.B.resolve(jsonResponse({ ok: true, text: 'result B' }));
+      await callB; mounted.render();
+      assert.ok(textOf(mounted.tree).includes('result B'));
+      assert.ok(!textOf(mounted.tree).includes('result A'));
+    });
+});
+
+await checkAsync('transport refresh preserves dirty edits and saves only changed fields', async () => {
+  let submitted;
+  const original = baseStatus();
+  const updated = baseStatus({ settings: { ...original.settings, tokenSource: 'env', wizardDone: true, toolsets: 'repos' } });
+  await withComponent(client.TransportCard, { t, data: original, onChanged: () => {} }, async (request) => {
+    submitted = (await request.json()).settings;
+    return jsonResponse({ ok: true, status: { settings: { ...updated.settings, ...submitted } } });
+  }, async (mounted) => {
+    inputNamed(mounted.tree, 'url').props.onChange({ target: { value: 'https://edited.example/mcp/' } }); mounted.render();
+    mounted.render({ t, data: updated, onChanged: () => {} });
+    assert.equal(inputNamed(mounted.tree, 'url').props.value, 'https://edited.example/mcp/');
+    assert.equal(inputNamed(mounted.tree, 'toolsets').props.value, 'repos');
+    assert.ok(textOf(mounted.tree).includes('t:unsavedChanges'));
+    await buttonNamed(mounted.tree, 'saveSettings').props.onClick(); mounted.render();
+    assert.deepEqual(submitted, { url: 'https://edited.example/mcp/' });
+    assert.ok(!textOf(mounted.tree).includes('t:unsavedChanges'));
+  });
+});
+
+await checkAsync('transport edits made during save survive the old acknowledgement', async () => {
+  const saving = deferred();
+  await withComponent(client.TransportCard, { t, data: baseStatus(), onChanged: () => {} }, () => saving.promise, async (mounted) => {
+    inputNamed(mounted.tree, 'url').props.onChange({ target: { value: 'https://first.example/' } }); mounted.render();
+    const save = buttonNamed(mounted.tree, 'saveSettings').props.onClick();
+    inputNamed(mounted.tree, 'url').props.onChange({ target: { value: 'https://second.example/' } }); mounted.render();
+    saving.resolve(jsonResponse({ ok: true, status: { settings: { ...baseStatus().settings, url: 'https://first.example/' } } }));
+    await save; mounted.render();
+    assert.equal(inputNamed(mounted.tree, 'url').props.value, 'https://second.example/');
+    assert.ok(textOf(mounted.tree).includes('t:unsavedChanges'));
+  });
+});
+
+await checkAsync('transport save failure is visible and dirty draft is retained for retry', async () => {
+  let changed = 0;
+  await withComponent(client.TransportCard, { t, data: baseStatus(), onChanged: () => { changed += 1; } }, () => jsonResponse({ ok: false, message: 'disk full' }, 500), async (mounted) => {
+    inputNamed(mounted.tree, 'url').props.onChange({ target: { value: 'https://keep.example/' } }); mounted.render();
+    await buttonNamed(mounted.tree, 'saveSettings').props.onClick(); mounted.render();
+    assert.equal(inputNamed(mounted.tree, 'url').props.value, 'https://keep.example/');
+    assert.ok(textOf(mounted.tree).includes('disk full'));
+    assert.ok(textOf(mounted.tree).includes('t:unsavedChanges'));
+    assert.equal(changed, 0);
+  });
+});
+
+await checkAsync('token source autosave rejection is caught and shown, not reported as success', async () => {
+  let changed = 0;
+  await withComponent(client.TokenCard, { t, data: baseStatus(), onChanged: () => { changed += 1; } }, () => Promise.reject(new Error('offline settings failure')), async (mounted) => {
+    const env = elementsOf(mounted.tree).find((node) => node.props.role === 'radio' && textOf(node) === 't:sourceEnv');
+    await env.props.onClick(); mounted.render();
+    assert.ok(textOf(mounted.tree).includes('offline settings failure'));
+    assert.equal(changed, 0);
+  });
+});
+
+await checkAsync('token environment autosave error is visible and failed secret save keeps the input', async () => {
+  const status = baseStatus(); status.settings.tokenSource = 'env';
+  await withComponent(client.TokenCard, { t, data: status, onChanged: () => {} }, () => jsonResponse({ message: 'write denied' }, 500), async (mounted) => {
+    const env = elementsOf(mounted.tree).find((node) => node.type === 'input' && node.props.value === status.settings.envVar);
+    env.props.onChange({ target: { value: 'CUSTOM_TOKEN' } }); mounted.render();
+    elementsOf(mounted.tree).find((node) => node.type === 'input' && node.props.value === 'CUSTOM_TOKEN').props.onBlur();
+    await drain(); mounted.render();
+    assert.ok(textOf(mounted.tree).includes('write denied'));
+    const secret = elementsOf(mounted.tree).find((node) => node.props.type === 'password');
+    secret.props.onChange({ target: { value: 'test-secret' } }); mounted.render();
+    await buttonNamed(mounted.tree, 'saveToken').props.onClick(); mounted.render();
+    assert.equal(elementsOf(mounted.tree).find((node) => node.props.type === 'password').props.value, 'test-secret');
+  });
+});
+
+await checkAsync('wizard skip does not finish when settings persistence fails', async () => {
+  let done = 0;
+  await withComponent(client.SetupWizard, { t, data: baseStatus(), onChanged: () => {}, onDone: () => { done += 1; } }, () => jsonResponse({ ok: false, message: 'cannot save wizard' }, 500), async (mounted) => {
+    await buttonNamed(mounted.tree, 'wizardSkip').props.onClick(); mounted.render();
+    assert.equal(done, 0);
+    assert.ok(textOf(mounted.tree).includes('cannot save wizard'));
+  });
+});
+
+await checkAsync('clone poll is single-flight, stops on terminal success, and refreshes exactly once', async () => {
+  const timers = fakeTimers();
+  const response = deferred();
+  let calls = 0;
+  let changed = 0;
+  const jobs = [];
+  const stop = client.watchClone({ id: 'job-1', schedule: timers.schedule, cancel: timers.cancel, request: async () => { calls += 1; return response.promise; }, onJob: (job) => jobs.push(job), onSettled: () => { changed += 1; }, onError: (error) => { throw error; } });
+  try {
+    const polling = timers.runNext();
+    assert.equal(timers.timers.size, 0, 'no next timer while request is unresolved');
+    assert.equal(calls, 1);
+    response.resolve({ ok: true, job: { id: 'job-1', state: 'done' } });
+    await polling;
+    assert.equal(timers.timers.size, 0);
+    assert.equal(changed, 1);
+    assert.equal(jobs[0].state, 'done');
+  } finally { stop(); timers.restore(); }
+});
+
+await checkAsync('poll HTTP 404 visibly stops and retry only resumes GET tracking, never clones twice', async () => {
+  let polls = 0;
+  let confirmations = 0;
+  let changed = 0;
+  await withComponent(client.RepoCard, { t, data: readyStatus(), onChanged: () => { changed += 1; } }, async (request) => {
+    const url = new URL(request.url);
+    if (url.pathname.endsWith('github.remote')) return jsonResponse(remoteBody(['A']));
+    if (request.method === 'POST') {
+      const body = await request.json();
+      if (!body.confirm) return jsonResponse({ ok: true, plan: planFor('A') });
+      confirmations += 1;
+      return jsonResponse({ ok: true, job: { id: 'job-1', repo: 'octocat/A', state: 'running', log: [] } });
+    }
+    polls += 1;
+    return polls === 1 ? jsonResponse({ ok: false, reason: 'unknown-job', message: 'job was lost' }, 404)
+      : jsonResponse({ ok: true, job: { id: 'job-1', repo: 'octocat/A', state: 'done', log: [], dest: 'C:\\repos\\A' } });
+  }, async (mounted, timers) => {
+    timers.runNext(); await drain(); mounted.render();
+    repoRow(mounted.tree, 'octocat/A').props.onClick(); await drain(); mounted.render();
+    await buttonNamed(mounted.tree, 'confirmGo').props.onClick(); mounted.render();
+    await timers.runNext(); mounted.render();
+    assert.equal(timers.timers.size, 0);
+    assert.ok(textOf(mounted.tree).includes('t:trackingStopped'));
+    assert.ok(!textOf(mounted.tree).includes('t:downloading'));
+    assert.ok(buttonNamed(mounted.tree, 'retryTracking'));
+    buttonNamed(mounted.tree, 'retryTracking').props.onClick(); mounted.render();
+    await timers.runNext(); mounted.render();
+    assert.equal(confirmations, 1);
+    assert.equal(polls, 2);
+    assert.equal(changed, 1);
+    assert.ok(textOf(mounted.tree).includes('t:downloadDone'));
+  });
+});
+
+await checkAsync('poll cleanup suppresses a delayed failure and cannot schedule another request', async () => {
+  const timers = fakeTimers();
+  const outcome = deferred();
+  let errors = 0;
+  const stop = client.watchClone({ id: 'job-1', schedule: timers.schedule, cancel: timers.cancel, request: () => outcome.promise, onJob: () => assert.fail('late job'), onSettled: () => assert.fail('late refresh'), onError: () => { errors += 1; } });
+  try {
+    const polling = timers.runNext();
+    stop(); outcome.reject(new Error('late failure'));
+    await polling;
+    assert.equal(errors, 0);
+    assert.equal(timers.timers.size, 0);
+  } finally { stop(); timers.restore(); }
+});
+
+await checkAsync('two immediate confirm clicks launch only one host request', async () => {
+  const response = deferred();
+  let confirmations = 0;
+  await withComponent(client.RepoCard, { t, data: readyStatus(), onChanged: () => {} }, async (request) => {
+    if (request.method === 'GET') return jsonResponse(remoteBody(['A']));
+    if (!(await request.json()).confirm) return jsonResponse({ ok: true, plan: planFor('A') });
+    confirmations += 1;
+    return response.promise;
+  }, async (mounted, timers) => {
+    timers.runNext(); await drain(); mounted.render();
+    repoRow(mounted.tree, 'octocat/A').props.onClick(); await drain(); mounted.render();
+    const click = buttonNamed(mounted.tree, 'confirmGo').props.onClick;
+    const first = click();
+    await click();
+    await drain(); mounted.render();
+    assert.equal(confirmations, 1);
+    assert.equal(buttonNamed(mounted.tree, 'confirmCancel').props.disabled, true);
+    assert.equal(repoRow(mounted.tree, 'octocat/A').props.disabled, true);
+    response.resolve(jsonResponse({ ok: true, job: { id: 'job-1', repo: 'octocat/A', state: 'running', log: [] } }));
+    await first; mounted.render();
+    assert.equal(byClass(mounted.tree, 'dsg-overlay').length, 0);
+  });
+});
+
+await checkAsync('running clone schedules its next poll only after success and network error stops', async () => {
+  const timers = fakeTimers();
+  const first = deferred();
+  let calls = 0;
+  let error;
+  const stop = client.watchClone({ id: 'job-1', schedule: timers.schedule, cancel: timers.cancel,
+    request: () => { calls += 1; return calls === 1 ? first.promise : Promise.reject(new Error('network down')); },
+    onJob: () => {}, onSettled: () => assert.fail('not terminal'), onError: (value) => { error = value; },
+  });
+  try {
+    const pending = timers.runNext();
+    assert.equal(timers.timers.size, 0);
+    first.resolve({ ok: true, job: { id: 'job-1', state: 'running' } }); await pending;
+    assert.equal(timers.timers.size, 1);
+    await timers.runNext();
+    assert.equal(error.message, 'network down');
+    assert.equal(calls, 2);
+    assert.equal(timers.timers.size, 0);
+  } finally { stop(); timers.restore(); }
 });
 
 // ------------------------------------------------------------------ summary ---

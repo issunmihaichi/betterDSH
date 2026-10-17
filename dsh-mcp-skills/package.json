@@ -1,6 +1,6 @@
 {
   "name": "dsh-mcp-skills",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "设置里的「MCP 与技能」页：统一管理 MCP 服务器（启停、配置、工具数）与技能库（列表、查看、模型调用开关）",
   "license": "MIT",

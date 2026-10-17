@@ -28,6 +28,8 @@ export const DURATIONS = {
   authFailuresToDisable: 3,
   /** Sticky binding lifetime (sub2api: stickySessionTTL = time.Hour). */
   stickyTtlMs: 60 * 60_000,
+  /** Codex long tasks: idle expiry, refreshed on each successful sticky request. */
+  codexStickyTtlMs: 7 * 24 * 60 * 60_000,
   /** How many account switches one request may spend before giving up. */
   maxAccountSwitches: 3,
 };

@@ -1,5 +1,15 @@
 # Portable release entry. Restart DSH after updating host modules.
 # Local debug paths and operator accounts are not included in release defaults.
 - insert:
+    # Keep the bridge row the GitHub settings page manages. No credential is
+    # shipped; fresh installs stay offline until the user explicitly connects.
+    - id: github-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      disabled: true
+      config:
+        serverName: github
+        transport: streamable-http
+        url: https://api.githubcopilot.com/mcp/
+        failOnStartupError: false
     - id: github
       name: dsh-github

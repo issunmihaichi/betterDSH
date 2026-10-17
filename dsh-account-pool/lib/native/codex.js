@@ -1,12 +1,15 @@
 /**
- * ChatGPT Codex OAuth Responses transport (text, user images and function tools).
+ * ChatGPT Codex OAuth Responses transport (text, user/tool images and function tools).
  * No upstream import: the caller supplies its SSE parser to mapCodex.
  * Wire facts follow sub2api's openai_codex_transform.go,
  * openai_gateway_forward.go and openai_chatgpt_headers.go.
  */
 import { Buffer } from 'node:buffer';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { uuidFromSeed } from '../claude-code/hash.js';
+import { MAX_CODEX_REQUEST_REPLAY_BYTES, codexReplayScope, openCodexReplay, sealCodexReplay } from './codex-replay.js';
+import { summarizeCodexAttribution } from './codex-attribution.js';
+import { compactionError, expandCodexCompactionMessages, mapCodexCompaction, openCodexCompaction } from './codex-compaction.js';
 
 const ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses';
 // Keep the outbound Codex identity above the model catalog's minimum versions.
@@ -14,14 +17,6 @@ const ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses';
 const CLIENT_VERSION = '0.160.1';
 const SKIPPED = new Set(['tool-addition', 'tool-removal', 'reasoning']);
 const EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
-const CONTINUATION_LIMIT = 512;
-const CONTINUATION_BYTES = 2 * 1024 * 1024;
-const CONTINUATION_TTL_MS = 60 * 60 * 1000;
-const continuations = new Map();
-let continuationBytes = 0;
-
-function fingerprint(value) { return createHash('sha256').update(value).digest('hex'); }
-function clone(value) { return JSON.parse(JSON.stringify(value)); }
 function argumentText(value) { return typeof value === 'string' ? value : JSON.stringify(value ?? {}); }
 function toolNames(names) {
   const originalToWire = new Map();
@@ -45,32 +40,6 @@ function toolNames(names) {
   }
   return { originalToWire, wireToOriginal };
 }
-function continuationGet(id, scope) {
-  if (!scope) return undefined;
-  const key = `${scope}:${id}`;
-  const prior = continuations.get(key);
-  if (!prior) return undefined;
-  if (prior.expiresAt <= Date.now()) {
-    continuations.delete(key); continuationBytes -= prior.bytes; return undefined;
-  }
-  continuations.delete(key); continuations.set(key, prior);
-  return prior;
-}
-function continuationPut(id, scope, value) {
-  if (!scope) return;
-  const key = `${scope}:${id}`;
-  const bytes = Buffer.byteLength(key) + Buffer.byteLength(JSON.stringify(value));
-  const previous = continuations.get(key);
-  if (previous) { continuations.delete(key); continuationBytes -= previous.bytes; }
-  if (bytes > CONTINUATION_BYTES / 4) return;
-  const now = Date.now();
-  continuations.set(key, { ...clone(value), bytes, expiresAt: now + CONTINUATION_TTL_MS });
-  continuationBytes += bytes;
-  for (const [oldKey, entry] of continuations) {
-    if (entry.expiresAt > now && continuations.size <= CONTINUATION_LIMIT && continuationBytes <= CONTINUATION_BYTES) continue;
-    continuations.delete(oldKey); continuationBytes -= entry.bytes;
-  }
-}
 
 function localError(message, code = 'POOL_UNSUPPORTED_CONTENT') {
   const error = new Error(message);
@@ -89,6 +58,38 @@ function jwtAccountId(token) {
 
 function headerValue(value) {
   return typeof value === 'string' && value.trim() !== '' && !/[\x00-\x20\x7f]/.test(value);
+}
+
+function nonblank(value) { return typeof value === 'string' && value.trim() !== ''; }
+function ownValue(record, key) {
+  if (record === null || typeof record !== 'object') return undefined;
+  // Ignore accessors/prototype fields and never coerce or serialize caller objects.
+  try { return Object.getOwnPropertyDescriptor(record, key)?.value; } catch { return undefined; }
+}
+
+/** Private companion sidecar: copy only the exact, primitive auto-review contract. */
+export function snapshotCodexRequestProvenance(value, { purpose, sessionId } = {}) {
+  const version = ownValue(value, 'version');
+  const kind = ownValue(value, 'kind');
+  const ownerSessionId = ownValue(value, 'ownerSessionId');
+  const requestId = ownValue(value, 'requestId');
+  return version === 1 && kind === 'auto-review' && nonblank(ownerSessionId) && nonblank(requestId)
+    && purpose === undefined && (sessionId === undefined || sessionId === ownerSessionId)
+    ? Object.freeze({ version, kind, ownerSessionId, requestId }) : undefined;
+}
+
+/** Resolver results may be live objects; retain no references across async I/O. */
+export function snapshotCodexSessionContext(value) {
+  const context = {};
+  const known = ownValue(value, 'known');
+  if (typeof known === 'boolean') context.known = known;
+  for (const key of ['origin', 'rootSessionId', 'parentSessionId', 'turnId']) {
+    const field = ownValue(value, key);
+    if (nonblank(field)) context[key] = field;
+  }
+  const missing = ownValue(value, 'missingSourceReason');
+  if (['session-service-unavailable', 'session-not-found', 'source-unavailable'].includes(missing)) context.missingSourceReason = missing;
+  return Object.freeze(context);
 }
 
 function codexUrl(account) {
@@ -110,6 +111,57 @@ function codexUrl(account) {
   if (suffix === undefined) throw localError('Codex baseUrl has an unsupported endpoint suffix');
   url.pathname = suffix;
   return url.href;
+}
+
+export function codexIdentity(account, credentialBundle) {
+  const bundle = typeof credentialBundle === 'string' ? { access_token: credentialBundle } : credentialBundle;
+  const token = bundle?.access_token;
+  const accountId = account?.chatgptAccountId ?? bundle?.chatgpt_account_id ?? bundle?.chatgptAccountId
+    ?? bundle?.account_id ?? bundle?.accountId ?? jwtAccountId(bundle?.id_token) ?? jwtAccountId(token) ?? account?.oauth?.accountId;
+  if (!headerValue(token)) throw localError('Codex requires a usable OAuth access token', 'POOL_NO_CREDENTIAL');
+  if (!headerValue(accountId)) throw localError('Codex requires a ChatGPT account id in the OAuth bundle or token claims', 'POOL_CODEX_ACCOUNT_REQUIRED');
+  return { bundle, token, accountId, url: codexUrl(account) };
+}
+
+/** Canonical Codex routing values. "fast" is a configuration alias, never emitted. */
+export function normalizeCodexServiceTier(value) {
+  if (value === undefined || value === null || value === 'standard' || value === 'default') return undefined;
+  if (value === 'fast' || value === 'priority') return 'priority';
+  if (value === 'ultrafast') return value;
+  throw localError('Invalid Codex service tier', 'POOL_CODEX_SPEED_INVALID');
+}
+
+/** Digest only; an actual token/account change must not inherit an entitlement. */
+function codexCatalogIdentity(account, identity) {
+  return createHash('sha256').update(JSON.stringify(['codex-models-v1', CLIENT_VERSION,
+    account?.id ?? null, account?.credentialRef ?? null, identity.accountId, identity.url, identity.token])).digest('hex');
+}
+
+/** First-party catalog only: an administrator proxy is not proof of OpenAI access. */
+export function buildCodexModelsRequest(account, credentialBundle) {
+  if (account?.platform !== 'openai' || account.authMode !== 'oauth') throw localError('Codex catalog requires OAuth', 'POOL_CODEX_SPEED_UNAVAILABLE');
+  const identity = codexIdentity(account, credentialBundle);
+  if (new URL(identity.url).origin !== 'https://chatgpt.com') throw localError('Codex catalog requires a trusted endpoint', 'POOL_CODEX_SPEED_UNAVAILABLE');
+  return {
+    identity: codexCatalogIdentity(account, identity),
+    url: `https://chatgpt.com/backend-api/codex/models?client_version=${CLIENT_VERSION}`,
+    init: { method: 'GET', redirect: 'error', headers: {
+      authorization: `Bearer ${identity.token}`, 'chatgpt-account-id': identity.accountId,
+      accept: 'application/json', originator: 'codex_cli_rs',
+      'user-agent': `codex_cli_rs/${CLIENT_VERSION}`, version: CLIENT_VERSION,
+    } },
+  };
+}
+
+/** History restoration precedes attachment resolution, so an image in a shadowed
+ * original span goes through the same durable preview path as an ordinary image. */
+export function prepareCodexCompactionHistory(account, options, credentialBundle, { replayCodec, encryptedCompaction = false, resolveCompactionHistory } = {}) {
+  const { bundle, accountId, url } = codexIdentity(account, credentialBundle);
+  const review = snapshotCodexRequestProvenance(options.codexRequestProvenance, options);
+  const eligible = options.purpose === undefined || options.purpose === 'compaction' && options.codexCompactionV2 === true;
+  const context = { replayCodec, scope: eligible && !review ? codexReplayScope(account, bundle, accountId, url, options.model, options.sessionId) : undefined };
+  const messages = expandCodexCompactionMessages(options.messages, { context, enabled: encryptedCompaction === true, resolveCompactionHistory, options });
+  return messages === options.messages ? options : { ...options, messages };
 }
 
 function callId(id) {
@@ -140,7 +192,7 @@ export async function prepareCodexImages(options, resolveAttachments) {
     for (const block of message.content) {
       options.signal?.throwIfAborted();
       if (block?.type !== 'image') { content.push(block); continue; }
-      if (message.role !== 'user') throw localError('Codex images are supported only in user messages');
+      if (message.role !== 'user' && message.role !== 'tool') throw localError('Codex images are supported only in user messages and tool results');
       if (!block.attachment) { imagePart(block); content.push(block); continue; }
       const ref = block.attachment;
       if (block.offloaded === true) {
@@ -185,7 +237,7 @@ function contentParts(content, allowCalls = false, allowImages = false) {
       imagePart(block);
       parts.push(block);
     } else if (!SKIPPED.has(block?.type)) {
-      throw localError('Codex supports text, user images and assistant function calls');
+      throw localError('Codex supports text, user/tool images and assistant function calls');
     }
   }
   return parts;
@@ -194,8 +246,9 @@ function contentParts(content, allowCalls = false, allowImages = false) {
 /**
  * Build a request using the existing upstream request options; no network I/O.
  * Returns {url, init, context}; pass context as mapCodex's optional third argument
- * to reverse reserved tool aliases and preserve private encrypted reasoning
- * during stateless tool continuations. Name maps belong to this request only.
+ * to reverse reserved tool aliases and seal ordered native replay into DSH's
+ * durable assistant source metadata. Name maps belong to this request only.
+ * The optional fourth argument is a trusted Host dependency, NOT call options.
  * credentialBundle: { access_token, chatgpt_account_id?, id_token? } OR a plain
  * access-token string. An explicit account.chatgptAccountId overrides the bundle,
  * then id/access JWT claims and account.oauth.accountId provide fallbacks. Opaque
@@ -205,41 +258,117 @@ function contentParts(content, allowCalls = false, allowImages = false) {
  * cannot change the destination. Redirects are disabled to retain token control.
  * maxTokens/temperature/stop are omitted: this OAuth endpoint rejects them.
  */
-export function buildCodexRequest(account, options = {}, credentialBundle) {
-  const bundle = typeof credentialBundle === 'string' ? { access_token: credentialBundle } : credentialBundle;
-  const token = bundle?.access_token;
-  const accountId = account?.chatgptAccountId
-    ?? bundle?.chatgpt_account_id
-    ?? bundle?.chatgptAccountId
-    ?? bundle?.account_id
-    ?? bundle?.accountId
-    ?? jwtAccountId(bundle?.id_token)
-    ?? jwtAccountId(token)
-    ?? account?.oauth?.accountId;
-  if (!headerValue(token)) throw localError('Codex requires a usable OAuth access token', 'POOL_NO_CREDENTIAL');
-  if (!headerValue(accountId)) throw localError('Codex requires a ChatGPT account id in the OAuth bundle or token claims', 'POOL_CODEX_ACCOUNT_REQUIRED');
-  const url = codexUrl(account);
-  // Keep cache affinity stable across turns and OAuth access-token refreshes.
-  const cacheKey = typeof options.sessionId === 'string' && options.sessionId.trim() !== ''
-    ? uuidFromSeed(JSON.stringify(['dsh-account-pool:codex-cache:v1', account?.id ?? null, accountId, url, options.sessionId]))
-    : undefined;
+export function buildCodexRequest(account, options = {}, credentialBundle, { replayCodec, encryptedCompaction = false, resolveCompactionHistory } = {}) {
+  const identity = codexIdentity(account, credentialBundle);
+  const { bundle, token, accountId, url } = identity;
+  const serviceTier = normalizeCodexServiceTier(options.codexServiceTier);
+  if (serviceTier && (account?.platform !== 'openai' || account.authMode !== 'oauth')) {
+    throw localError('Codex speed requires an OAuth account', 'POOL_CODEX_SPEED_UNAVAILABLE');
+  }
+  if (serviceTier === 'ultrafast' && (options.codexSpeedModel !== options.model
+    || options.codexSpeedIdentity !== codexCatalogIdentity(account, identity))) {
+    throw localError('Ultrafast capability changed; refresh capabilities or choose Standard', 'POOL_CODEX_SPEED_UNAVAILABLE');
+  }
+  // Official rust-v0.160.1 responses_metadata.rs: the JSON-string blob is the
+  // canonical snapshot; body string projections and headers must agree with it.
+  // Classification uses structured purpose/session provenance, never prompt text.
+  const provenance = snapshotCodexSessionContext(options.codexSessionContext);
+  const title = options.purpose === 'session-title';
+  // Reject conflicting purpose/session ownership instead of guessing another
+  // task's origin. The companion itself never adds a generic sessionId.
+  const review = snapshotCodexRequestProvenance(options.codexRequestProvenance, options);
+  const compaction = !review && options.purpose === 'compaction';
+  const child = provenance.known === true && provenance.origin === 'subagent';
+  const turnSeed = review?.requestId ?? (!title && !compaction ? provenance.turnId : undefined)
+    ?? (nonblank(options.codexTurnId) ? options.codexTurnId : randomUUID());
+  const scopedId = (session) => uuidFromSeed(JSON.stringify(['dsh-account-pool:codex-cache:v1', account?.id ?? null, accountId, url, session]));
+  // Keep ordinary cache affinity stable across turns and OAuth refreshes. Review
+  // ownership is attribution only, never a durable prompt-cache/sticky session.
+  const cacheKey = !review && nonblank(options.sessionId) ? scopedId(options.sessionId) : undefined;
+  const root = provenance.known === true ? provenance.rootSessionId : undefined;
+  const metadata = {
+    installation_id: uuidFromSeed(JSON.stringify(['dsh-account-pool:codex-installation:v1', account?.id ?? null, accountId, url])),
+    session_id: review ? scopedId(root ?? review.ownerSessionId)
+      : child && root ? scopedId(root) : cacheKey ?? scopedId(turnSeed),
+    thread_id: title ? scopedId(`title:${options.sessionId ?? ''}:${turnSeed}`)
+      : review ? scopedId(JSON.stringify(['review', review.ownerSessionId, review.requestId])) : cacheKey ?? scopedId(turnSeed),
+    turn_id: uuidFromSeed(JSON.stringify(['dsh-account-pool:codex-turn:v1', account?.id ?? null, accountId, url,
+      review ? review.ownerSessionId : options.sessionId ?? null, turnSeed, review ? 'auto-review' : options.purpose ?? 'turn'])),
+    request_kind: compaction ? 'compaction' : 'turn',
+    ...(title ? { thread_source: 'thread_title' } : review ? { thread_source: 'guardian_review' }
+      : provenance.known === true ? { thread_source: child ? 'subagent' : 'user' } : {}),
+    ...(!title && !review && child ? { subagent_kind: 'thread_spawn' } : {}),
+    ...(review ? { parent_thread_id: scopedId(review.ownerSessionId) }
+      : !title && child && provenance.parentSessionId ? { parent_thread_id: scopedId(provenance.parentSessionId) } : {}),
+  };
+  metadata.window_id = `${metadata.thread_id}:0`;
+  const metadataJson = JSON.stringify(metadata);
+  // Internal Guardian has its own header, but no Codex subagent_kind variant.
+  const subagent = review ? 'guardian' : !title && child ? 'collab_spawn' : undefined;
+  const clientMetadata = {
+    'x-codex-installation-id': metadata.installation_id,
+    session_id: metadata.session_id,
+    thread_id: metadata.thread_id,
+    turn_id: metadata.turn_id,
+    'x-codex-window-id': metadata.window_id,
+    'x-codex-turn-metadata': metadataJson,
+    ...(subagent ? { 'x-openai-subagent': subagent } : {}),
+    ...(metadata.parent_thread_id ? { 'x-codex-parent-thread-id': metadata.parent_thread_id } : {}),
+  };
   if (typeof options.model !== 'string' || options.model.trim() === '') throw localError('Codex requires a model');
   if (options.system !== undefined && typeof options.system !== 'string') throw localError('Codex system instructions must be text');
   if (options.messages !== undefined && !Array.isArray(options.messages)) throw localError('Codex messages must be an array');
   if (options.tools !== undefined && !Array.isArray(options.tools)) throw localError('Codex tools must be an array');
+  const compactionV2 = compaction && options.codexCompactionV2 === true;
+  if (compactionV2 && encryptedCompaction !== true) throw compactionError('POOL_CODEX_COMPACTION_DISABLED');
+  const context = {
+    scope: (options.purpose === undefined || compactionV2) && !review
+      ? codexReplayScope(account, bundle, accountId, url, options.model, options.sessionId) : undefined,
+    replayCodec,
+    compactionV2,
+    signal: options.signal,
+    attribution: summarizeCodexAttribution(metadata, provenance, options.sessionId),
+  };
+  if (compactionV2 && (!context.scope || !replayCodec)) throw compactionError('POOL_CODEX_REPLAY_KEY_UNAVAILABLE');
+  const messages = expandCodexCompactionMessages(options.messages ?? [], { context, enabled: encryptedCompaction === true,
+    resolveCompactionHistory, options });
   const names = (options.tools ?? []).map((tool) => tool?.name);
-  for (const message of options.messages ?? []) {
+  for (const message of messages) {
     if (message?.role !== 'assistant') continue;
     for (const part of contentParts(message.content, true)) if (part.type === 'tool-call') names.push(part.name);
   }
+  Object.assign(context, toolNames(names));
   const instructions = options.system ? [options.system] : [];
-  const context = { scope: fingerprint(JSON.stringify([account?.id ?? null, accountId, fingerprint(token), url, options.model.trim()])), ...toolNames(names) };
   const input = [];
-  const restoredReasoning = new Set();
-  for (const message of options.messages ?? []) {
+  const replays = new Map();
+  let replayBytes = encryptedCompaction === true ? messages.reduce((total, message) => {
+    const compacted = openCodexCompaction(context, message);
+    return total + (compacted ? Buffer.byteLength(JSON.stringify(compacted)) : 0);
+  }, 0) : 0;
+  // Under the request budget prefer recent complete responses, not the oldest
+  // ones. Never truncate a reasoning item or resurrect history removed by DSH.
+  for (let index = messages.length - 1; index >= 0 && replayBytes < MAX_CODEX_REQUEST_REPLAY_BYTES; index--) {
+    const message = messages[index];
+    if (message?.role !== 'assistant') continue;
+    const replay = openCodexReplay(context, message, contentParts(message.content, true));
+    if (replay && replayBytes + replay.bytes <= MAX_CODEX_REQUEST_REPLAY_BYTES) {
+      replays.set(index, replay);
+      replayBytes += replay.bytes;
+    }
+  }
+  for (const [messageIndex, message] of messages.entries()) {
+    const compacted = encryptedCompaction === true ? openCodexCompaction(context, message) : undefined;
+    if (compacted) { input.push(...compacted); continue; }
     const role = message?.role;
     if (role === 'tool') {
-      input.push({ type: 'function_call_output', call_id: callId(message.toolCallId), output: contentParts(message.content).map((part) => part.text).join('') });
+      const parts = contentParts(message.content, false, true);
+      // Codex natively accepts ordered multimodal function outputs. Keep images
+      // attached to their call, not a synthetic user message, and preserve the
+      // existing string wire format for text-only tools and continuation caches.
+      const output = parts.some((part) => part.type === 'image')
+        ? parts.map((part) => part.type === 'image' ? imagePart(part) : { type: 'input_text', text: part.text })
+        : parts.map((part) => part.text).join('');
+      input.push({ type: 'function_call_output', call_id: callId(message.toolCallId), output });
       continue;
     }
     if (!['user', 'assistant', 'system', 'developer'].includes(role)) throw localError('Codex received an unsupported message role');
@@ -249,7 +378,15 @@ export function buildCodexRequest(account, options = {}, credentialBundle) {
       if (text !== '') instructions.push(text);
       continue;
     }
+    if (role === 'assistant') {
+      const replay = replays.get(messageIndex);
+      if (replay) {
+        for (const item of replayInput(replay.plan, parts, context)) input.push(item);
+        continue;
+      }
+    }
     // Keep user text/images in one ordered message, and split at assistant calls.
+    // Missing/foreign/edited replay always keeps provider-neutral content.
     let content = [];
     const flushText = () => {
       if (content.length) input.push({ type: 'message', role, content });
@@ -268,27 +405,29 @@ export function buildCodexRequest(account, options = {}, credentialBundle) {
       flushText();
       if (typeof part.name !== 'string' || part.name.trim() === '') throw localError('Codex function calls require a name');
       const args = argumentText(part.arguments);
-      const cached = continuationGet(part.id, context.scope);
-      if (cached?.name === part.name && cached.arguments === args) {
-        for (const reasoning of cached.reasoning) {
-          const key = fingerprint(JSON.stringify(reasoning));
-          if (restoredReasoning.has(key)) continue;
-          restoredReasoning.add(key);
-          input.push(clone(reasoning));
-        }
-      }
       input.push({ type: 'function_call', call_id: callId(part.id), name: context.originalToWire.get(part.name), arguments: args });
     }
     flushText();
   }
+  if (compactionV2) {
+    // Like native v2, user inputs remain explicit before the compaction item;
+    // replacing them with ciphertext alone would lose the retained user context.
+    // Keep them sealed locally with the checkpoint (including resolved images).
+    // If this whole payload exceeds the AEAD bound, fail back to text compaction
+    // rather than silently dropping/truncating user instructions.
+    context.compactionRetainedInput = structuredClone(input.filter(item => item.type === 'message' && item.role === 'user'));
+    input.push({ type: 'compaction_trigger' });
+  }
   const body = {
     model: options.model.trim(),
+    ...(serviceTier ? { service_tier: serviceTier } : {}),
     store: false,
     stream: true,
     instructions: instructions.join('\n\n') || 'You are a helpful coding assistant.',
     input,
     include: ['reasoning.encrypted_content'],
     ...(cacheKey ? { prompt_cache_key: cacheKey } : {}),
+    client_metadata: clientMetadata,
   };
   const effort = options.reasoningEffort;
   if (effort !== undefined && effort !== '' && effort !== 'off') {
@@ -314,10 +453,18 @@ export function buildCodexRequest(account, options = {}, credentialBundle) {
         authorization: `Bearer ${token}`,
         'chatgpt-account-id': accountId,
         'openai-beta': 'responses=experimental',
+        ...(encryptedCompaction === true ? { 'x-codex-beta-features': 'remote_compaction_v2' } : {}),
         originator: 'codex_cli_rs',
         'user-agent': `codex_cli_rs/${CLIENT_VERSION}`,
         version: CLIENT_VERSION,
+        ...(serviceTier ? { 'x-codex-routing-hint': `model=${body.model};tier=${serviceTier}` } : {}),
         ...(cacheKey ? { session_id: cacheKey } : {}),
+        'session-id': metadata.session_id,
+        'thread-id': metadata.thread_id,
+        'x-codex-window-id': metadata.window_id,
+        'x-codex-turn-metadata': metadataJson,
+        ...(subagent ? { 'x-openai-subagent': subagent } : {}),
+        ...(metadata.parent_thread_id ? { 'x-codex-parent-thread-id': metadata.parent_thread_id } : {}),
       },
       body: JSON.stringify(body),
     },
@@ -349,6 +496,35 @@ function streamError(kind, event = {}) {
 
 function count(value) { return Number.isFinite(value) && value >= 0 ? value : 0; }
 
+/** Same canonical shape for persisted replay and an in-memory WS continuation baseline. */
+function replayInput(plan, parts, context) {
+  return plan.map(entry => {
+    if (entry.type === 'reasoning') {
+      // store:false HTTP replay cannot dereference provider ids. Preserve order.
+      return { type: 'reasoning', encrypted_content: entry.encrypted_content, summary: [] };
+    }
+    if (entry.type === 'message') return { type: 'message', role: 'assistant',
+      content: entry.blocks.map(index => ({ type: 'output_text', text: parts[index].text })),
+      ...(entry.phase ? { phase: entry.phase } : {}) };
+    const part = parts[entry.block];
+    return { type: 'function_call', call_id: callId(part.id),
+      name: context.originalToWire.get(part.name), arguments: argumentText(part.arguments) };
+  });
+}
+
+// Never put response ids or plaintext replay on public DSH chunks/context serialization.
+// A baseline is usable only when the same output can be durably replayed next turn.
+const continuationOutputs = new WeakMap();
+const continuationCallIds = new WeakMap();
+export function getCodexContinuationOutput(context) {
+  const output = context && continuationOutputs.get(context);
+  return output === undefined ? undefined : structuredClone(output);
+}
+export function getCodexContinuationCallIds(context) {
+  const ids = context && continuationCallIds.get(context);
+  return ids === undefined ? undefined : structuredClone(ids);
+}
+
 /**
  * Async StreamChunk mapper. `body` is a ReadableStream<Uint8Array> and
  * `parseSse(body)` must yield data-field strings and cancel/release on return.
@@ -356,14 +532,19 @@ function count(value) { return Number.isFinite(value) && value >= 0 ? value : 0;
  * It emits usage + finish, matching upstream.js; failure/incomplete/[DONE]/EOF
  * without a successful terminal event throws with status and code for failover.
  * Reasoning content is intentionally omitted from public chunks; reasoning token
- * usage is retained. Optional builder context enables a private bounded cache
- * scoped to account, token fingerprint, model and endpoint for tool replay.
+ * usage is retained. Successful terminal replay is locally sealed and persisted
+ * by DSH, bound to account/principal/workspaces/model/endpoint/session. No global
+ * tool cache or age-based eviction; failed/cancelled streams never emit replay.
  */
 export async function* mapCodex(body, parseSse, context) {
   if (typeof parseSse !== 'function') throw new TypeError('mapCodex requires an SSE parser');
+  if (context?.compactionV2) { yield* mapCodexCompaction(body, parseSse, context, streamError); return; }
   const blocks = new Map();
   const aliases = new Map();
   const nativeOutput = new Map();
+  const publicOrder = [];
+  if (context) { continuationOutputs.delete(context); continuationCallIds.delete(context); }
+  let continuationCompatible = true;
   let nextIndex = 0;
   let hasTools = false;
 
@@ -413,6 +594,7 @@ export async function* mapCodex(body, parseSse, context) {
     if (state.started) return;
     if (state.block.type === 'tool-call' && (!state.block.id || !state.block.name)) return;
     state.started = true;
+    publicOrder.push(state);
     yield { type: 'block-start', index: state.index, blockType: state.block.type };
     if (state.pending) {
       for (const delta of state.pending) yield { type: 'tool-call-delta', index: state.index, id: state.block.id, argumentsDelta: delta };
@@ -450,7 +632,10 @@ export async function* mapCodex(body, parseSse, context) {
     if (!item || typeof item !== 'object') throw streamError('CODEX_INVALID_STREAM');
     const key = itemKey(event);
     if (done && item.status !== undefined && item.status !== 'completed') throw streamError('CODEX_INCOMPLETE_OUTPUT');
-    if (done && context?.scope && (item.type === 'reasoning' || item.type === 'function_call')) {
+    if (!['reasoning', 'function_call', 'message'].includes(item.type)
+      || done && item.type === 'reasoning' && !nonblank(item.encrypted_content)
+      || item.type === 'message' && Array.isArray(item.content) && item.content.some(part => part?.type !== 'output_text')) continuationCompatible = false;
+    if (done && context?.scope && context.replayCodec && ['reasoning', 'function_call', 'message'].includes(item.type)) {
       const previous = nativeOutput.get(key);
       nativeOutput.set(key, { item, order: event.output_index ?? previous?.order ?? nativeOutput.size });
     }
@@ -521,17 +706,51 @@ export async function* mapCodex(body, parseSse, context) {
         if (response.output !== undefined && !Array.isArray(response.output)) throw streamError('CODEX_INVALID_TERMINAL');
         for (const [output_index, item] of (response.output ?? []).entries()) yield* outputItem({ output_index, item }, true);
         for (const state of blocks.values()) yield* close(state);
-        if (context?.scope) {
-          const reasoning = [];
-          for (const { item } of [...nativeOutput.values()].sort((a, b) => a.order - b.order)) {
-            if (item.type === 'reasoning' && typeof item.encrypted_content === 'string' && item.encrypted_content !== '') {
-              // store:false cannot resolve rs_* ids. The reference strips both
-              // id/call_id and backfills required summary before replay.
-              const { id, call_id, ...replay } = item;
-              replay.summary = Array.isArray(replay.summary) ? replay.summary : [];
-              reasoning.push(replay);
-            } else if (item.type === 'function_call' && reasoning.length > 0) {
-              continuationPut(item.call_id, context.scope, { name: context.wireToOriginal?.get(item.name) ?? item.name, arguments: item.arguments ?? '', reasoning });
+        let replayState;
+        if (context?.scope && context.replayCodec) {
+          const positions = new Map(publicOrder.map((state, index) => [state, index]));
+          const plan = [];
+          const covered = new Set();
+          let valid = true;
+          for (const [key, { item }] of [...nativeOutput.entries()].sort((a, b) => a[1].order - b[1].order)) {
+            if (item.type === 'reasoning') {
+              if (typeof item.encrypted_content === 'string' && item.encrypted_content !== '') {
+                // No provider id, summary plaintext, token or tool-argument copy.
+                plan.push({ type: 'reasoning', encrypted_content: item.encrypted_content });
+              }
+            } else if (item.type === 'function_call') {
+              const position = positions.get(blocks.get(`${key}:tool`));
+              if (position === undefined || covered.has(position)) { valid = false; break; }
+              covered.add(position);
+              plan.push({ type: 'function_call', block: position });
+            } else {
+              const indexes = [];
+              for (const [content_index, part] of (item.content ?? []).entries()) {
+                if (part.type !== 'output_text' && part.type !== 'refusal') continue;
+                const position = positions.get(blocks.get(`${key}:text:${content_index}`));
+                if (position === undefined || covered.has(position)) { valid = false; break; }
+                covered.add(position);
+                indexes.push(position);
+              }
+              if (item.phase !== undefined && !['commentary', 'final_answer'].includes(item.phase)) valid = false;
+              if (!valid) break;
+              if (indexes.length) plan.push({ type: 'message', blocks: indexes, ...(item.phase ? { phase: item.phase } : {}) });
+            }
+          }
+          if (valid && covered.size === publicOrder.length) {
+            const parts = publicOrder.map(state => state.block);
+            replayState = sealCodexReplay(context, parts, plan);
+            if (replayState && continuationCompatible) {
+              const callIds = new Map();
+              for (const { item } of nativeOutput.values()) if (item.type === 'function_call') {
+                const normalized = callId(item.call_id);
+                if (callIds.has(normalized) && callIds.get(normalized) !== item.call_id) continuationCompatible = false;
+                callIds.set(normalized, item.call_id);
+              }
+              if (continuationCompatible) {
+                continuationOutputs.set(context, replayInput(plan, parts, context));
+                continuationCallIds.set(context, callIds);
+              }
             }
           }
         }
@@ -545,7 +764,7 @@ export async function* mapCodex(body, parseSse, context) {
           cacheWriteTokens: 0,
           reasoningTokens: count(usage.output_tokens_details?.reasoning_tokens),
         } };
-        yield { type: 'finish', reason: { kind: hasTools ? 'tool-calls' : 'stop' } };
+        yield { type: 'finish', reason: { kind: hasTools ? 'tool-calls' : 'stop' }, ...(replayState ? { replayState } : {}) };
         return;
       }
       default: break; // created/in_progress, reasoning, annotations and metadata

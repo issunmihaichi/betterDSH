@@ -8,6 +8,7 @@
  *   node tools/client-test.mjs
  */
 import fs from 'node:fs';
+import { accountSchema } from '../lib/domain.js';
 
 let checks = 0;
 let passed = 0;
@@ -1873,6 +1874,193 @@ if (prioBody.group !== undefined) {
   eq(saved.openaiApi,'responses','untouched edit preserves saved request format');eq(saved.openaiTransport,'websocket','untouched edit preserves saved transport');
   ACCOUNTS_BODY.accounts[0]=original;delete ACCOUNTS_BODY.openaiProtocolVersion;
 }
+// ------------------------------------------------- capability-gated native Codex transport (real save payloads)
+{
+  const originalAccounts = ACCOUNTS_BODY.accounts;
+  const originalCodexVersion = ACCOUNTS_BODY.codexWebSocketVersion;
+  const originalProtocolVersion = ACCOUNTS_BODY.openaiProtocolVersion;
+  const originalFetch = globalThis.fetch;
+  const view = () => render(page.type, page.props);
+  const form = () => nodesIn(view(), 'form')[0];
+  const select = (label) => nodesIn(form(), 'select').find(node => node.props['aria-label'] === label);
+  const choose = (label, value) => select(label).props.onChange({ target: { value } });
+  const submit = () => form().props.onSubmit(new Event('submit', { cancelable: true }));
+  const codex = { ...originalAccounts[0], platform: 'openai', authMode: 'oauth', groups: [], openaiApi: 'chat-completions', openaiTransport: 'websocket' };
+  async function open({ account = codex, codexVersion = 1, protocolVersion = 1, create = false } = {}) {
+    ACCOUNTS_BODY.accounts = [account, { ...codex, id: 'second-codex', label: 'Second Codex', openaiTransport: 'http' }];
+    if (codexVersion === null) delete ACCOUNTS_BODY.codexWebSocketVersion; else ACCOUNTS_BODY.codexWebSocketVersion = codexVersion;
+    if (protocolVersion === null) delete ACCOUNTS_BODY.openaiProtocolVersion; else ACCOUNTS_BODY.openaiProtocolVersion = protocolVersion;
+    const state = await renderState(page, 'ready');
+    const readyFetch = globalThis.fetch;
+    const requests = [];
+    let respond = (body) => Response.json({ ok: true, account: { id: body.id } });
+    globalThis.fetch = async (url, init) => {
+      if (init?.method !== 'POST') return readyFetch(url, init);
+      const request = new Request(new URL(String(url), 'http://offline.invalid/'), init);
+      const body = await request.json();
+      requests.push({ request, body });
+      return respond(body);
+    };
+    buttonsLabelled(state.tree, create ? '新增账号' : '编辑')[0].props.onClick();
+    if (create) {
+      inputsIn(form()).find(node => node.props['aria-label'] === 'ID（唯一，创建后不可改）').props.onChange({ target: { value: 'new-codex' } });
+      choose('平台', 'openai');
+      choose('凭据类型', 'oauth');
+    }
+    return { requests, respondWith: (fn) => { respond = fn; } };
+  }
+  function assertPayload(state, expected, label) {
+    const sent = state.requests.at(-1);
+    eq(sent?.request.url, 'http://offline.invalid/api/accountPool.account', `${label}: account write route`);
+    eq(sent?.request.bodyUsed, true, `${label}: consumes a real Request body once`);
+    const body = sent?.body;
+    eq(Object.fromEntries(Object.keys(expected).map(key => [key, body?.account[key]])), expected, label);
+    eq('credential' in body, false, `${label}: leaves untouched write-only credentials out`);
+    ok(!('codexWebSocketVersion' in body.account), `${label}: capability is not an account setting`);
+    const parsed = accountSchema.safeParse({ id: body.id, createdAt: new Date(NOW).toISOString(), updatedAt: new Date(NOW).toISOString(), ...body.account });
+    ok(parsed.success, `${label}: submitted fields satisfy the durable schema`, parsed.error?.message);
+  }
+  try {
+    // The new capability is separate from generic API-key Responses support.
+    for (const codexVersion of [null, 0]) {
+      for (const protocolVersion of [null, 1]) {
+        const state = await open({ codexVersion, protocolVersion });
+        eq(select('传输方式'), undefined, 'old host never exposes Codex WS without its capability');
+        eq(select('请求格式'), undefined, 'OAuth never exposes a generic API format even on old hosts');
+        await submit();
+        const saved = state.requests[0].body.account;
+        if (protocolVersion === 1) eq([saved.openaiApi, saved.openaiTransport], ['chat-completions', 'http'], 'generic-only host never receives unsupported OAuth WS');
+        else ok(!('openaiApi' in saved) && !('openaiTransport' in saved), 'legacy host receives no unsupported protocol fields');
+      }
+    }
+    for (const version of [1, 2]) {
+      const state = await open({ codexVersion: version, protocolVersion: null, create: true });
+      eq(select('传输方式').props.value, 'http', 'new OAuth accounts retain HTTP as the default');
+      eq(select('请求格式'), undefined, 'Codex-only capability exposes no request format selector');
+      const options = nodesIn(select('传输方式'), 'option');
+      eq(options.map(node => node.props.value), ['http', 'websocket'], 'Codex transport has exactly HTTP and WebSocket choices');
+      ok(options.every(node => !node.props.disabled), 'Codex WS is selectable without generic Responses');
+      const describedBy = select('传输方式').props['aria-describedby'];
+      const hint = nodesIn(form(), 'span').find(node => node.props.id === describedBy);
+      ok(!!hint && /固定的原生端点/.test(rawText(hint)) && /连接复用/.test(rawText(hint)) && /增量续接/.test(rawText(hint)) && /回退到 HTTP/.test(rawText(hint)), 'accessible Codex hint explains native endpoint, reuse, incremental continuation and HTTP fallback');
+      choose('传输方式', 'websocket');
+      await submit();
+      eq(state.requests[0].body.action, 'create', 'Codex transport creates through the normal account action');
+      eq(state.requests[0].body.id, 'new-codex', 'Codex transport create retains the entered ID');
+      assertPayload(state, { platform: 'openai', authMode: 'oauth', openaiApi: 'chat-completions', openaiTransport: 'websocket' }, 'new native Codex WS save');
+    }
+    {
+      const state = await open({ account: { ...codex, authMode: 'api-key', openaiApi: 'responses' }, protocolVersion: null });
+      eq(select('请求格式'), undefined, 'Codex capability alone does not expose generic API-key format');
+      eq(select('传输方式'), undefined, 'Codex capability alone does not expose generic API-key transport');
+      await submit();
+      const saved = state.requests[0].body.account;
+      ok(!('openaiApi' in saved) && !('openaiTransport' in saved), 'Codex-only capability does not rewrite hidden generic API-key configuration');
+    }
+    {
+      const state = await open({ account: { ...codex, authMode: 'api-key', openaiApi: 'responses' }, codexVersion: null });
+      choose('凭据类型', 'oauth');
+      eq(select('传输方式'), undefined, 'switching generic WS to OAuth on an old host still hides native transport');
+      await submit();
+      assertPayload(state, { authMode: 'oauth', openaiApi: 'chat-completions', openaiTransport: 'http' }, 'old host generic WS to OAuth normalizes unsupported fields');
+    }
+    {
+      const state = await open({ protocolVersion: null });
+      choose('平台', 'gemini');
+      await submit();
+      assertPayload(state, { platform: 'gemini', authMode: 'oauth', openaiApi: 'chat-completions', openaiTransport: 'http' }, 'Codex-only host clears native WS when moving away from Codex');
+    }
+    for (const openaiApi of ['chat-completions', 'responses']) {
+      const state = await open({ account: { ...codex, openaiApi } });
+      eq(select('传输方式').props.value, 'websocket', 'editing either historical API value preserves native WS selection');
+      inputsIn(form()).find(node => node.props['aria-label'] === '标签').props.onChange({ target: { value: 'edited-codex' } });
+      await submit();
+      eq(state.requests[0].body.action, 'update', 'existing Codex WS uses update');
+      assertPayload(state, { label: 'edited-codex', openaiApi: 'chat-completions', openaiTransport: 'websocket' }, 'unrelated edits retain native Codex WS');
+    }
+    {
+      const legacy = { ...codex }; delete legacy.openaiTransport; delete legacy.openaiApi;
+      const state = await open({ account: legacy });
+      eq(select('传输方式').props.value, 'http', 'legacy OAuth row missing transport loads as HTTP');
+      await submit();
+      assertPayload(state, { openaiApi: 'chat-completions', openaiTransport: 'http' }, 'untouched legacy OAuth save stays HTTP');
+    }
+    for (const platform of ['anthropic', 'gemini', 'grok', 'custom']) {
+      const state = await open({ account: { ...codex, platform, openaiTransport: 'http' } });
+      eq(select('传输方式'), undefined, `${platform} OAuth never exposes Codex transport`);
+      eq(select('请求格式'), undefined, `${platform} OAuth never exposes generic request format`);
+      await submit();
+      assertPayload(state, { platform, authMode: 'oauth', openaiApi: 'chat-completions', openaiTransport: 'http' }, `${platform} OAuth stays HTTP`);
+    }
+    const transitions = [
+      { name: 'OAuth WS to API key', changes: [['凭据类型', 'api-key']], expected: { platform: 'openai', authMode: 'api-key', openaiApi: 'chat-completions', openaiTransport: 'http' } },
+      { name: 'OAuth WS to another OAuth provider', changes: [['平台', 'grok']], expected: { platform: 'grok', authMode: 'oauth', openaiApi: 'chat-completions', openaiTransport: 'http' } },
+      { name: 'returning from incompatible provider never resurrects WS', changes: [['平台', 'gemini'], ['平台', 'openai']], expected: { platform: 'openai', authMode: 'oauth', openaiApi: 'chat-completions', openaiTransport: 'http' } },
+      { name: 'API-key Responses WS to Codex', account: { ...codex, authMode: 'api-key', openaiApi: 'responses' }, changes: [['凭据类型', 'oauth']], expected: { platform: 'openai', authMode: 'oauth', openaiApi: 'chat-completions', openaiTransport: 'websocket' } },
+      { name: 'API-key Responses WS to incompatible platform', account: { ...codex, authMode: 'api-key', openaiApi: 'responses' }, changes: [['平台', 'anthropic']], expected: { platform: 'anthropic', authMode: 'api-key', openaiApi: 'chat-completions', openaiTransport: 'http' } },
+      { name: 'API-key compatible provider preserves generic Responses WS', account: { ...codex, authMode: 'api-key', openaiApi: 'responses' }, changes: [['平台', 'custom']], expected: { platform: 'custom', authMode: 'api-key', openaiApi: 'responses', openaiTransport: 'websocket' } },
+      { name: 'Codex to generic Responses WS remains explicitly selectable', changes: [['凭据类型', 'api-key'], ['请求格式', 'responses'], ['传输方式', 'websocket']], expected: { platform: 'openai', authMode: 'api-key', openaiApi: 'responses', openaiTransport: 'websocket' } },
+      { name: 'switching off native WS stays HTTP', changes: [['传输方式', 'http']], expected: { platform: 'openai', authMode: 'oauth', openaiApi: 'chat-completions', openaiTransport: 'http' } },
+    ];
+    for (const scenario of transitions) {
+      const state = await open({ account: scenario.account ?? codex });
+      for (const [label, value] of scenario.changes) choose(label, value);
+      if (scenario.expected.authMode === 'api-key' && scenario.expected.platform === 'openai' && scenario.expected.openaiApi === 'chat-completions') {
+        eq(nodesIn(select('传输方式'), 'option').find(node => node.props.value === 'websocket').props.disabled, true, 'switching to generic Chat Completions disables WS');
+      }
+      if (select('传输方式')) eq(select('传输方式').props.value, scenario.expected.openaiTransport, `${scenario.name}: visible draft is normalized before save`);
+      await submit();
+      assertPayload(state, scenario.expected, scenario.name);
+    }
+    {
+      const state = await open();
+      let reject;
+      state.respondWith(() => new Promise((_resolve, fail) => { reject = fail; }));
+      const saving = submit();
+      eq(await submit(), false, 'Codex WS same-turn duplicate save is refused');
+      await settle();
+      eq(state.requests.length, 1, 'Codex WS pending save emits one real POST');
+      for (const label of ['传输方式', '平台', '凭据类型']) eq(select(label).props.disabled, true, `${label} is disabled during the native transport save`);
+      eq(buttonsLabelled(form(), '保存中…')[0]?.props.disabled, true, 'native transport save announces and disables pending Save');
+      eq(buttonsLabelled(form(), '取消')[0].props.disabled, true, 'native transport save disables Cancel while committing');
+      reject(new Error('fixture delayed Codex rejection'));
+      eq(await saving, false, 'delayed transport save rejection is not reported as success');
+      eq(select('传输方式').props.value, 'websocket', 'delayed failure keeps selected native WS for correction');
+      eq(select('传输方式').props.disabled, false, 'delayed failure unlocks native transport');
+      ok(nodesIn(form(), 'div').some(node => node.props.role === 'alert' && rawText(node).includes('fixture delayed Codex rejection')), 'native transport save error is announced within the still-open editor');
+      state.respondWith(() => { throw new Error('fixture immediate Codex rejection'); });
+      eq(await submit(), false, 'immediate transport save rejection stays in the editor');
+      eq(select('传输方式').props.value, 'websocket', 'immediate failure preserves native WS too');
+      state.respondWith(() => Response.json({ error: { message: 'fixture backend transport validation' } }, { status: 400 }));
+      eq(await submit(), false, 'backend transport rejection never closes the editor');
+      ok(textOf(form()).includes('fixture backend transport validation'), 'backend rejection remains visible for retry');
+      choose('传输方式', 'http');
+      state.respondWith(body => Response.json({ ok: true, account: { id: body.id } }));
+      eq(await submit(), true, 'corrected native transport can be saved after both rejection paths');
+      assertPayload(state, { openaiApi: 'chat-completions', openaiTransport: 'http' }, 'corrected transport retry sends current selection');
+      eq(nodesIn(view(), 'form').length, 0, 'successful native transport retry closes only the finished editor');
+    }
+    {
+      const state = await open();
+      const queuedEdit = buttonsLabelled(view(), '编辑')[1];
+      let resolve;
+      state.respondWith(() => new Promise(done => { resolve = done; }));
+      const oldSave = submit(); await settle();
+      queuedEdit.props.onClick();
+      eq(select('传输方式').props.value, 'http', 'a different editor gets its own transport draft');
+      resolve(Response.json({ ok: true, account: { id: codex.id } }));
+      eq(await oldSave, false, 'late native WS save never completes a replacement editor');
+      eq(select('传输方式').props.value, 'http', 'late native WS completion does not leak its selection into another account');
+      eq(state.requests.length, 1, 'switching editors cannot cause a second concurrent transport write');
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    ACCOUNTS_BODY.accounts = originalAccounts;
+    if (originalCodexVersion === undefined) delete ACCOUNTS_BODY.codexWebSocketVersion; else ACCOUNTS_BODY.codexWebSocketVersion = originalCodexVersion;
+    if (originalProtocolVersion === undefined) delete ACCOUNTS_BODY.openaiProtocolVersion; else ACCOUNTS_BODY.openaiProtocolVersion = originalProtocolVersion;
+  }
+}
+
 // ------------------------------------------------- account-level pool detection retries
 {
   const previousVersion=ACCOUNTS_BODY.detectionVersion;
@@ -1954,6 +2142,505 @@ if (prioBody.group !== undefined) {
     if(previousVersion===undefined)delete ACCOUNTS_BODY.detectionVersion;else ACCOUNTS_BODY.detectionVersion=previousVersion;
   }
 }
+// ------------------------------------------------- read recovery and mutation lifecycle
+{
+  const state = await renderState(page, 'ready');
+  buttonsLabelled(state.tree, '编辑')[0].props.onClick();
+  let tree = render(page.type, page.props);
+  inputsIn(tree).find(n => n.props['aria-label'] === '标签').props.onChange({ target: { value: 'unsaved-label' } });
+  inputsIn(render(page.type, page.props)).find(n => n.props.type === 'password').props.onChange({ target: { value: 'unsaved-secret' } });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => String(url) === 'api/accountPool.accounts'
+    ? { ok: false, status: 503, json: async () => ({ error: { message: 'refresh unavailable' } }) }
+    : originalFetch(url, init);
+  buttonsLabelled(render(page.type, page.props), '刷新')[0].props.onClick();
+  render(page.type, page.props); await sweep();
+  tree = render(page.type, page.props);
+  ok(textOf(tree).includes('仍显示上次成功读取的数据'), 'failed refresh is explicitly stale rather than a first-load error');
+  ok(textOf(tree).includes('refresh unavailable'), 'failed refresh preserves the Host diagnostic');
+  eq(inputsIn(tree).find(n => n.props['aria-label'] === '标签').props.value, 'unsaved-label', 'failed account refresh preserves mounted editor draft');
+  eq(inputsIn(tree).find(n => n.props.type === 'password').props.value, 'unsaved-secret', 'failed account refresh does not discard the write-only credential draft');
+  globalThis.fetch = originalFetch;
+  buttonsLabelled(tree, '重新读取')[0].props.onClick(); render(page.type, page.props); await sweep();
+  tree = render(page.type, page.props);
+  ok(!textOf(tree).includes('refresh unavailable'), 'a successful retry clears stale diagnostics');
+  eq(inputsIn(tree).find(n => n.props['aria-label'] === '标签').props.value, 'unsaved-label', 'successful retry also retains the editor draft');
+}
+{
+  const stub = makeFetch('ready'); remount();
+  globalThis.fetch = async (url, init) => String(url) === 'api/accountPool.oauth'
+    ? { ok: false, status: 503, json: async () => ({ error: { message: 'oauth directory unavailable' } }) }
+    : stub.impl(url, init);
+  render(page.type, page.props); await sweep();
+  buttonsLabelled(render(page.type, page.props), 'OAuth 登录')[0].props.onClick();
+  let tree = render(page.type, page.props);
+  ok(textOf(tree).includes('无法读取 OAuth 提供商'), 'OAuth directory failure is not reported as an empty provider list');
+  ok(textOf(tree).includes('oauth directory unavailable'), 'OAuth directory failure shows the original diagnostic');
+  globalThis.fetch = stub.impl;
+  buttonsLabelled(tree, '重新读取')[0].props.onClick(); render(page.type, page.props); await sweep();
+  tree = render(page.type, page.props);
+  eq(buttonsLabelled(tree, '开始登录')[0].props.disabled, false, 'independent OAuth directory retry restores a usable picker');
+  const before = stub.calls.filter(call => call.url === 'api/accountPool.oauth').length;
+  buttonsLabelled(tree, '刷新')[0].props.onClick(); render(page.type, page.props); await sweep();
+  eq(stub.calls.filter(call => call.url === 'api/accountPool.oauth').length, before + 1, 'page refresh also refreshes the OAuth directory');
+}
+{
+  const stub = makeFetch('ready'); remount(); let release; let signal;
+  globalThis.fetch = (url, init) => String(url) === 'api/accountPool.oauth'
+    ? new Promise(resolve => { release = resolve; signal = init.signal; }) : stub.impl(url, init);
+  render(page.type, page.props); await sweep();
+  buttonsLabelled(render(page.type, page.props), 'OAuth 登录')[0].props.onClick();
+  const tree = render(page.type, page.props);
+  ok(textOf(tree).includes('正在读取 OAuth 提供商'), 'pending OAuth directory has a distinct loading state');
+  eq(buttonsLabelled(tree, '开始登录').length, 0, 'loading never mounts a picker with an empty initial selection');
+  remount(); eq(signal.aborted, true, 'unmount aborts outstanding directory reads');
+  release({ ok: true, status: 200, json: async () => OAUTH_BODY }); await sweep();
+}
+{
+  const state = await renderState(page, 'ready'); const originalFetch = globalThis.fetch;
+  let release; const writes = [];
+  globalThis.fetch = (url, init) => init?.method === 'POST'
+    ? new Promise(resolve => { writes.push(JSON.parse(init.body)); release = resolve; }) : originalFetch(url, init);
+  const button = buttonsLabelled(state.tree, '停用')[0];
+  const first = button.props.onClick(); const second = button.props.onClick();
+  eq(writes.length, 1, 'same-turn duplicate action is blocked before React renders disabled buttons');
+  eq(await second, false, 'duplicate action resolves without dispatching');
+  remount(); const before = state.calls.length;
+  release({ ok: true, status: 200, json: async () => ({ ok: true, action: 'disable' }) });
+  eq(await first, false, 'late mutation success does not update an unmounted page');
+  eq(state.calls.length, before, 'late mutation completion does not start refresh reads after unmount');
+  globalThis.fetch = originalFetch;
+}
+// ------------------------------------------------- acknowledged multi-step editor saves (real HTTP envelopes)
+{
+  const originalGroups = ACCOUNTS_BODY.groups;
+  ACCOUNTS_BODY.groups = [...originalGroups, { id: 'second', label: '第二池', models: [] }];
+  const state = await renderState(page, 'ready');
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    if (init?.method !== 'POST') return originalFetch(url, init);
+    const request = new Request(new URL(String(url), 'http://offline.invalid/'), init);
+    const body = await request.json();
+    return new Promise(resolve => requests.push({ request, body, resolve }));
+  };
+  const change = (node, value) => {
+    const event = new Event('change'); Object.defineProperty(event, 'target', { value: { value } });
+    node.props.onChange(event);
+  };
+  const view = () => render(page.type, page.props);
+  const submit = () => {
+    const event = new Event('submit', { cancelable: true });
+    const promise = nodesIn(view(), 'form')[0].props.onSubmit(event);
+    eq(event.defaultPrevented, true, 'multi-step save uses a cancelled native submit event');
+    return promise;
+  };
+  try {
+    buttonsLabelled(view(), '新增账号')[0].props.onClick();
+    change(inputsIn(view()).find(n => n.props['aria-label'] === 'ID（唯一，创建后不可改）'), ' draft-new ');
+    change(inputsIn(view()).find(n => n.props['aria-label'] === '标签'), 'draft label');
+    inputsIn(view()).filter(n => n.props.className === 'dap-check-group').forEach(n => n.props.onChange());
+    inputsIn(view()).filter(n => n.props.className === 'dap-check-prio').forEach((n, index) => change(n, String(11 + index)));
+    const first = submit();
+    eq(await submit(), false, 'same-turn duplicate form submission is blocked for the entire multi-step save');
+    await sweep();
+    eq(requests.length, 1, 'duplicate form submission never emits a second main write');
+    eq(requests[0].request.method, 'POST', 'save regression uses a real Request envelope');
+    eq(requests[0].body.action, 'create', 'new editor starts with exactly one create');
+    requests[0].resolve(Response.json({ ok: true, account: { id: 'draft-new' } })); await sweep();
+    eq(requests[1].body, { id: 'draft-new', action: 'priority-set', group: 'cheap', priority: 11 }, 'priority writes use the confirmed canonical account ID');
+    requests[1].resolve(Response.json({ ok: true })); await sweep();
+    requests[2].resolve(Response.json({ error: { message: 'second priority refused' } }, { status: 400 }));
+    eq(await first, false, 'a rejected independent priority leaves the save unfinished');
+    let tree = view();
+    ok(textOf(tree).includes('账号 draft-new 已保存'), 'partial save explicitly states that the main account already committed');
+    ok(textOf(tree).includes('second priority refused'), 'partial save keeps the exact rejection for correction');
+    eq(inputsIn(tree).find(n => n.props['aria-label'] === 'ID（唯一，创建后不可改）').props.disabled, true, 'confirmed create locks its saved identity for retries');
+    const retry = submit(); await sweep();
+    eq(requests.length, 4, 'same-draft retry emits only one unfinished priority');
+    eq(requests[3].body, { id: 'draft-new', action: 'priority-set', group: 'second', priority: 12 }, 'retry never repeats create or the acknowledged first priority');
+    requests[3].resolve(Response.json({ ok: true }));
+    eq(await retry, true, 'remaining priority success completes the save');
+    eq(nodesIn(view(), 'form').length, 0, 'the current editor closes after all acknowledged steps');
+  } finally { globalThis.fetch = originalFetch; ACCOUNTS_BODY.groups = originalGroups; }
+}
+{
+  const state = await renderState(page, 'ready'); const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    if (init?.method !== 'POST') return originalFetch(url, init);
+    const request = new Request(new URL(String(url), 'http://offline.invalid/'), init);
+    const body = await request.json();
+    return new Promise(resolve => requests.push({ body, resolve }));
+  };
+  const view = () => render(page.type, page.props);
+  try {
+    buttonsLabelled(view(), '编辑')[0].props.onClick();
+    const oldEditorButton = buttonsLabelled(view(), '编辑')[1];
+    const first = nodesIn(view(), 'form')[0].props.onSubmit(new Event('submit', { cancelable: true })); await sweep();
+    // An event already queued before buttons became disabled can still arrive.
+    oldEditorButton.props.onClick();
+    let tree = view();
+    ok(textOf(tree).includes('编辑账号 a2'), 'a queued editor event opens a distinct account editing session');
+    inputsIn(tree).find(n => n.props['aria-label'] === '标签').props.onChange({ target: { value: 'new editor draft' } });
+    requests[0].resolve(Response.json({ ok: true, account: { id: 'a1' } }));
+    eq(await first, false, 'old save completion does not consume a newly opened editor');
+    tree = view();
+    eq(nodesIn(tree, 'form').length, 1, 'old completion never closes the new editor');
+    eq(inputsIn(tree).find(n => n.props['aria-label'] === '标签').props.value, 'new editor draft', 'old completion preserves the new editor draft');
+    eq(requests.length, 1, 'old completion stops before sending the old editor remaining priorities');
+  } finally { globalThis.fetch = originalFetch; }
+}
+{
+  const state = await renderState(page, 'ready'); const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    if (init?.method !== 'POST') return originalFetch(url, init);
+    const request = new Request(new URL(String(url), 'http://offline.invalid/'), init);
+    const body = await request.json();
+    return new Promise(resolve => requests.push({ body, resolve }));
+  };
+  const view = () => render(page.type, page.props);
+  const submit = () => nodesIn(view(), 'form')[0].props.onSubmit(new Event('submit', { cancelable: true }));
+  try {
+    buttonsLabelled(view(), '新增账号')[0].props.onClick();
+    inputsIn(view()).find(n => n.props['aria-label'] === 'ID（唯一，创建后不可改）').props.onChange({ target: { value: 'created-before-priority' } });
+    inputsIn(view()).find(n => n.props.className === 'dap-check-group').props.onChange();
+    inputsIn(view()).find(n => n.props.className === 'dap-check-prio').props.onChange({ target: { value: '7' } });
+    const first = submit(); await sweep();
+    requests[0].resolve(Response.json({ ok: true, account: { id: 'created-before-priority' } })); await sweep();
+    requests[1].resolve(Response.json({ error: { message: 'priority refused' } }, { status: 400 }));
+    await first;
+    inputsIn(view()).find(n => n.props['aria-label'] === '标签').props.onChange({ target: { value: 'changed-after-create' } });
+    const retry = submit(); await sweep();
+    eq(requests[2].body.action, 'update', 'changed main fields after partial create use update, never create');
+    eq(requests[2].body.id, 'created-before-priority', 'changed-draft retry pins the confirmed account ID');
+    eq(requests[2].body.account.label, 'changed-after-create', 'changed-draft retry sends the corrected account fields');
+    requests[2].resolve(Response.json({ ok: true, account: { id: 'created-before-priority' } })); await sweep();
+    eq(requests[3].body.action, 'priority-set', 'priority retry follows the confirmed update');
+    const queuedEdit = buttonsLabelled(view(), '编辑')[1];
+    queuedEdit.props.onClick();
+    requests[3].resolve(Response.json({ ok: true }));
+    eq(await retry, false, 'late final priority acknowledgement does not finish a replacement editor');
+    ok(textOf(view()).includes('编辑账号 a2'), 'switching during the priority stage preserves the new editor');
+    eq(nodesIn(view(), 'form').length, 1, 'late final priority response never closes the replacement form');
+  } finally { globalThis.fetch = originalFetch; }
+}
+// ------------------------------------------------- named group deletion confirmation
+{
+  const state = await renderState(page, 'ready'); const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    if (init?.method !== 'POST') return originalFetch(url, init);
+    const request = new Request(new URL(String(url), 'http://offline.invalid/'), init);
+    const body = await request.json();
+    return new Promise(resolve => requests.push({ body, resolve }));
+  };
+  const view = () => render(page.type, page.props);
+  const groupPanel = () => nodesIn(view(), 'div').find(n => n.props.id === 'dap-panel-groups');
+  const arm = () => buttonsLabelled(groupPanel(), '删除')[0].props.onClick(new Event('click'));
+  try {
+    const tab = buttonsIn(view()).find(n => n.props.id === 'dap-tab-groups'); tab.props.onClick();
+    arm(); await sweep();
+    eq(requests.length, 0, 'first group delete click only arms confirmation and sends no POST');
+    ok(textOf(groupPanel()).includes('删除「便宜池」分组和对应模型入口？分组中的账号会保留。'), 'group confirmation names the group and explains accounts are retained');
+    eq(buttonsLabelled(groupPanel(), '确认删除')[0].props['aria-label'], '确认删除 便宜池', 'confirmation button has an unambiguous accessible name');
+    buttonsLabelled(groupPanel(), '取消')[0].props.onClick(new Event('click')); await sweep();
+    eq(buttonsLabelled(groupPanel(), '确认删除').length, 0, 'Cancel disarms group deletion');
+    eq(requests.length, 0, 'Cancel never dispatches deletion');
+    arm();
+    const confirmation = nodesIn(groupPanel(), 'div').find(n => n.props.role === 'group');
+    const escape = new Event('keydown', { cancelable: true }); Object.defineProperty(escape, 'key', { value: 'Escape' });
+    confirmation.props.onKeyDown(escape);
+    eq(escape.defaultPrevented, true, 'Escape cancels confirmation without falling through');
+    eq(buttonsLabelled(groupPanel(), '确认删除').length, 0, 'Escape disarms group deletion');
+    arm();
+    buttonsIn(view()).find(n => n.props.id === 'dap-tab-accounts').props.onClick();
+    eq(buttonsLabelled(groupPanel(), '确认删除').length, 0, 'leaving the group tab disarms deletion');
+    buttonsIn(view()).find(n => n.props.id === 'dap-tab-groups').props.onClick(); arm();
+    const deletion = buttonsLabelled(groupPanel(), '确认删除')[0].props.onClick(new Event('click')); await sweep();
+    eq(requests.length, 1, 'only the explicit confirmation dispatches one group deletion');
+    eq(requests[0].body, { id: 'cheap', action: 'group-delete' }, 'confirmed deletion addresses exactly the named group ID');
+    requests[0].resolve(Response.json({ ok: true, action: 'group-delete', id: 'cheap' }));
+    await deletion;
+    eq(buttonsLabelled(groupPanel(), '确认删除').length, 0, 'acknowledged deletion clears the confirmation');
+  } finally { globalThis.fetch = originalFetch; }
+}
+// ------------------------------------------------- optional attribution integration
+{
+  remount();
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const probeKey = 'c'.repeat(64);
+  let enabled = true;
+  let job = null;
+  const accountBody = { ...ACCOUNTS_BODY, accounts: ACCOUNTS_BODY.accounts.map(account => account.id === 'a1' ? { ...account, schedulable: false } : account) };
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url), method = init.method || 'GET';
+    calls.push({ path, method, body: init.body ? JSON.parse(init.body) : null });
+    if (path === 'api/lm-detector/pool') return Response.json({ version: 1, available: true, enabled, busy: false, limits: { maxTokens: 4096, timeoutMs: 120000 }, rows: [{ accountId: 'a1', label: '主号', key: probeKey, model: 'configured-exact-model', ready: true, job }] });
+    if (path === 'api/lm-detector/pool-start') {
+      job = { id: 'fixture-attribution-job', state: 'completed', progress: { completed: 3, total: 3 }, probes: [], analysis: { used_outputs: 3, prediction_name: 'gpt-6-astra/6.1-sol', results: [{ display_name: 'gpt-6-astra/6.1-sol', probability: 0.7 }] } };
+      return Response.json(job, { status: 202 });
+    }
+    if (path.startsWith('api/accountPool.usage')) return Response.json(USAGE_BODY);
+    if (path.startsWith('api/accountPool.oauth')) return Response.json(OAUTH_BODY);
+    if (method === 'POST') return Response.json({ ok: true });
+    return Response.json(accountBody);
+  };
+  const view = () => render(page.type, page.props);
+  try {
+    view(); await sweep();
+    const statusCell = nodesIn(view(), 'td').find(node => node.props.className === 'dap-cell-status' && textOf(node).includes('模型归因测试'));
+    ok(!!statusCell, 'attribution control is placed below the account status, not in another column');
+    ok(textOf(statusCell).includes('已暂停调度'), 'paused account retains its original status beside attribution');
+    eq(buttonsLabelled(view(), '模型归因测试').length, 1, 'only advertised account targets get controls');
+    eq(buttonsLabelled(view(), '模型归因测试')[0].props.disabled, false, 'manual attribution remains available on a paused target');
+    eq(calls.filter(call => call.method === 'POST').length, 0, 'opening the pool performs no attribution POST');
+    buttonsLabelled(view(), '模型归因测试')[0].props.onClick();
+    ok(textOf(view()).includes('3 次采样，可能消耗额度；每次请求预算 4096 输出 token，超时 120 秒'), 'confirmation discloses captured three-call budget and timeout');
+    eq(calls.filter(call => call.path === 'api/lm-detector/pool-start').length, 0, 'arming confirmation sends no model request');
+    await buttonsLabelled(view(), '确认开始 · 3 次调用')[0].props.onClick(); view(); await sweep();
+    const request = calls.find(call => call.path === 'api/lm-detector/pool-start');
+    eq(request?.body, { accountId: 'a1', expectedKey: probeKey }, 'confirmed test sends only the account and captured key, not prompt/credentials/route');
+    eq(calls.filter(call => call.path === 'api/lm-detector/pool-start').length, 1, 'one confirmation creates one attribution job');
+    ok(textOf(view()).includes('参考接近：gpt-6-astra/6.1-sol'), 'completed result is explicitly reference similarity');
+    ok(textOf(view()).includes('不是模型身份认证'), 'result keeps its identity limitation');
+    enabled = false;
+    buttonsLabelled(view(), '刷新')[0].props.onClick(); view(); await sweep();
+    eq(buttonsLabelled(view(), '模型归因测试').length, 0, 'plugin toggle hides pool controls on refreshed metadata');
+    eq(calls.filter(call => call.path === 'api/lm-detector/pool-start').length, 1, 'disable and refresh never add a probe');
+  } finally { remount(); globalThis.fetch = originalFetch; }
+}
+
+// Missing/reloaded companions are capabilities, not a cache of permission to POST.
+// Drive real hook effects and callbacks with deterministic, read-only probe timers.
+{
+  remount();
+  const originalFetch = globalThis.fetch, originalSetTimeout = globalThis.setTimeout, originalClearTimeout = globalThis.clearTimeout;
+  const originalSetInterval = globalThis.setInterval, originalClearInterval = globalThis.clearInterval;
+  const timers = new Map(), calls = []; let timerId = 0;
+  globalThis.setTimeout = (fn, ms) => { const id = ++timerId; timers.set(id, { fn, ms }); return id; };
+  globalThis.clearTimeout = id => timers.delete(id);
+  globalThis.setInterval = () => ++timerId; globalThis.clearInterval = () => {};
+  const key = 'd'.repeat(64);
+  const row = { accountId: 'a1', key, model: 'fixture-model', ready: true, job: null };
+  const capability = { version: 1, available: true, enabled: true, busy: false, limits: { maxTokens: 4096, timeoutMs: 120000 }, rows: [row] };
+  let response = () => Response.json({ error: { message: 'not installed' } }, { status: 404 });
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url), method = init.method || 'GET';
+    calls.push({ path, method, cache: init.cache, body: init.body ? JSON.parse(init.body) : null });
+    if (path === 'api/lm-detector/pool') return response();
+    if (path === 'api/lm-detector/pool-start' || path === 'api/lm-detector/cancel') return Response.json({ id: 'fixture-job' });
+    if (path.startsWith('api/accountPool.usage')) return Response.json(USAGE_BODY);
+    if (path.startsWith('api/accountPool.oauth')) return Response.json(OAUTH_BODY);
+    if (method === 'POST') return Response.json({ ok: true });
+    return Response.json(ACCOUNTS_BODY);
+  };
+  const view = () => render(page.type, page.props);
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  const posts = () => calls.filter(call => call.method === 'POST' && call.path.startsWith('api/lm-detector/')).length;
+  const controls = () => buttonsLabelled(view(), '模型归因测试');
+  const accountEdits = () => nodesIn(view(), 'td').filter(node => node.props.className === 'dap-cell-actions').flatMap(node => buttonsLabelled(node, '编辑')).filter(button => !button.props.disabled);
+  const confirmation = () => buttonsLabelled(view(), '确认开始 · 3 次调用');
+  const fireProbe = ms => {
+    const entry = [...timers].find(([, timer]) => timer.ms === ms);
+    ok(!!entry, `attribution schedules a ${ms}ms read-only probe`);
+    if (entry) { timers.delete(entry[0]); entry[1].fn(); }
+  };
+  const recover = async () => {
+    response = () => Response.json(capability);
+    fireProbe(30000); view(); await settle();
+    eq(controls().length, 1, 'valid capability automatically recovers without remount or user refresh');
+  };
+  try {
+    view(); await settle();
+    eq(controls().length, 0, 'initial 404 leaves attribution hidden');
+    eq(accountEdits().length, ACCOUNTS_BODY.accounts.length, 'initial companion 404 leaves account editing available');
+    eq(posts(), 0, 'initial 404 and discovery never POST');
+    await recover();
+    const staleArm = controls()[0].props.onClick;
+    staleArm();
+    const staleStart = confirmation()[0].props.onClick;
+    response = () => Response.json({ error: { message: 'unloaded' } }, { status: 404 });
+    fireProbe(6000);
+    await staleStart();
+    eq(posts(), 0, 'starting a capability read immediately revokes old callbacks before a render');
+    view(); await settle();
+    await staleStart(); staleArm();
+    eq(posts(), 0, '404 revokes callbacks before React commits the failed state');
+    eq(controls().length, 0, '200 to 404 removes stale controls');
+    await recover();
+    eq(confirmation().length, 0, '200 to 404 to 200 clears the old confirmation');
+    await staleStart(); staleArm();
+    eq(posts(), 0, 'pre-unload callbacks cannot POST after recovery with the same key');
+    eq(confirmation().length, 0, 'pre-unload arm callback cannot restore a confirmation');
+    controls()[0].props.onClick();
+    await confirmation()[0].props.onClick(); view(); await settle(); view();
+    eq(posts(), 1, 'fresh explicit confirmation works after automatic recovery');
+
+    const invalid = [
+      ['503', () => Response.json(capability, { status: 503 })],
+      ['HTML fallback', () => new Response('<html>missing plugin</html>', { headers: { 'content-type': 'text/html' } })],
+      ['network failure', () => { throw new Error('offline fixture'); }],
+      ...[
+        ['wrong version', { ...capability, version: 2 }],
+        ['rows object', { ...capability, rows: {} }],
+        ['null row', { ...capability, rows: [null] }],
+        ['enabled string', { ...capability, enabled: 'yes' }],
+        ['not available', { ...capability, available: false }],
+        ['disabled', { ...capability, enabled: false }],
+        ['empty ready key', { ...capability, rows: [{ ...row, key: '' }] }],
+        ['object model', { ...capability, rows: [{ ...row, model: {} }] }],
+        ['bad limits', { ...capability, limits: { maxTokens: {} } }],
+        ['results object', { ...capability, rows: [{ ...row, job: { id: 'bad', state: 'completed', analysis: { results: {} } } }] }],
+        ['null result', { ...capability, rows: [{ ...row, job: { id: 'bad', state: 'completed', analysis: { results: [null] } } }] }],
+        ['object prediction', { ...capability, rows: [{ ...row, job: { id: 'bad', state: 'completed', analysis: { prediction_name: {} } } }] }],
+        ['probes object', { ...capability, rows: [{ ...row, job: { id: 'bad', state: 'completed', probes: {} } }] }],
+        ['null probe', { ...capability, rows: [{ ...row, job: { id: 'bad', state: 'completed', probes: [null] } }] }],
+      ].map(([label, body]) => [label, () => Response.json(body)]),
+    ];
+    for (const [label, fixture] of invalid) {
+      controls()[0].props.onClick();
+      const oldStart = confirmation()[0].props.onClick;
+      response = fixture; fireProbe(6000); view(); await settle();
+      await oldStart();
+      eq(posts(), 1, `${label} cannot authorize an old callback`);
+      eq(controls().length, 0, `${label} is isolated from the attribution renderer`);
+      eq(accountEdits().length, ACCOUNTS_BODY.accounts.length, `${label} does not break account-pool controls`);
+      await recover();
+      eq(confirmation().length, 0, `${label} clears confirmation rather than restoring it on recovery`);
+      await oldStart();
+      eq(posts(), 1, `${label} old callback stays inert after recovery`);
+    }
+
+    // Even a fetch implementation that ignores abort cannot resurrect a stale read.
+    let releaseLate;
+    response = () => new Promise(resolve => { releaseLate = resolve; });
+    fireProbe(6000); view(); await settle();
+    eq(controls().length, 0, 'pending capability reads do not expose actionable cached controls');
+    response = () => Response.json({}, { status: 404 });
+    buttonsLabelled(view(), '刷新')[0].props.onClick(); view(); await settle(); view();
+    releaseLate(Response.json(capability)); await settle();
+    eq(controls().length, 0, 'late success from an aborted read cannot undo a newer 404');
+    await recover();
+
+    // Legal optional nulls and unavailable rows must not disable other targets.
+    response = () => Response.json({ ...capability, rows: [
+      { ...row, job: { id: 'nullable', state: 'completed', error: null, probes: null, progress: null, analysis: { prediction_name: null, results: null, used_outputs: null } } },
+      { accountId: 'a2', ready: false, key: null, model: null, reason: null, job: null },
+    ] });
+    fireProbe(6000); view(); await settle();
+    eq(controls().length, 2, 'legal nulls and an unready row coexist with the ready capability');
+    eq(controls()[0].props.disabled, false, 'legal null fields preserve ready-target actions');
+    eq(controls()[1].props.disabled, true, 'unready target remains disabled');
+
+    // A stale cancel must not cancel a replacement job sharing the same account key.
+    response = () => Response.json({ ...capability, busy: true, rows: [{ ...row, job: { id: 'old-job', state: 'running', progress: { completed: 1 } } }] });
+    fireProbe(6000); view(); await settle();
+    const oldCancel = buttonsLabelled(view(), '取消归因')[0]?.props.onClick;
+    ok(typeof oldCancel === 'function', 'running attribution exposes cancellation');
+    response = () => Response.json({ ...capability, busy: true, rows: [{ ...row, job: { id: 'replacement-job', state: 'running' } }] });
+    fireProbe(1500); view(); await settle(); view();
+    await oldCancel?.();
+    eq(posts(), 1, 'old cancel callback cannot target the replacement job');
+    const freshCancel = buttonsLabelled(view(), '取消归因')[0]?.props.onClick;
+    await freshCancel?.(); view(); await settle(); view();
+    eq(posts(), 2, 'fresh cancel remains available for the current running job');
+    eq(calls.filter(call => call.path === 'api/lm-detector/cancel').at(-1)?.body, { id: 'replacement-job' }, 'fresh cancel sends only the current job id');
+
+    response = () => Response.json({}, { status: 404 });
+    fireProbe(1500); view(); await settle(); view();
+    await buttonsLabelled(view(), '停用')[0].props.onClick(); view(); await settle(); view();
+    ok(calls.some(call => call.method === 'POST' && call.path === 'api/accountPool.account'), 'ordinary account actions still POST while attribution is absent');
+    ok(calls.filter(call => call.path === 'api/lm-detector/pool').every(call => call.cache === 'no-store'), 'capability discovery cannot reuse a cached HTTP success');
+    remount();
+    await staleStart(); await oldCancel?.(); await freshCancel?.(); staleArm();
+    eq(posts(), 2, 'unmounted attribution callbacks cannot send POST');
+    eq(timers.size, 0, 'unmount clears all attribution reads and discovery timers');
+  } finally {
+    remount(); globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout; globalThis.clearTimeout = originalClearTimeout;
+    globalThis.setInterval = originalSetInterval; globalThis.clearInterval = originalClearInterval;
+  }
+}
+
+// ------------------------------------------------- Auto Review settings interactions
+{
+  const originalFetch = globalThis.fetch;
+  const settleReview = async () => { await new Promise(resolve => setImmediate(resolve)); };
+  const directory = { version: 1, available: true, compatible: true, revision: 3, selection: { mode: 'session' }, choices: [
+    { provider: 'pool-cheap', providerName: '便宜池', model: 'cheap-model', modelName: '便宜模型' },
+    { provider: 'pool-other', providerName: '备池', model: 'other-model', modelName: '备用模型' },
+  ] };
+  let current = structuredClone(directory), posts = [], rejectSave = false, releaseSave = null;
+  let routeFailure = false;
+  const ordinary = makeFetch('ready');
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url) !== 'api/autoReview.model') return ordinary.impl(url, init);
+    if (init.method === 'POST') {
+      const body = JSON.parse(init.body); posts.push(body);
+      if (releaseSave === 'defer') await new Promise(resolve => { releaseSave = resolve; });
+      if (rejectSave) return Response.json({ error: { code: 'stale-revision', message: '请刷新后重试' } }, { status: 409 });
+      current = { ...current, selection: body.selection, revision: current.revision + 1 };
+      return Response.json(current);
+    }
+    return routeFailure ? Response.json({ error: { message: '审核插件未启用' } }, { status: 503 }) : Response.json(current);
+  };
+  const view = () => render(page.type, page.props);
+  const reviewPanel = tree => nodesIn(tree, 'div').find(node => node.props.id === 'dap-panel-auto-review');
+  const fields = () => nodesIn(reviewPanel(view()), 'select');
+  const saveButton = () => buttonsLabelled(reviewPanel(view()), '保存')[0];
+  try {
+    remount(); view(); await settleReview();
+    const tree = view();
+    ok(!ordinary.calls.some(call => call.url === 'api/autoReview.model'), 'reviewer endpoint is lazy, independent of accounts loading');
+    buttonsLabelled(tree, 'Auto Review')[0].props.onClick(); view(); await settleReview(); view();
+    eq(fields()[0].props.value, 'session', 'reviewer defaults to current session');
+    ok(textOf(reviewPanel(view())).includes('不改变审批策略'), 'reviewer UI explicitly preserves approval policy');
+    fields()[0].props.onChange({ target: { value: 'fixed' } });
+    eq(fields().map(node => node.props.value), ['fixed', 'pool-cheap', 'cheap-model'], 'fixed reviewer selects first advertised pool model');
+    fields()[1].props.onChange({ target: { value: 'pool-other' } });
+    eq(fields().map(node => node.props.value), ['fixed', 'pool-other', 'other-model'], 'switching pool resets model to its own directory');
+    await nodesIn(reviewPanel(view()), 'form')[0].props.onSubmit({ preventDefault() {} }); view(); await settleReview(); view();
+    eq(posts[0], { selection: { mode: 'fixed', provider: 'pool-other', model: 'other-model' }, expectedRevision: 3 }, 'reviewer saves exact provider/model and revision through dedicated endpoint');
+    ok(textOf(reviewPanel(view())).includes('已保存'), 'reviewer reports verified save success');
+    ok(!ordinary.calls.some(call => call.method === 'POST'), 'reviewer save never writes account or chat configuration');
+
+    fields()[0].props.onChange({ target: { value: 'session' } });
+    rejectSave = true;
+    await nodesIn(reviewPanel(view()), 'form')[0].props.onSubmit({ preventDefault() {} });
+    ok(textOf(reviewPanel(view())).includes('请刷新后重试'), 'reviewer save error is visible');
+    eq(fields()[0].props.value, 'session', 'failed reviewer save preserves draft');
+    ok(!textOf(reviewPanel(view())).includes('已保存'), 'failed save never claims success');
+    rejectSave = false;
+    releaseSave = 'defer';
+    const callback = nodesIn(reviewPanel(view()), 'form')[0].props.onSubmit;
+    const first = callback({ preventDefault() {} });
+    await callback({ preventDefault() {} });
+    eq(posts.length, 3, 'same-turn repeated reviewer submit is single-flight');
+    ok(buttonsLabelled(reviewPanel(view()), '保存中…')[0]?.props.disabled || nodesIn(reviewPanel(view()), 'button').find(node => node.props.type === 'submit')?.props.disabled, 'reviewer fields and save disable during pending write');
+    buttonsLabelled(view(), 'Auto Review')[0].props.onClick();
+    releaseSave(); await first; view(); await settleReview(); view();
+    eq(current.selection, { mode: 'session' }, 'session mode clears fixed reviewer route');
+
+    current = { ...current, selection: { mode: 'fixed', provider: 'pool-removed', model: 'removed-model' } };
+    buttonsLabelled(reviewPanel(view()), '刷新')[0].props.onClick(); view(); await settleReview(); view();
+    ok(saveButton().props.disabled, 'removed reviewer model cannot be saved');
+    ok(textOf(reviewPanel(view())).includes('不会自动回退'), 'removed model is surfaced rather than silently falling back');
+    routeFailure = true;
+    buttonsLabelled(reviewPanel(view()), '刷新')[0].props.onClick(); view(); await settleReview(); view();
+    ok(saveButton().props.disabled, 'unavailable reviewer disables stale cached controls');
+    ok(textOf(reviewPanel(view())).includes('暂不可用'), 'unavailable companion has clear recovery hint');
+    routeFailure = false; current = structuredClone(directory);
+    buttonsLabelled(reviewPanel(view()), '刷新')[0].props.onClick(); view(); await settleReview(); view();
+    ok(!saveButton().props.disabled, 'reviewer read recovers after refresh');
+    const unmountedCallback = nodesIn(reviewPanel(view()), 'form')[0].props.onSubmit;
+    remount(); await unmountedCallback({ preventDefault() {} });
+    eq(posts.length, 3, 'unmounted reviewer callback cannot save');
+  } finally { remount(); globalThis.fetch = originalFetch; }
+}
+
 // ------------------------------------------------- report
 
 if (failures.length > 0) {

@@ -117,12 +117,48 @@ await check('accounts: pool detection settings default safely and validate bound
   assert.deepEqual(accountSchema.parse({...row,poolDetectionKeywords:[]}).poolDetectionKeywords,[],'Explicitly empty rules match nothing');
 });
 
+await check('accounts: legacy protocol defaults remain HTTP and chat-completions for every provider/auth mode', () => {
+  for (const platform of ['anthropic', 'openai', 'gemini', 'grok', 'custom']) {
+    for (const authMode of ['api-key', 'oauth']) {
+      const legacy = { id: 'legacy-protocol', platform, authMode, createdAt: iso(T0), updatedAt: iso(T0) };
+      const parsed = accountSchema.parse(legacy);
+      assert.equal(parsed.openaiApi, 'chat-completions');
+      assert.equal(parsed.openaiTransport, 'http');
+      assert.deepEqual(accountSchema.parse(parsed), parsed, 'defaulted rows round-trip without a migration');
+    }
+  }
+});
+
+await check('accounts: Codex OAuth WS ignores legacy API format without widening other provider/auth combinations', () => {
+  const row = makeAccount({ id: 'protocol-matrix', now: iso(T0) });
+  for (const platform of ['anthropic', 'openai', 'gemini', 'grok', 'custom']) {
+    for (const authMode of ['api-key', 'oauth']) {
+      for (const openaiApi of ['chat-completions', 'responses']) {
+        for (const openaiTransport of ['http', 'websocket']) {
+          const candidate = { ...row, platform, authMode, openaiApi, openaiTransport };
+          const defaults = openaiApi === 'chat-completions' && openaiTransport === 'http';
+          const generic = ['openai', 'grok', 'custom'].includes(platform) && authMode === 'api-key' && openaiApi === 'responses';
+          const codex = platform === 'openai' && authMode === 'oauth' && openaiTransport === 'websocket';
+          const parsed = accountSchema.safeParse(candidate);
+          assert.equal(parsed.success, defaults || generic || codex, JSON.stringify({ platform, authMode, openaiApi, openaiTransport }));
+          if (parsed.success) assert.deepEqual(parsed.data, candidate, 'validation must not silently change the selected transport');
+        }
+      }
+    }
+  }
+  const codex = makeAccount({ id: 'codex-ws', platform: 'openai', authMode: 'oauth', openaiTransport: 'websocket', now: iso(T0) });
+  assert.equal(codex.openaiApi, 'chat-completions', 'native Codex opt-in does not need a generic Responses format');
+  assert.equal(codex.openaiTransport, 'websocket');
+  assert.equal(accountSchema.safeParse({ ...codex, openaiTransport: 'ws' }).success, false);
+  assert.equal(accountSchema.safeParse({ ...codex, openaiApi: 'codex' }).success, false);
+});
+
 // ------------------------------------------------- spec shape
 
-await check('spec: declares the three tables and a non-nullable global', () => {
+await check('spec: declares pool tables, local API settings and a non-nullable global', () => {
   assert.deepEqual(
     Object.keys(poolDomainSpec.tables).sort(),
-    ['accounts', 'bindings', 'groups', 'priorities', 'usage'],
+    ['accounts', 'bindings', 'groups', 'local_api', 'priorities', 'usage'],
   );
   assert.equal(poolDomainSpec.invalidRecords, 'backup-and-skip');
   assert.equal(poolDomainSpec.global.schema.safeParse(null).success, false);
@@ -329,6 +365,22 @@ await check('adapter: a client error persists nothing at all', async () => {
 });
 
 // ------------------------------------------------- the usage record the host builds
+
+await check('usage: historical rows keep unknown efforts and explicit mappings round-trip', () => {
+  const legacy = { id: 'legacy-usage', at: iso(T0), model: 'm', ok: true };
+  const unknown = usageSchema.parse(legacy);
+  assert.equal(unknown.reasoningEffort, null);
+  assert.equal(unknown.mappedReasoningEffort, null);
+  assert.deepEqual(usageSchema.parse(unknown), unknown);
+  for (const [reasoningEffort, mappedReasoningEffort] of [['high', 'high'], ['high', 'xhigh'], ['off', null]]) {
+    const parsed = usageSchema.parse({ ...legacy, reasoningEffort, mappedReasoningEffort });
+    assert.equal(parsed.reasoningEffort, reasoningEffort);
+    assert.equal(parsed.mappedReasoningEffort, mappedReasoningEffort);
+    assert.deepEqual(usageSchema.parse(JSON.parse(JSON.stringify(parsed))), parsed);
+  }
+  assert.equal(usageSchema.safeParse({ ...legacy, reasoningEffort: 1 }).success, false);
+  assert.equal(usageSchema.safeParse({ ...legacy, mappedReasoningEffort: {} }).success, false);
+});
 
 await check('usage: the payload the adapter reports folds into a valid usage record', async () => {
   const clock = makeClock();

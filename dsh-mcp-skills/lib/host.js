@@ -18,7 +18,7 @@
  *   Token cost    every MCP row also carries what its tool schemas cost in the
  *                model's context (`toolTokens`), priced with the same formulas
  *                the context-window panel uses (`./estimate.js`, kept equal by
- *                `tools/estimate-parity-test.mjs`). The number is a heuristic —
+ *                `tools/host-test.mjs`). The number is a heuristic —
  *                it is the panel's `~` arithmetic, not a provider's billing
  *                token count.
  *
@@ -80,8 +80,60 @@ const JSON_HEADERS = {
 
 const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: JSON_HEADERS });
 
-/** Keys whose values are credentials and must never reach the browser. */
-const SECRET_KEY = /^(authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|apikey|token|access[-_]?token|refresh[-_]?token|secret|client[-_]?secret|password|passwd|bearer)$/i;
+/** Credential fields include namespaced env variables and custom HTTP headers. */
+const SECRET_KEY = /(?:^|-)(authorization|cookie|set-cookie|api-?key|key|token|secret|password|passwd|bearer|credential|credentials|pat)$/i;
+
+function isSecretKey(key) {
+  const normalized = String(key)
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/[_\s]+/g, '-')
+    .toLowerCase();
+  return SECRET_KEY.test(normalized);
+}
+
+/** A display-only URL: neither userinfo nor credential query values survive. */
+function redactUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return value;
+  }
+  let changed = false;
+  if (url.username !== '' || url.password !== '') {
+    if (url.username !== '') url.username = REDACTED;
+    if (url.password !== '') url.password = REDACTED;
+    changed = true;
+  }
+  for (const key of new Set(url.searchParams.keys())) {
+    if (!isSecretKey(key)) continue;
+    url.searchParams.set(key, REDACTED);
+    changed = true;
+  }
+  return changed ? url.toString() : value;
+}
+
+/** A whole masked scalar is restorable without exposing part of a credential. */
+function redactArgument(value) {
+  if (typeof value !== 'string') return value;
+  const assignment = /^--?([^=]+)=(.*)$/s.exec(value) ?? /^([^=\s]+)=(.*)$/s.exec(value);
+  if (assignment !== null && isSecretKey(assignment[1])) return REDACTED;
+  const content = assignment === null ? value : assignment[2];
+  const header = /^\s*([^:\s]+)\s*:/.exec(content);
+  if (header !== null && isSecretKey(header[1])) return REDACTED;
+  return redactUrl(content) !== content ? REDACTED : value;
+}
+
+/** Mask both `--token=value` and `--token value`, including docker env/header args. */
+function redactArguments(values) {
+  return values.map((value, index) => {
+    const previous = index === 0 ? undefined : values[index - 1];
+    if (typeof previous === 'string' && /^--?[^=]+$/.test(previous) && isSecretKey(previous.replace(/^-+/, ''))) {
+      return REDACTED;
+    }
+    return redactArgument(value);
+  });
+}
 
 /** Call a possibly-absent service method, treating any throw as "no value". */
 function attempt(fn) {
@@ -117,10 +169,15 @@ export function isMcpConfig(config) {
   );
 }
 
-/** Deep copy of `value` with every credential-looking string replaced. */
+/** Deep copy with credential fields, credential URLs, and secret argv masked. */
 export function redactSecrets(value, keyHint = '') {
-  if (typeof value === 'string') return SECRET_KEY.test(keyHint) ? REDACTED : value;
-  if (Array.isArray(value)) return value.map((item) => redactSecrets(item, keyHint));
+  if (typeof value === 'string') {
+    return isSecretKey(keyHint) || redactUrl(value) !== value ? REDACTED : value;
+  }
+  if (Array.isArray(value)) {
+    const items = keyHint === 'args' ? redactArguments(value) : value;
+    return items.map((item) => redactSecrets(item, keyHint));
+  }
   if (value !== null && typeof value === 'object') {
     const out = {};
     for (const [key, child] of Object.entries(value)) out[key] = redactSecrets(child, key);
@@ -136,27 +193,36 @@ export function redactSecrets(value, keyHint = '') {
  * without the page having to hold the credential.
  */
 export function restoreSecrets(stored, incoming) {
-  if (incoming === REDACTED) return stored;
-  if (Array.isArray(incoming)) {
-    const current = Array.isArray(stored) ? stored : [];
-    return incoming.map((item, index) => restoreSecrets(current[index], item));
-  }
-  if (incoming !== null && typeof incoming === 'object') {
-    const current = stored !== null && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
-    const out = {};
-    for (const [key, child] of Object.entries(incoming)) out[key] = restoreSecrets(current[key], child);
-    return out;
-  }
-  return incoming;
+  const masked = redactSecrets(stored);
+  const restore = (current, next, placeholder) => {
+    // Only a value the read route actually masked is a keep-secret sentinel.
+    // Ordinary fields can still be deliberately edited to the literal "***".
+    if (next === REDACTED && placeholder === REDACTED) return current;
+    if (Array.isArray(next)) {
+      const values = Array.isArray(current) ? current : [];
+      const placeholders = Array.isArray(placeholder) ? placeholder : [];
+      return next.map((item, index) => restore(values[index], item, placeholders[index]));
+    }
+    if (next !== null && typeof next === 'object') {
+      const values = current !== null && typeof current === 'object' && !Array.isArray(current) ? current : {};
+      const placeholders = placeholder !== null && typeof placeholder === 'object' ? placeholder : {};
+      const out = {};
+      for (const [key, child] of Object.entries(next)) out[key] = restore(values[key], child, placeholders[key]);
+      return out;
+    }
+    return next;
+  };
+  return restore(stored, incoming, masked);
 }
 
 /** A one-line description of where an MCP server lives. */
 export function describeEndpoint(config) {
   if (config.transport === 'stdio') {
-    const args = asArray(config.args).map((arg) => String(arg)).join(' ');
-    return [config.command, args].filter((part) => part !== undefined && part !== '').join(' ') || '(未设置 command)';
+    const args = redactArguments(asArray(config.args)).map((arg) => String(arg)).join(' ');
+    const command = typeof config.command === 'string' ? redactArgument(config.command) : config.command;
+    return [command, args].filter((part) => part !== undefined && part !== '').join(' ') || '(未设置 command)';
   }
-  return typeof config.url === 'string' && config.url !== '' ? config.url : '(未设置 url)';
+  return typeof config.url === 'string' && config.url !== '' ? redactUrl(config.url) : '(未设置 url)';
 }
 
 /**
@@ -396,8 +462,15 @@ export function createMcpSkills(deps) {
   }
 
   async function readJson(request) {
-    const body = await attempt(() => request.json());
-    return body !== null && typeof body === 'object' ? body : {};
+    let body;
+    try {
+      body = await request.json();
+    } catch (error) {
+      throw Object.assign(new Error('请求体不是合法 JSON：' + (error instanceof Error ? error.message : String(error))), {
+        reason: 'bad-json', status: 400,
+      });
+    }
+    return body !== null && typeof body === 'object' && !Array.isArray(body) ? body : {};
   }
 
   async function route(routeName, request) {
@@ -429,7 +502,9 @@ export function createMcpSkills(deps) {
         if (editor === undefined || typeof editor.edit !== 'function') {
           return json({ ok: false, reason: 'unavailable', message: 'configEditor 服务不可用，无法改配置' }, 503);
         }
-        const patchId = request.method === 'POST' ? (await readJson(request)).patchId : url.searchParams.get('patchId');
+        // Fetch Request bodies are single-use: parse this POST exactly once.
+        const body = request.method === 'POST' ? await readJson(request) : undefined;
+        const patchId = body === undefined ? url.searchParams.get('patchId') : body.patchId;
         if (typeof patchId !== 'string' || patchId === '') {
           return json({ ok: false, reason: 'bad-request', message: '缺少 patchId' }, 400);
         }
@@ -443,7 +518,6 @@ export function createMcpSkills(deps) {
         if (request.method !== 'POST') {
           return json({ ok: true, patchId, ownedBy, redacted: true, config: redactSecrets(current), text: JSON.stringify(redactSecrets(current), null, 2) });
         }
-        const body = await readJson(request);
         let next;
         try {
           next = typeof body.text === 'string' ? JSON.parse(body.text) : body.config;
@@ -488,8 +562,9 @@ export function createMcpSkills(deps) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       lastError = message;
-      logger.warn?.(`dsh-mcp-skills: route ${routeName} failed: ${message}`);
-      return json({ ok: false, reason: 'internal', message }, 500);
+      const badJson = error?.reason === 'bad-json' && error?.status === 400;
+      if (!badJson) logger.warn?.(`dsh-mcp-skills: route ${routeName} failed: ${message}`);
+      return json({ ok: false, reason: badJson ? 'bad-json' : 'internal', message }, badJson ? 400 : 500);
     }
   }
 

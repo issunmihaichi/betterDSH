@@ -43,7 +43,7 @@ function fakeSessionQuery(sessions) {
       const session = sessions.find((candidate) => candidate.id === id);
       if (session === undefined) throw new Error('unknown session');
       if (session.fail === true) throw new Error('replay validation failed');
-      return { events: session.events, inheritedEventCount: session.inheritedEventCount ?? 0 };
+      return { session: { id: session.id }, events: session.events, inheritedEventCount: session.inheritedEventCount ?? 0 };
     },
   };
 }
@@ -137,6 +137,14 @@ eq(report.days.at(-1).day.startsWith('2026-'), true, 'day keys are dates');
 eq(report.days.at(-1).input, 1_106, 'today bucket holds input from both sessions');
 eq(report.days.at(-1).requests, 3, 'today bucket counts every reply that day');
 eq(report.totals.input, 1_106, 'the out-of-window 777-token reply is excluded from totals');
+eq(report.analytics.messages.total, 3, 'Host integrates assistant-message aggregation');
+eq(report.analytics.messages.byClient[0].id, 'unknown', 'Host never guesses client provenance');
+eq(report.analytics.messages.byClient[0].label, '未记录', 'unknown clients have the agreed label');
+eq(report.analytics.messages.byModel[0].id, 'unknown', 'messages without source/header have unknown model');
+eq(report.analytics.days, report.days.map(({ day, label }) => ({ day, label })), 'Host analytics axis agrees with legacy tokens');
+eq(report.analytics.chats.map(chat => chat.id), ['session-today', 'session-forked'], 'Host ranks only selected-window active chats');
+eq(report.analytics.chats[0].title, 'session-today', 'Host falls back to id, not message content');
+eq(report.analytics.quota, { available: false, fiveHourLimit: null, weeklyLimit: null }, 'Host does not call or invent a quota API');
 
 console.log('== query handling ==');
 const head = await state.route.fetch(new Request('http://127.0.0.1:19387/api/usage.report?range=7', { method: 'HEAD' }));
@@ -182,6 +190,142 @@ apply(empty.ctx);
 const emptyReport = await (await empty.state.route.fetch(new Request('http://127.0.0.1:19387/api/usage.report?range=7'))).json();
 eq(emptyReport.totals, { input: 0, output: 0, uncachedInput: 0, cacheRead: 0, cacheWrite: 0, requests: 0 }, 'no sessions yields zeros');
 eq(emptyReport.meta.activeDays, 0, 'no active days');
+
+console.log('== explicit refresh and shared cancellation ==');
+const refreshedQuery = fakeSessionQuery(sessions);
+const refreshedCtx = makeCtx(refreshedQuery);
+apply(refreshedCtx.ctx);
+const refreshedGet = (suffix = '') => refreshedCtx.state.route.fetch(new Request('http://127.0.0.1/api/usage.report?range=7' + suffix));
+await refreshedGet();
+await refreshedGet();
+eq(refreshedQuery.calls.list, 1, 'ordinary reads use TTL cache');
+await refreshedGet('&refresh=1');
+eq(refreshedQuery.calls.list, 2, 'explicit refresh bypasses TTL cache');
+let releaseRead;
+const readBarrier = new Promise(resolve => { releaseRead = resolve; });
+let sharedLists = 0;
+const sharedCtx = makeCtx({ listSessions: async signal => { sharedLists++; await readBarrier; if (signal?.aborted) throw Error('aborted caller'); return []; }, readSession: async () => ({ events: [] }) });
+apply(sharedCtx.ctx, { cacheTtlMs: 0 });
+const firstAbort = new AbortController();
+const firstCall = sharedCtx.state.route.fetch(new Request('http://127.0.0.1/api/usage.report?range=7&refresh=1', { signal: firstAbort.signal }));
+const secondCall = sharedCtx.state.route.fetch(new Request('http://127.0.0.1/api/usage.report?range=7&refresh=1'));
+firstAbort.abort();
+releaseRead();
+await firstCall;
+eq((await secondCall).status, 200, 'one caller abort does not cancel another subscriber');
+eq(sharedLists, 1, 'simultaneous explicit refreshes are single flight');
+const boundedCtx = makeCtx(fakeSessionQuery(sessions));
+apply(boundedCtx.ctx, { maxSessions: 1 });
+const bounded = await (await boundedCtx.state.route.fetch(new Request('http://127.0.0.1/api/usage.report?range=7'))).json();
+eq(bounded.meta.truncatedSessions, 3, 'bounded scans disclose unscanned sessions');
+
+console.log('== analytics integration / local log privacy ==');
+const todayMs = Date.now();
+const localEvent = (type, data, time = todayMs) => ({ type, seq: 1, time, data });
+const analyticsSessions = [
+  { id: 'analytics-live', live: true, inheritedEventCount: 4, events: [
+    localEvent('request/header', { header: { config: { provider: 'local-provider', model: 'inherited-model' } } }),
+    localEvent('session/title', { title: '继承标题' }),
+    usageEvent(todayMs, 999, 999),
+    localEvent('tool/call', { callId: 'parent-skill', name: 'skill', arguments: '{"name":"parent-skill"}' }),
+    localEvent('assistant/message', { message: { role: 'assistant', content: 'PRIVATE ASSISTANT' } }),
+    localEvent('assistant/message', { usage: { inputTokens: 1, outputTokens: 2 }, message: { role: 'assistant', source: { kind: 'model', provider: 'local-provider', model: 'settled-model' } } }),
+    localEvent('tool/call', { callId: 'safe-name', name: '__proto__', arguments: 'PRIVATE TOOL ARGUMENTS' }),
+    localEvent('tool/call', { callId: 'child-skill', name: 'skill', arguments: '{"name":"analytics-test"}' }),
+    localEvent('tool/result', { message: { toolCallId: 'child-skill', isError: true } }),
+    localEvent('tool/result', { message: { toolCallId: 'child-skill' } }),
+    localEvent('tool/result', { message: { toolCallId: 'child-skill' } }),
+    localEvent('tool/result', { message: { toolCallId: 'parent-skill' } }),
+    localEvent('user/message', { role: 'user', content: 'PRIVATE USER MUST NOT BE TITLE' }),
+    localEvent('session/title', { title: '最新标题' }),
+  ] },
+  { id: 'analytics-old', events: [usageEvent(new Date(todayMs).setDate(new Date(todayMs).getDate() - 91), 100, 100)] },
+  { id: 'analytics-failed', fail: true, events: [] },
+];
+const analyticsCtx = makeCtx(fakeSessionQuery(analyticsSessions));
+apply(analyticsCtx.ctx);
+const analyticsReport = await (await analyticsCtx.state.route.fetch(new Request('http://127.0.0.1/api/usage.report?range=7'))).json();
+eq(analyticsReport.totals.input, 1, 'Host tokens exclude inherited prefix and old sessions');
+eq(analyticsReport.analytics.messages.total, 2, 'Host counts usage-free settled messages');
+eq(analyticsReport.analytics.tools.total, 2, 'Host counts safe tool names from call events');
+eq(analyticsReport.analytics.skills.total, 1, 'Host counts only a successful non-inherited skill once');
+eq(analyticsReport.analytics.skills.series[0].id, 'analytics-test', 'Host reads skill name only from valid call JSON');
+eq(analyticsReport.analytics.messages.byModel.map(row => row.id), ['["local-provider","inherited-model"]', '["local-provider","settled-model"]'], 'Host carries inherited model fallback, preferring settled source');
+eq(analyticsReport.analytics.chats.length, 1, 'Host emits only active selected-window chats');
+eq(analyticsReport.analytics.chats[0].title, '最新标题', 'Host folds latest log-backed title');
+eq(analyticsReport.analytics.chats[0].messages, 2, 'Host chat message count includes usage-free replies');
+eq(analyticsReport.analytics.chats[0].toolCalls, 2, 'Host chat tools exclude prefix');
+eq(analyticsReport.analytics.chats[0].tokenSharePercent, 100, 'single active token-bearing chat owns 100 percent');
+eq(analyticsReport.meta.skippedSessions, 1, 'analytics preserve unreadable-session isolation');
+ok(!JSON.stringify(analyticsReport).includes('PRIVATE'), 'Host response never contains user content or arguments');
+
+console.log('== bounded read concurrency / eager snapshot folding ==');
+async function concurrencyProbe(configuredConcurrency, expectedConcurrency) {
+  const count = expectedConcurrency + 3;
+  const records = Array.from({ length: count }, (_, index) => ({ header: { id: `bounded-${index}` }, live: index === count - 1, persisted: true }));
+  const started = [];
+  const folded = new Set();
+  const releases = [];
+  let active = 0;
+  let peak = 0;
+  let gateOpened = false;
+  let foldedBeforeNextRead = true;
+  let ready;
+  const initialReads = new Promise(resolve => { ready = resolve; });
+  const service = {
+    listSessions: async () => records,
+    readSession: (id) => {
+      started.push(id);
+      if (started.length > expectedConcurrency && folded.size < started.length - expectedConcurrency) foldedBeforeNextRead = false;
+      active += 1;
+      peak = Math.max(peak, active);
+      const snapshot = {
+        session: { id }, inheritedEventCount: 0,
+        get events() { folded.add(id); return [usageEvent(Date.now(), 1, 1)]; },
+      };
+      if (started.length === expectedConcurrency) ready();
+      const read = gateOpened ? Promise.resolve(snapshot) : new Promise(resolve => releases.push(() => resolve(snapshot)));
+      return read.finally(() => { active -= 1; });
+    },
+  };
+  const tested = makeCtx(service);
+  apply(tested.ctx, { readConcurrency: configuredConcurrency, cacheTtlMs: 0 });
+  const pending = tested.state.route.fetch(new Request('http://127.0.0.1/api/usage.report?range=7'));
+  await initialReads;
+  eq(started.length, expectedConcurrency, `readConcurrency=${configuredConcurrency} initially starts only its bounded workers`);
+  eq(active, expectedConcurrency, 'only bounded reads are simultaneously retained');
+  eq(started[0], `bounded-${count - 1}`, 'live sessions are prioritized even if listed last');
+  gateOpened = true;
+  releases.forEach(release => release());
+  const built = await (await pending).json();
+  eq(peak, expectedConcurrency, 'peak read concurrency never exceeds configured clamp');
+  eq(folded.size, count, 'every snapshot has been folded');
+  ok(foldedBeforeNextRead, 'each worker folds its completed snapshot before reading the next, not after collecting all logs');
+  eq(built.meta.scannedSessions, count, 'bounded workers complete the census');
+  eq(built.analytics.messages.total, count, 'bounded workers preserve all message counters');
+  eq(built.totals.input, count, 'bounded workers preserve all token counters');
+}
+await concurrencyProbe(2, 2);
+await concurrencyProbe(0, 1);
+await concurrencyProbe(100, 16);
+
+console.log('== one captured calendar window across async reads ==');
+const originalNow = Date.now;
+const capturedNow = new Date('2026-03-10T23:59:59').getTime();
+try {
+  Date.now = () => capturedNow;
+  const midnightCtx = makeCtx({
+    listSessions: async () => { Date.now = () => capturedNow + 120_000; return [{ header: { id: 'midnight' }, live: false, persisted: true }]; },
+    readSession: async () => ({ session: { id: 'midnight' }, inheritedEventCount: 0, events: [usageEvent(capturedNow, 2, 3)] }),
+  });
+  apply(midnightCtx.ctx, { cacheTtlMs: 0 });
+  const midnight = await (await midnightCtx.state.route.fetch(new Request('http://127.0.0.1/api/usage.report?range=7'))).json();
+  eq(midnight.generatedAt, capturedNow, 'generation timestamp is captured before session reads');
+  eq(midnight.days.at(-1).day, '2026-03-10', 'calendar window does not drift when reads cross midnight');
+  eq(midnight.analytics.days, midnight.days.map(({ day, label }) => ({ day, label })), 'all analytics and tokens retain that captured window');
+} finally {
+  Date.now = originalNow;
+}
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) {

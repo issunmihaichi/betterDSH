@@ -178,12 +178,25 @@ function world(options = {}) {
   return { github, store, mcpState, calls, repos };
 }
 
-/** Minimal Request stand-in: what the routes actually read. */
+/** Exercise real Fetch Request parsing on every route, without a server. */
 function get(url) {
-  return { method: 'GET', url, json: async () => { throw new Error('no body'); } };
+  return new Request(url);
 }
 function post(url, body) {
-  return { method: 'POST', url, json: async () => body };
+  return new Request(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+}
+
+/** A browser first sees a plan, then sends exactly that displayed descriptor. */
+async function confirmedPost(github, body) {
+  const planned = await bodyOf(await github.handleRoute(ROUTES.clone, post(`http://x${ROUTES.clone}`, { ...body, confirm: false })));
+  return post(`http://x${ROUTES.clone}`, { ...body, dir: planned.plan.dir, expected: planned.plan, confirm: true });
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
 }
 
 async function bodyOf(response, expectedStatus = 200) {
@@ -456,7 +469,7 @@ await check('a clone request without confirmation only returns the plan', async 
 
 await check('a confirmed clone downloads and registers a workspace', async () => {
   const { github, calls, repos } = world({ rowEnabled: true });
-  const started = await bodyOf(await github.handleRoute(ROUTES.clone, post(`http://x${ROUTES.clone}`, {
+  const started = await bodyOf(await github.handleRoute(ROUTES.clone, await confirmedPost(github, {
     repo: 'octocat/Hello-World',
     confirm: true,
   })));
@@ -504,7 +517,7 @@ await check('a downloaded clone is annotated with the workspace that owns it', a
 
 await check('a failing clone is reported, not registered', async () => {
   const { github, calls } = world({ rowEnabled: true, cloneCode: 128 });
-  const started = await bodyOf(await github.handleRoute(ROUTES.clone, post(`http://x${ROUTES.clone}`, { repo: 'octocat/missing', confirm: true })));
+  const started = await bodyOf(await github.handleRoute(ROUTES.clone, await confirmedPost(github, { repo: 'octocat/missing', confirm: true })));
   let job = started.job;
   for (let attempt = 0; attempt < 50 && job.state === 'running'; attempt += 1) {
     await new Promise((resolve) => { setTimeout(resolve, 5); });
@@ -517,7 +530,7 @@ await check('a failing clone is reported, not registered', async () => {
 
 await check('an unusable repository name is refused before any git runs', async () => {
   const { github, calls } = world();
-  const body = await bodyOf(await github.handleRoute(ROUTES.clone, post(`http://x${ROUTES.clone}`, { repo: 'not-a-repo', confirm: true })), 400);
+  const body = await bodyOf(await github.handleRoute(ROUTES.clone, post(`http://x${ROUTES.clone}`, { repo: 'not-a-repo' })), 400);
   assert.equal(body.ok, false);
   assert.equal(calls.clone.length, 0);
 });
@@ -578,7 +591,7 @@ await check('the plan handed to the browser never carries the token', async () =
 
 await check('a clone with a token authenticates git and then scrubs origin', async () => {
   const { github, calls } = world({ token: 'ghp_supersecretvalue' });
-  const started = await bodyOf(await github.handleRoute(ROUTES.clone, post(`http://x${ROUTES.clone}`, {
+  const started = await bodyOf(await github.handleRoute(ROUTES.clone, await confirmedPost(github, {
     repo: 'octocat/Hello-World',
     private: true,
     confirm: true,
@@ -601,7 +614,7 @@ await check('a clone with a token authenticates git and then scrubs origin', asy
 
 await check('a clone with no token never injects a credential', async () => {
   const { github, calls } = world();
-  const started = await bodyOf(await github.handleRoute(ROUTES.clone, post(`http://x${ROUTES.clone}`, { repo: 'octocat/Hello-World', confirm: true })));
+  const started = await bodyOf(await github.handleRoute(ROUTES.clone, await confirmedPost(github, { repo: 'octocat/Hello-World', confirm: true })));
   let job = started.job;
   for (let attempt = 0; attempt < 50 && job.state === 'running'; attempt += 1) {
     await new Promise((resolve) => { setTimeout(resolve, 5); });
@@ -614,7 +627,7 @@ await check('a clone with no token never injects a credential', async () => {
 
 await check('a repository chosen from the list clones its default branch', async () => {
   const { github, calls } = world({ token: 'ghp_test' });
-  await github.handleRoute(ROUTES.clone, post(`http://x${ROUTES.clone}`, {
+  await github.handleRoute(ROUTES.clone, await confirmedPost(github, {
     repo: 'octocat/Spoon-Knife',
     branch: 'gh-pages',
     confirm: true,
@@ -782,16 +795,123 @@ await check('the command never throws, whatever the input', async () => {
   }
 });
 
-await check('a service failure inside a route becomes a JSON 500', async () => {
-  const { github } = world({ rowEnabled: true });
-  const broken = { ...github };
-  const outcome = await github.handleRoute(ROUTES.status, {
-    method: 'GET',
-    url: 'http://x',
-    json: async () => ({}),
+await check('a real store failure inside a route becomes a JSON 500', async () => {
+  const { github, store } = world({ rowEnabled: true });
+  store.load = async () => { throw new Error('settings unavailable'); };
+  const outcome = await bodyOf(await github.handleRoute(ROUTES.status, get(`http://x${ROUTES.status}`)), 500);
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.reason, 'internal');
+  assert.equal(outcome.message, 'settings unavailable');
+});
+
+// -------------------------------------------------- concurrency / confirmation ---
+
+await check('concurrent real settings Requests serialize deferred writes and merge both patches', async () => {
+  const { github, store } = world();
+  const firstWrite = deferred();
+  const entered = deferred();
+  const save = store.save;
+  let active = 0;
+  let maxActive = 0;
+  let writes = 0;
+  store.save = async (next) => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    writes += 1;
+    if (writes === 1) { entered.resolve(); await firstWrite.promise; }
+    try { return await save(next); } finally { active -= 1; }
+  };
+  const first = github.handleRoute(ROUTES.settings, post(`http://x${ROUTES.settings}`, { settings: { cloneRoot: 'D:\\chosen' } }));
+  await entered.promise;
+  const second = github.handleRoute(ROUTES.settings, post(`http://x${ROUTES.settings}`, { settings: { readOnly: true } }));
+  // Let native Request.json() finish while the first save remains blocked.
+  // A non-serialized implementation would enter the second save right now.
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(writes, 1);
+  firstWrite.resolve();
+  for (const response of await Promise.all([first, second])) assert.equal((await bodyOf(response)).ok, true);
+  assert.equal(maxActive, 1);
+  assert.equal(store.state.settings.cloneRoot, 'D:\\chosen');
+  assert.equal(store.state.settings.readOnly, true);
+  assert.equal((await github.settings()).readOnly, true);
+});
+
+await check('a failed deferred settings write does not publish or poison later patches', async () => {
+  const { github, store } = world({ settings: { cloneRoot: 'C:\\original' } });
+  const gate = deferred();
+  const entered = deferred();
+  const save = store.save;
+  let first = true;
+  store.save = async (next) => {
+    if (first) { first = false; entered.resolve(); await gate.promise; throw new Error('disk full'); }
+    return save(next);
+  };
+  const failing = github.handleRoute(ROUTES.settings, post(`http://x${ROUTES.settings}`, { settings: { cloneRoot: 'D:\\lost' } }));
+  await entered.promise;
+  const later = github.handleRoute(ROUTES.settings, post(`http://x${ROUTES.settings}`, { settings: { readOnly: true } }));
+  gate.resolve();
+  assert.equal((await bodyOf(await failing, 500)).message, 'disk full');
+  assert.equal((await bodyOf(await later)).ok, true);
+  assert.equal(store.state.settings.cloneRoot, 'C:\\original');
+  assert.equal(store.state.settings.readOnly, true);
+});
+
+await check('initial concurrent loads share one read and never overwrite a committed patch', async () => {
+  const { github, store } = world();
+  const gate = deferred();
+  const entered = deferred();
+  let loads = 0;
+  store.load = async () => { loads += 1; entered.resolve(); await gate.promise; return {}; };
+  const reading = github.settings();
+  await entered.promise;
+  const writing = github.saveSettings({ readOnly: true });
+  gate.resolve();
+  await Promise.all([reading, writing]);
+  assert.equal(loads, 1);
+  assert.equal((await github.settings()).readOnly, true);
+});
+
+await check('HTTP confirmation without a displayed descriptor refuses before git', async () => {
+  const { github, calls } = world();
+  const body = await bodyOf(await github.handleRoute(ROUTES.clone, post(`http://x${ROUTES.clone}`, { repo: 'octocat/Hello-World', confirm: true })), 409);
+  assert.equal(body.reason, 'confirmation-required');
+  assert.equal(calls.clone.length, 0);
+});
+
+for (const changed of [{ cloneRoot: 'D:\\changed' }, { cloneDepth: 1 }, { cloneBranch: 'other' }]) {
+  await check(`changed clone settings ${JSON.stringify(changed)} require reconfirmation`, async () => {
+    const { github, calls } = world();
+    const planned = await bodyOf(await github.handleRoute(ROUTES.clone, post(`http://x${ROUTES.clone}`, { repo: 'octocat/Hello-World' })));
+    await github.saveSettings(changed);
+    const rejected = await bodyOf(await github.handleRoute(ROUTES.clone, post(`http://x${ROUTES.clone}`, {
+      repo: planned.plan.fullName, expected: planned.plan, confirm: true,
+    })), 409);
+    assert.equal(rejected.reason, 'plan-changed');
+    assert.equal(calls.clone.length, 0);
+    assert.equal(calls.workspace.length, 0);
   });
-  assert.equal(outcome.status, 200);
-  assert.equal(broken !== undefined, true);
+}
+
+await check('matching displayed custom directory and depth are what git actually receives', async () => {
+  const { github, calls } = world({ settings: { cloneDepth: 7 } });
+  const req = await confirmedPost(github, { repo: 'octocat/Hello-World', dir: 'my-copy', branch: 'main' });
+  const started = await bodyOf(await github.handleRoute(ROUTES.clone, req));
+  assert.equal(started.ok, true);
+  assert.equal(calls.clone[0].dest, 'C:\\fake\\repos\\my-copy');
+  assert.equal(calls.clone[0].depth, 7);
+  assert.equal(calls.clone[0].branch, 'main');
+});
+
+await check('a changed repository or incomplete expected descriptor is not confirmation', async () => {
+  const { github, calls } = world();
+  const planned = await github.planClone({ repo: 'octocat/Hello-World' });
+  for (const [repo, expected] of [['octocat/other', planned], [planned.fullName, { dest: planned.dest, depth: planned.depth }]]) {
+    const rejected = await bodyOf(await github.handleRoute(ROUTES.clone, post(`http://x${ROUTES.clone}`, {
+      repo, expected, confirm: true,
+    })), 409);
+    assert.equal(rejected.reason, 'plan-changed');
+  }
+  assert.equal(calls.clone.length, 0);
 });
 
 // ------------------------------------------------------------------ summary ---

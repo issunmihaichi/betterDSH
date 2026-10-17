@@ -500,6 +500,119 @@ check('negative differences, unavailable breakdowns and overflow retain consiste
   assert.ok(Math.abs(over.barRows.reduce((sum, row) => sum + row.share, 0) - 1) < 1e-12);
 });
 
+check('missing classification weights retain the official tools bucket', () => {
+  const view = mod.compositionOf({ messageTokens: 10, toolsTokens: 100, systemTokens: 5 }, 1000, { tools: { mcp: { tokens: 0 }, system: { tokens: 0 } } });
+  assert.equal(view.classified, false);
+  assert.equal(view.rows.find(row => row.key === 'tools').value, 100);
+  assert.equal(view.free, 885);
+});
+check('classification state is visible without claiming an empty tool list', () => {
+  const loading = mod.ContextPanel({ ...panelProps, detailStatus: 'loading' });
+  assert.ok(textOf(loading).includes('正在读取工具与技能明细'));
+  const failed = mod.ContextPanel({ ...panelProps, detailStatus: 'error', detailError: '503 unavailable', detailStale: false });
+  assert.ok(textOf(failed).includes('暂显示官方估算桶'));
+  assert.ok(textOf(failed).includes('503 unavailable'));
+  assert.equal(byClass(failed, 'dcw-retry').props.disabled, false);
+  const stale = mod.ContextPanel({ ...panelProps, detailStatus: 'error', detailError: 'timeout', detailStale: true });
+  assert.ok(textOf(stale).includes('上次成功读取的数据'));
+  assert.ok(textOf(stale).includes('读取超时'));
+});
+check('the whole dialog is bounded and keyboard focus is visible', () => {
+  assert.ok(injected[0].textContent.includes('max-height:calc(100dvh - 24px);overflow-y:auto'));
+  assert.ok(injected[0].textContent.includes('.dcw-trigger:focus-visible'));
+});
+
+// A small mounted-hook harness complements the pure element-tree checks above.
+const originalHooks = { useState: reactShim.useState, useEffect: reactShim.useEffect, useRef: reactShim.useRef };
+let states = [], effects = [], cursor = 0;
+reactShim.useState = (initial) => {
+  const index = cursor++;
+  if (!(index in states)) states[index] = typeof initial === 'function' ? initial() : initial;
+  return [states[index], value => { states[index] = typeof value === 'function' ? value(states[index]) : value; }];
+};
+reactShim.useRef = initial => {
+  const index = cursor++;
+  if (!(index in states)) states[index] = { current: initial };
+  return states[index];
+};
+reactShim.useEffect = (fn, deps) => {
+  const index = cursor++; const old = effects[index];
+  if (old && deps.every((value, i) => Object.is(value, old.deps[i]))) return;
+  old?.cleanup?.(); effects[index] = { deps, cleanup: fn() };
+};
+const hook = (fn, ...args) => { cursor = 0; return fn(...args); };
+const cleanupHooks = () => { for (const entry of effects) entry?.cleanup?.(); states = []; effects = []; };
+const tick = () => new Promise(resolve => setImmediate(resolve));
+async function checkAsync(name, fn) {
+  try { await fn(); passed++; console.log(`  ok  ${name}`); }
+  catch (error) { failures.push(`${name}: ${error.message}`); console.log(`FAIL  ${name}\n      ${error.message}`); }
+  finally { cleanupHooks(); }
+}
+await checkAsync('detail reads are single-flight, stale on failure, retryable and cancelled on session change', async () => {
+  const originalFetch = globalThis.fetch, originalSet = globalThis.setInterval, originalClear = globalThis.clearInterval;
+  const requests = [], timers = new Map(); let nextId = 0;
+  globalThis.fetch = (url, init) => new Promise(resolve => requests.push({ url, signal: init.signal, resolve }));
+  globalThis.setInterval = fn => { const id = ++nextId; timers.set(id, fn); return id; };
+  globalThis.clearInterval = id => timers.delete(id);
+  const response = (sessionId, ok = true) => ({ ok, status: ok ? 200 : 503, json: async () => ok ? { sessionId, generatedAt: 10, tools: detail.tools } : { error: { message: 'offline' } } });
+  try {
+    let state = hook(mod.useDetail, 'one', true);
+    assert.equal(state.status, 'loading'); assert.equal(requests.length, 1);
+    const poll = [...timers.values()][0]; poll(); poll();
+    assert.equal(requests.length, 1, 'slow reads must not overlap on timer ticks');
+    requests[0].resolve(response('one')); await tick(); state = hook(mod.useDetail, 'one', true);
+    assert.equal(state.detail.sessionId, 'one');
+    poll(); requests[1].resolve(response('one', false)); await tick(); state = hook(mod.useDetail, 'one', true);
+    assert.equal(state.stale, true); assert.equal(state.error, 'offline'); assert.equal(state.detail.sessionId, 'one');
+    state.retry(); state = hook(mod.useDetail, 'one', true);
+    assert.equal(requests.length, 3); requests[2].resolve(response('one')); await tick(); state = hook(mod.useDetail, 'one', true);
+    assert.equal(state.error, null); assert.equal(state.stale, false);
+    [...timers.values()][0]();
+    state = hook(mod.useDetail, 'two', true);
+    assert.equal(requests[3].signal.aborted, true); assert.equal(state.detail, null);
+    requests[3].resolve(response('one')); await tick();
+    assert.equal(hook(mod.useDetail, 'two', true).detail, null, 'old session response is ignored even if a mock resolves after abort');
+    requests[4].resolve(response('two')); await tick(); assert.equal(hook(mod.useDetail, 'two', true).detail.sessionId, 'two');
+    [...timers.values()][0](); state = hook(mod.useDetail, 'two', false);
+    assert.equal(requests[5].signal.aborted, true); assert.equal(timers.size, 0);
+    assert.equal(requests.length, 6, 'closing a loaded panel cancels without starting a replacement request');
+    requests[5].resolve(response('two')); await tick();
+    assert.equal(hook(mod.useDetail, 'two', false).detail.sessionId, 'two');
+    hook(mod.useDetail, 'two', true); cleanupHooks();
+    assert.equal(requests[6].signal.aborted, true, 'unmount also cancels the reopened panel read');
+    requests[6].resolve(response('two')); await tick();
+    hook(mod.useDetail, 'new', true); hook(mod.useDetail, 'new', false);
+    assert.equal(requests[7].signal.aborted, true);
+    assert.equal(requests.length, 8, 'closing before the first response also cancels without restarting');
+    requests[7].resolve(response('new')); await tick();
+  } finally { cleanupHooks(); globalThis.fetch = originalFetch; globalThis.setInterval = originalSet; globalThis.clearInterval = originalClear; }
+});
+await checkAsync('portal focus enters the dialog, restores on Escape and never steals outside focus', async () => {
+  const header = { focus: () => { document.activeElement = header; } };
+  let restores = 0;
+  const trigger = { focus: () => { restores++; document.activeElement = trigger; } };
+  const panel = { querySelector: () => header, contains: node => node === header };
+  hook(mod.usePanelFocus, { current: trigger }, { current: panel }, true);
+  assert.equal(document.activeElement, header);
+  cleanupHooks(); assert.equal(document.activeElement, trigger); assert.equal(restores, 1);
+  hook(mod.usePanelFocus, { current: trigger }, { current: panel }, true);
+  const outside = {}; document.activeElement = outside; cleanupHooks();
+  assert.equal(document.activeElement, outside); assert.equal(restores, 1);
+  const listeners = new Map(); let closes = 0; let prevented = false; let stopped = false;
+  const add = document.addEventListener, remove = document.removeEventListener;
+  document.addEventListener = (name, fn) => listeners.set(name, fn);
+  document.removeEventListener = name => listeners.delete(name);
+  try {
+    hook(mod.useDismiss, { current: { contains: node => node === trigger } }, { current: panel }, true, () => { closes++; });
+    listeners.get('keydown')({ key: 'Escape', preventDefault: () => { prevented = true; }, stopPropagation: () => { stopped = true; } });
+    assert.equal(closes, 1); assert.equal(prevented, true); assert.equal(stopped, true);
+    listeners.get('focusin')({ target: header }); assert.equal(closes, 1);
+    listeners.get('focusin')({ target: outside }); assert.equal(closes, 2, 'Tab leaving the nonmodal panel closes it');
+    cleanupHooks(); assert.equal(listeners.size, 0);
+  } finally { cleanupHooks(); document.addEventListener = add; document.removeEventListener = remove; }
+});
+Object.assign(reactShim, originalHooks);
+
 console.log(`\n${String(passed)} passed, ${String(failures.length)} failed`);
 if (failures.length > 0) {
   console.log(failures.join('\n'));

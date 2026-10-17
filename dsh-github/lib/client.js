@@ -164,6 +164,12 @@ window.__ModuleLoader__.load({
 			defaultBranch: '默认分支 {branch}',
 			remoteFailed: '读取仓库列表失败：{message}',
 			confirmBranch: '分支：{branch}',
+			confirmDepth: '历史深度：{depth}',
+			fullHistory: '完整历史',
+			trackingStopped: '进度跟踪已停止',
+			trackingFailed: '无法跟踪下载：{message}。下载可能仍在后台进行；重试只恢复进度查询，不会重复下载。',
+			retryTracking: '重试进度查询',
+			unsavedChanges: '有未保存的修改；刷新状态不会覆盖它们。',
 			confirmToken: '将使用已保存的令牌完成下载，完成后会把 origin 还原为不含令牌的地址。',
 			repoLabel: '仓库',
 			repoPlaceholder: 'owner/repo 或 https://github.com/owner/repo',
@@ -202,7 +208,7 @@ window.__ModuleLoader__.load({
 
 		const en = {
 			title: 'GitHub',
-			intro: 'Connect github/github-mcp-server with a personal access token so the model can call GitHub tools, and download remote repositories into a DSH workspace. The token never leaves this machine.',
+			intro: 'Connect github/github-mcp-server with a personal access token so the model can call GitHub tools, and download remote repositories into a DSH workspace. The token is stored locally and sent only as needed to GitHub or your configured MCP endpoint.',
 			refresh: 'Refresh',
 			wizardTitle: 'Setup wizard',
 			wizardProgress: 'Step {index} of {total} · {label}',
@@ -307,6 +313,12 @@ window.__ModuleLoader__.load({
 			defaultBranch: 'default {branch}',
 			remoteFailed: 'Reading the repository list failed: {message}',
 			confirmBranch: 'Branch: {branch}',
+			confirmDepth: 'History depth: {depth}',
+			fullHistory: 'full history',
+			trackingStopped: 'Progress tracking stopped',
+			trackingFailed: 'Cannot track download: {message}. It may still be running in the background; retry only resumes status checks, not the download.',
+			retryTracking: 'Retry status checks',
+			unsavedChanges: 'Unsaved changes are preserved when status refreshes.',
 			confirmToken: 'The saved token is used for the download, and origin is restored without it afterwards.',
 			repoLabel: 'Repository',
 			repoPlaceholder: 'owner/repo or https://github.com/owner/repo',
@@ -362,8 +374,61 @@ window.__ModuleLoader__.load({
 			}
 			const response = await fetch(path, init);
 			const body = await response.json().catch(() => null);
-			if (body === null) throw new Error(`HTTP ${String(response.status)}`);
+			if (!response.ok || body === null || typeof body !== 'object' || body.ok === false) {
+				const error = new Error(body?.message ?? body?.applied?.message ?? `HTTP ${String(response.status)}`);
+				error.status = response.status;
+				error.reason = body?.reason;
+				throw error;
+			}
 			return body;
+		}
+
+		/** Latest intent wins, including invalidation before a debounce or unmount. */
+		function createRequestGeneration() {
+			let generation = 0;
+			return {
+				next: () => ++generation,
+				isCurrent: (value) => value === generation,
+				invalidate: () => { generation += 1; },
+			};
+		}
+
+		function useRequestGeneration() {
+			const ref = React.useRef(null);
+			if (ref.current === null) ref.current = createRequestGeneration();
+			React.useEffect(() => () => ref.current.invalidate(), []);
+			return ref.current;
+		}
+
+		/** At most one poll in flight; errors stop tracking, never the host clone. */
+		function watchClone(options) {
+			let alive = true;
+			let timer;
+			const schedule = options.schedule ?? setTimeout;
+			const cancel = options.cancel ?? clearTimeout;
+			const poll = async () => {
+				try {
+					const outcome = await (options.request ?? request)(`${ROUTES.clone}?id=${encodeURIComponent(options.id)}`);
+					if (!alive) return;
+					if (outcome.ok !== true || outcome.job?.id !== options.id
+						|| !['running', 'done', 'failed'].includes(outcome.job.state)) {
+						throw new Error(outcome.message ?? 'Invalid download status');
+					}
+					options.onJob(outcome.job);
+					if (outcome.job.state !== 'running') {
+						alive = false;
+						options.onSettled();
+						return;
+					}
+					timer = schedule(poll, 700);
+				} catch (error) {
+					if (!alive) return;
+					alive = false;
+					options.onError(error);
+				}
+			};
+			timer = schedule(poll, 700);
+			return () => { alive = false; cancel(timer); };
 		}
 
 		const CSS = `
@@ -471,7 +536,7 @@ window.__ModuleLoader__.load({
 						setState({ status: 'ready', data, error: null });
 					} catch (error) {
 						if (!alive) return;
-						setState({ status: 'error', data: null, error: error instanceof Error ? error.message : String(error) });
+						setState((previous) => ({ status: 'error', data: previous.data, error: error instanceof Error ? error.message : String(error) }));
 					}
 				})();
 				return () => { alive = false; };
@@ -510,6 +575,7 @@ window.__ModuleLoader__.load({
 				type: 'button',
 				role: 'radio',
 				className: 'dsg-seg-item',
+				disabled: props.disabled === true,
 				'aria-checked': option.value === props.value ? 'true' : 'false',
 				onClick: () => props.onChange(option.value),
 			}, option.label)));
@@ -559,15 +625,18 @@ window.__ModuleLoader__.load({
 			const [envVar, setEnvVar] = React.useState(data.settings.envVar);
 			const [busy, setBusy] = React.useState(false);
 			const [message, setMessage] = React.useState(null);
+			const envDirty = React.useRef(false);
+			React.useEffect(() => { if (!envDirty.current) setEnvVar(data.settings.envVar); }, [data.settings.envVar]);
 
-			const submit = async (body) => {
+			const submit = async (body, route = ROUTES.token) => {
 				setBusy(true);
 				setMessage(null);
 				try {
-					const outcome = await request(ROUTES.token, { body });
-					setDraft('');
-					if (outcome.ok === false) setMessage({ kind: 'error', text: outcome.applied?.message ?? outcome.message ?? 'failed' });
-					else setMessage({ kind: 'ok', text: t('tokenPresent', { preview: outcome.status?.token?.preview ?? '', source: outcome.status?.token?.source ?? '' }) });
+					const outcome = await request(route, { body });
+					if (route === ROUTES.token) setDraft('');
+					if (body.settings?.envVar !== undefined) envDirty.current = false;
+					setMessage({ kind: 'ok', text: route === ROUTES.settings ? t('saveSettings')
+						: fill(t('tokenPresent'), { preview: outcome.status?.token?.preview ?? '', source: outcome.status?.token?.source ?? '' }) });
 					onChanged();
 				} catch (error) {
 					setMessage({ kind: 'error', text: error instanceof Error ? error.message : String(error) });
@@ -588,15 +657,17 @@ window.__ModuleLoader__.load({
 							{ value: 'store', label: t('sourceStore') },
 							{ value: 'env', label: t('sourceEnv') },
 						],
-						onChange: (value) => { void request(ROUTES.settings, { body: { settings: { tokenSource: value } } }).then(onChanged); },
+						disabled: busy,
+						onChange: (value) => submit({ settings: { tokenSource: value } }, ROUTES.settings),
 					}),
 					data.settings.tokenSource === 'env' ? h('span', { className: 'dsg-label', key: 'env-l' }, t('envVar')) : null,
 					data.settings.tokenSource === 'env' ? h('div', { className: 'dsg-inline', key: 'env' }, [
 						h('input', {
 							className: 'dsg-input',
 							value: envVar,
-							onChange: (event) => setEnvVar(event.target.value),
-							onBlur: () => { void request(ROUTES.settings, { body: { settings: { envVar } } }).then(onChanged); },
+							disabled: busy,
+							onChange: (event) => { envDirty.current = true; setEnvVar(event.target.value); },
+							onBlur: () => { if (envDirty.current) void submit({ settings: { envVar } }, ROUTES.settings); },
 						}),
 					]) : null,
 					h('span', { className: 'dsg-label', key: 'token-l' }, t('tokenField')),
@@ -606,6 +677,7 @@ window.__ModuleLoader__.load({
 							type: 'password',
 							placeholder: t('tokenPlaceholder'),
 							value: draft,
+							disabled: busy,
 							onChange: (event) => setDraft(event.target.value),
 						}),
 						h(Button, { key: 'save', variant: 'primary', disabled: busy || draft.trim() === '', onClick: () => submit({ token: draft }) }, t('saveToken')),
@@ -626,17 +698,27 @@ window.__ModuleLoader__.load({
 			const [busy, setBusy] = React.useState(false);
 			const [message, setMessage] = React.useState(null);
 
-			React.useEffect(() => { setDraft(data.settings); }, [data.settings]);
+			const dirty = React.useRef({});
+			// Refresh untouched fields only; never discard an unsaved local edit.
+			React.useEffect(() => { setDraft({ ...data.settings, ...dirty.current }); }, [data.settings]);
 
-			const patch = (values) => setDraft((previous) => ({ ...previous, ...values }));
+			const patch = (values) => {
+				dirty.current = { ...dirty.current, ...values };
+				setDraft((previous) => ({ ...previous, ...values }));
+			};
 
 			const save = async (extra) => {
 				setBusy(true);
 				setMessage(null);
+				const submitted = { ...dirty.current, ...(extra ?? {}) };
 				try {
-					const outcome = await request(ROUTES.settings, { body: { settings: { ...draft, ...(extra ?? {}) } } });
-					if (outcome.ok === false) setMessage({ kind: 'error', text: outcome.applied?.message ?? outcome.message ?? 'failed' });
-					else setMessage({ kind: 'ok', text: t('saveSettings') });
+					// Send only changed fields: unrelated token/wizard patches stay intact.
+					const outcome = await request(ROUTES.settings, { body: { settings: submitted } });
+					for (const key of Object.keys(submitted)) {
+						if (dirty.current[key] === submitted[key]) delete dirty.current[key];
+					}
+					setDraft({ ...(outcome.status?.settings ?? draft), ...dirty.current });
+					setMessage({ kind: 'ok', text: t('saveSettings') });
 					onChanged();
 				} catch (error) {
 					setMessage({ kind: 'error', text: error instanceof Error ? error.message : String(error) });
@@ -719,7 +801,8 @@ window.__ModuleLoader__.load({
 					h(Button, { key: 'connect', disabled: busy, onClick: () => toggle('connect') }, busy ? t('connecting') : t('connect')),
 					h(Button, { key: 'disconnect', disabled: busy || data.mcp.enabled !== true, onClick: () => toggle('disconnect') }, t('disconnect')),
 				]),
-				message === null ? null : h('div', { key: 'msg', className: message.kind === 'ok' ? 'dsg-ok' : 'dsg-error' }, message.text),
+				Object.keys(dirty.current).length === 0 ? null : h('div', { key: 'dirty', className: 'dsg-warn' }, t('unsavedChanges')),
+				message === null ? null : h('div', { key: 'msg', role: 'status', className: message.kind === 'ok' ? 'dsg-ok' : 'dsg-error' }, message.text),
 				data.lastError === null || data.lastError === undefined ? null : h('div', { key: 'last', className: 'dsg-error' }, fill(t('lastError'), { message: data.lastError })),
 			]);
 		}
@@ -732,15 +815,18 @@ window.__ModuleLoader__.load({
 			const [argumentText, setArgumentText] = React.useState('{}');
 			const [result, setResult] = React.useState(null);
 			const [busy, setBusy] = React.useState(false);
+			const calls = useRequestGeneration();
 
 			const needle = filter.trim().toLowerCase();
 			const tools = (data.tools ?? []).filter((tool) => needle === ''
 				|| tool.shortName.toLowerCase().includes(needle)
 				|| String(tool.description ?? '').toLowerCase().includes(needle));
 			const active = tools.find((tool) => tool.shortName === selected) ?? null;
+			React.useEffect(() => { calls.invalidate(); setBusy(false); setResult(null); }, [active?.name]);
 
 			const call = async () => {
 				if (active === null) return;
+				const generation = calls.next();
 				setBusy(true);
 				setResult(null);
 				try {
@@ -752,12 +838,13 @@ window.__ModuleLoader__.load({
 						return;
 					}
 					const outcome = await request(ROUTES.call, { body: { name: active.shortName, arguments: parsed } });
+					if (!calls.isCurrent(generation)) return;
 					if (outcome.ok === false) setResult({ kind: 'error', text: fill(t('callFailed'), { message: outcome.message ?? 'failed' }) });
 					else setResult({ kind: outcome.isError === true ? 'error' : 'ok', text: outcome.text ?? '' });
 				} catch (error) {
-					setResult({ kind: 'error', text: fill(t('callFailed'), { message: error instanceof Error ? error.message : String(error) }) });
+					if (calls.isCurrent(generation)) setResult({ kind: 'error', text: fill(t('callFailed'), { message: error instanceof Error ? error.message : String(error) }) });
 				} finally {
-					setBusy(false);
+					if (calls.isCurrent(generation)) setBusy(false);
 				}
 			};
 
@@ -773,7 +860,7 @@ window.__ModuleLoader__.load({
 							className: 'dsg-input',
 							placeholder: t('toolsFilter'),
 							value: filter,
-							onChange: (event) => setFilter(event.target.value),
+							onChange: (event) => { calls.invalidate(); setBusy(false); setFilter(event.target.value); },
 						}),
 						h('div', { className: 'dsg-tools', key: 'list' }, tools.slice(0, 200).map((tool) => h('button', {
 							key: tool.shortName,
@@ -781,6 +868,8 @@ window.__ModuleLoader__.load({
 							className: 'dsg-tool',
 							'aria-pressed': tool.shortName === selected ? 'true' : 'false',
 							onClick: () => {
+								calls.invalidate();
+								setBusy(false);
 								setSelected(tool.shortName);
 								setArgumentText('{}');
 								setResult(null);
@@ -843,8 +932,20 @@ window.__ModuleLoader__.load({
 			const [message, setMessage] = React.useState(null);
 			const [manualOpen, setManualOpen] = React.useState(false);
 			const [manual, setManual] = React.useState('');
+			const [starting, setStarting] = React.useState(false);
+			const [pollError, setPollError] = React.useState(null);
+			const [pollNonce, setPollNonce] = React.useState(0);
+			const listingRequests = useRequestGeneration();
+			const planRequests = useRequestGeneration();
+			const launching = React.useRef(false);
 
 			const tokenReady = data.token.present === true;
+			const cancelPlan = () => {
+				if (launching.current) return;
+				planRequests.invalidate();
+				setPlan(null);
+				setBusy(false);
+			};
 
 			/**
 			 * Switch the app to a downloaded clone's workspace.
@@ -866,14 +967,12 @@ window.__ModuleLoader__.load({
 				}
 			};
 
-			const load = React.useCallback(async (page, query, append) => {
+			const load = React.useCallback(async (page, query, append, refresh = false) => {
+				const generation = listingRequests.next();
 				setListing((previous) => ({ ...previous, status: 'loading', error: null }));
 				try {
-					const outcome = await request(`${ROUTES.remote}?page=${String(page)}&q=${encodeURIComponent(query)}`);
-					if (outcome.ok !== true) {
-						setListing((previous) => ({ ...previous, status: 'error', error: outcome.message ?? 'failed' }));
-						return;
-					}
+					const outcome = await request(`${ROUTES.remote}?page=${String(page)}&q=${encodeURIComponent(query)}${refresh ? '&refresh=1' : ''}`);
+					if (!listingRequests.isCurrent(generation)) return;
 					setListing((previous) => ({
 						status: 'ready',
 						account: outcome.account ?? previous.account,
@@ -884,73 +983,81 @@ window.__ModuleLoader__.load({
 						error: null,
 					}));
 				} catch (error) {
-					setListing((previous) => ({ ...previous, status: 'error', error: error instanceof Error ? error.message : String(error) }));
+					if (listingRequests.isCurrent(generation)) setListing((previous) => ({ ...previous, status: 'error', error: error instanceof Error ? error.message : String(error) }));
 				}
-			}, []);
+			}, [listingRequests]);
 
-			// Load on mount and whenever the search text settles.
+			// Invalidate before the debounce, not merely when its next request starts.
 			React.useEffect(() => {
-				if (tokenReady !== true) return undefined;
-				let alive = true;
-				const timer = setTimeout(() => { if (alive) void load(1, filter, false); }, filter === '' ? 0 : 450);
-				return () => { alive = false; clearTimeout(timer); };
-			}, [filter, tokenReady, load]);
+				listingRequests.invalidate();
+				if (tokenReady !== true) {
+					setListing({ status: 'idle', account: null, items: [], page: 0, hasMore: false, scanned: 0, error: null });
+					cancelPlan();
+					return undefined;
+				}
+				const timer = setTimeout(() => { void load(1, filter, false); }, filter === '' ? 0 : 450);
+				return () => { listingRequests.invalidate(); clearTimeout(timer); };
+			}, [filter, tokenReady, data.token.preview, data.settings.tokenSource, data.settings.envVar, load]);
 
-			// While a clone runs, follow it; when it settles, refresh the page data.
+			// A stopped watch has an explicit retry; it never retries the clone itself.
 			React.useEffect(() => {
 				if (job === null || job.state !== 'running') return undefined;
-				let alive = true;
-				const timer = setInterval(async () => {
-					try {
-						const outcome = await request(`${ROUTES.clone}?id=${encodeURIComponent(job.id)}`);
-						if (!alive) return;
-						if (outcome.ok === true) {
-							setJob(outcome.job);
-							if (outcome.job.state !== 'running') onChanged();
-						}
-					} catch { /* keep polling; a transient failure must not stop the watch */ }
-				}, 700);
-				return () => { alive = false; clearInterval(timer); };
-			}, [job, onChanged]);
+				return watchClone({
+					id: job.id,
+					onJob: setJob,
+					onSettled: onChanged,
+					onError: (error) => setPollError(error instanceof Error ? error.message : String(error)),
+				});
+			}, [job?.id, job?.state, pollNonce, onChanged]);
 
 			const ask = async (body) => {
+				if (launching.current) return;
+				const generation = planRequests.next();
+				setPlan(null);
 				setBusy(true);
 				setMessage(null);
 				try {
 					const outcome = await request(ROUTES.clone, { body });
-					if (outcome.ok !== true) setMessage({ kind: 'error', text: outcome.message ?? 'failed' });
-					else setPlan(outcome.plan);
+					if (planRequests.isCurrent(generation)) setPlan(outcome.plan);
 				} catch (error) {
-					setMessage({ kind: 'error', text: error instanceof Error ? error.message : String(error) });
+					if (planRequests.isCurrent(generation)) setMessage({ kind: 'error', text: error instanceof Error ? error.message : String(error) });
 				} finally {
-					setBusy(false);
+					if (planRequests.isCurrent(generation)) setBusy(false);
 				}
 			};
 
 			const confirm = async () => {
-				if (plan === null) return;
+				if (plan === null || launching.current) return;
+				const generation = planRequests.next();
+				launching.current = true;
+				setStarting(true);
 				setBusy(true);
 				setMessage(null);
 				try {
 					const outcome = await request(ROUTES.clone, {
-						body: { repo: plan.fullName, branch: plan.branch, private: plan.private === true, confirm: true },
+						body: {
+							repo: plan.fullName, branch: plan.branch, dir: plan.dir, private: plan.private === true, confirm: true,
+							expected: { fullName: plan.fullName, cloneUrl: plan.cloneUrl, dest: plan.dest, branch: plan.branch, depth: plan.depth },
+						},
 					});
-					if (outcome.ok !== true) setMessage({ kind: 'error', text: outcome.message ?? 'failed' });
-					else {
-						setJob(outcome.job);
-						setPlan(null);
-					}
+					if (!planRequests.isCurrent(generation)) return;
+					setPollError(null);
+					setJob(outcome.job);
+					setPlan(null);
 				} catch (error) {
+					if (!planRequests.isCurrent(generation)) return;
+					if (error.reason === 'plan-changed' || error.reason === 'confirmation-required') setPlan(null);
 					setMessage({ kind: 'error', text: error instanceof Error ? error.message : String(error) });
 				} finally {
-					setBusy(false);
+					launching.current = false;
+					if (planRequests.isCurrent(generation)) { setBusy(false); setStarting(false); }
 				}
 			};
 
 			const stateColor = job === null ? undefined : job.state === 'done'
 				? 'var(--dsw-alias-state-success-primary)'
 				: job.state === 'failed' ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-state-warn-primary)';
-			const stateText = job === null ? '' : job.state === 'done' ? t('downloadDone') : job.state === 'failed' ? t('downloadFailed') : t('downloading');
+			const stateText = job === null ? '' : job.state === 'done' ? t('downloadDone') : job.state === 'failed' ? t('downloadFailed') : pollError !== null ? t('trackingStopped') : t('downloading');
 
 			const picker = tokenReady !== true
 				? h('div', { className: 'dsg-empty', key: 'need-token' }, t('needToken'))
@@ -966,7 +1073,7 @@ window.__ModuleLoader__.load({
 						h(Button, {
 							key: 'refresh',
 							disabled: listing.status === 'loading',
-							onClick: () => load(1, filter, false),
+							onClick: () => load(1, filter, false, true),
 						}, t('refreshList')),
 					]),
 					h('input', {
@@ -974,7 +1081,11 @@ window.__ModuleLoader__.load({
 						className: 'dsg-input',
 						placeholder: t('searchPlaceholder'),
 						value: filter,
-						onChange: (event) => setFilter(event.target.value),
+						onChange: (event) => {
+							listingRequests.invalidate();
+							setListing((previous) => ({ ...previous, status: 'loading', items: [], error: null }));
+							setFilter(event.target.value);
+						},
 					}),
 					h('div', { className: 'dsg-repolist', key: 'list' },
 						(listing.status === 'loading' || listing.status === 'idle') && listing.items.length === 0
@@ -987,8 +1098,9 @@ window.__ModuleLoader__.load({
 										key: repo.fullName,
 										type: 'button',
 										className: 'dsg-repo-row',
+										disabled: starting,
 										'aria-pressed': plan !== null && plan.fullName === repo.fullName ? 'true' : 'false',
-										onClick: () => { setPlan(null); setMessage(null); void ask({ repo: repo.fullName, branch: repo.defaultBranch, private: repo.private }); },
+										onClick: () => { void ask({ repo: repo.fullName, branch: repo.defaultBranch, private: repo.private }); },
 									}, [
 										h('span', { className: 'dsg-repo-main', key: 'main' }, [
 											h('span', { className: 'dsg-repo-name', key: 'name' }, repo.fullName),
@@ -1016,7 +1128,8 @@ window.__ModuleLoader__.load({
 							style: { flex: '1 1 240px' },
 							placeholder: t('repoPlaceholder'),
 							value: manual,
-							onChange: (event) => setManual(event.target.value),
+							disabled: starting,
+							onChange: (event) => { cancelPlan(); setManual(event.target.value); },
 						}) : null,
 						manualOpen === true ? h(Button, {
 							key: 'go',
@@ -1029,16 +1142,18 @@ window.__ModuleLoader__.load({
 			return h(Card, { title: t('repoCardTitle') }, [
 				h('div', { className: 'dsg-card-sub', key: 'intro', style: { marginBottom: '8px' } }, t('repoIntro')),
 				h('div', { key: 'picker' }, picker),
+				busy && !starting ? h('div', { key: 'planning', role: 'status', className: 'dsg-card-sub' }, t('preparing')) : null,
 				plan === null ? null : h('div', { className: 'dsg-overlay', key: 'confirm' }, [
 					h('p', { className: 'dsg-overlay-title', key: 'title' }, t('confirmTitle')),
 					h('div', { className: 'dsg-card-sub', key: 'body' }, t('confirmBody')),
 					h('div', { className: 'dsg-repo-path', key: 'src' }, fill(t('confirmSource'), { url: plan.cloneUrl })),
 					h('div', { className: 'dsg-repo-path', key: 'dest' }, fill(t('confirmTarget'), { dest: plan.dest })),
 					plan.branch === '' ? null : h('div', { className: 'dsg-repo-path', key: 'branch' }, fill(t('confirmBranch'), { branch: plan.branch })),
+					h('div', { className: 'dsg-repo-path', key: 'depth' }, fill(t('confirmDepth'), { depth: plan.depth === 0 ? t('fullHistory') : plan.depth })),
 					plan.usesToken === true ? h('div', { className: 'dsg-card-sub', key: 'token' }, t('confirmToken')) : null,
 					h('div', { className: 'dsg-actions', key: 'go' }, [
 						h(Button, { key: 'go', variant: 'primary', disabled: busy, onClick: confirm }, t('confirmGo')),
-						h(Button, { key: 'cancel', onClick: () => setPlan(null) }, t('confirmCancel')),
+						h(Button, { key: 'cancel', disabled: starting, onClick: cancelPlan }, t('confirmCancel')),
 					]),
 				]),
 				job === null ? null : h('div', { key: 'job' }, [
@@ -1048,6 +1163,10 @@ window.__ModuleLoader__.load({
 						className: job.workspace.created === true ? 'dsg-ok' : 'dsg-warn',
 					}, job.workspace.created === true ? t('workspaceCreated') : fill(t('workspaceFailed'), { reason: job.workspace.reason ?? '' })),
 					h('pre', { key: 'log', className: 'dsg-pre' }, (job.log ?? []).slice(-14).join('\n')),
+					pollError === null ? null : h('div', { key: 'poll-error', role: 'alert', className: 'dsg-warn' }, [
+						fill(t('trackingFailed'), { message: pollError }),
+						h(Button, { key: 'retry', onClick: () => { setPollError(null); setPollNonce((value) => value + 1); } }, t('retryTracking')),
+					]),
 				]),
 				message === null ? null : h('div', { key: 'msg', className: 'dsg-error' }, message.text),
 				h('div', { key: 'repos-title', className: 'dsg-label', style: { marginTop: '12px' } }, t('reposTitle')),
@@ -1205,8 +1324,8 @@ window.__ModuleLoader__.load({
 
 			/** Finish and skip do the same thing: stop showing the wizard. */
 			const leave = async () => {
-				await call(ROUTES.settings, { settings: { wizardDone: true } });
-				onDone();
+				const outcome = await call(ROUTES.settings, { settings: { wizardDone: true } });
+				if (outcome?.ok === true) onDone();
 			};
 
 			const stepsRow = h('div', { className: 'dsg-steps', key: 'steps' }, WIZARD_STEPS.map((name, at) => h('span', {
@@ -1332,6 +1451,7 @@ window.__ModuleLoader__.load({
 			const { t, ctx } = props;
 			const [nonce, setNonce] = React.useState(0);
 			const [showAdvanced, setShowAdvanced] = React.useState(false);
+			const [actionError, setActionError] = React.useState(null);
 			const state = useStatus(nonce);
 			useStyles(ctx);
 
@@ -1394,6 +1514,8 @@ window.__ModuleLoader__.load({
 
 			return h('div', { className: 'dsg-root' }, [
 				head,
+				state.error === null ? null : h('div', { key: 'status-error', role: 'alert', className: 'dsg-error' }, fill(t('failed'), { message: state.error })),
+				actionError === null ? null : h('div', { key: 'action-error', role: 'alert', className: 'dsg-error' }, actionError),
 				h('div', { className: 'dsg-strip', key: 'strip' }, [
 					h(Stat, {
 						key: 'state',
@@ -1440,8 +1562,13 @@ window.__ModuleLoader__.load({
 							type: 'button',
 							className: 'dsg-linkbutton',
 							onClick: async () => {
-								await request(ROUTES.settings, { body: { settings: { wizardDone: false } } });
-								reload();
+								setActionError(null);
+								try {
+									await request(ROUTES.settings, { body: { settings: { wizardDone: false } } });
+									reload();
+								} catch (error) {
+									setActionError(error instanceof Error ? error.message : String(error));
+								}
 							},
 						}, t('wizardRerun')),
 					]),
@@ -1481,6 +1608,9 @@ window.__ModuleLoader__.load({
 		exports.NS = NS;
 		exports.ROUTES = ROUTES;
 		exports.fill = fill;
+		exports.request = request;
+		exports.watchClone = watchClone;
+		exports.createRequestGeneration = createRequestGeneration;
 		exports.parameterRows = parameterRows;
 		exports.GitHubSection = GitHubSection;
 		exports.SetupWizard = SetupWizard;

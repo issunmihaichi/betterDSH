@@ -252,6 +252,112 @@ const errorNode = flatten(errored).find((node) => String(node?.props?.className 
 ok(errorNode !== undefined, 'transport failure renders the error state');
 ok(String(errorNode.children?.[0] ?? '').includes('transport exploded'), 'error state surfaces the failure message');
 
+console.log('== UX state and exact-data accessibility ==');
+const previous = { status: 'ready', report: fakeReport(), error: null };
+eq(exported.reportState(previous, { type: 'start', rangeDays: 7 }).report, null, 'switching range cannot relabel old data');
+eq(exported.reportState(previous, { type: 'start', rangeDays: 30 }).report, previous.report, 'refresh keeps same-range last result');
+const staleState = exported.reportState(previous, { type: 'error', rangeDays: 30, error: 'offline' });
+eq(staleState.report, previous.report, 'failed refresh keeps the last successful report');
+eq(staleState.status, 'error', 'failed refresh stays visibly stale');
+ok(flatten(ready).some(node => node.type === 'table'), 'chart has a semantic exact-data table');
+ok(flatten(ready).some(node => node.type === 'td' && node.children[0] === '15700000'), 'table preserves exact token counts');
+ok(flatten(errored).some(node => node.type === 'button' && node.children[0] === bad.state.dictionaries.zh.retry), 'first-load error always provides retry');
+eq(errorNode.props.role, 'alert', 'error is announced');
+
+// A dependency-aware effect harness proves late range requests cannot overwrite.
+const originalEffect = React.useEffect;
+let lastDeps; let lastCleanup;
+React.useEffect = (effect, deps) => { cursor++; if (!lastDeps || deps.some((value,index) => value !== lastDeps[index])) { lastCleanup?.(); lastDeps = deps; lastCleanup = effect(); } };
+remount();
+const pendingReads = [];
+globalThis.fetch = url => new Promise(resolve => pendingReads.push({ url, resolve }));
+const t = key => key;
+render(() => exported.useReport(30, 0, t), {});
+render(() => exported.useReport(7, 1, t), {});
+eq(pendingReads.length, 2, 'range changes dispatch a new request');
+ok(pendingReads[1].url.includes('refresh=1'), 'explicit retry sends refresh contract');
+pendingReads[1].resolve({ ok: true, json: async () => ({ ...fakeReport(), rangeDays: 7 }) });
+await new Promise(resolve => setTimeout(resolve, 0));
+pendingReads[0].resolve({ ok: true, json: async () => fakeReport() });
+await new Promise(resolve => setTimeout(resolve, 0));
+const finalState = render(() => exported.useReport(7, 1, t), {});
+eq(finalState.report.rangeDays, 7, 'late old-range result cannot replace current data');
+lastCleanup?.(); React.useEffect = originalEffect;
+
+console.log('== analytics charts and ranking ==');
+const translate = key => good.state.dictionaries.zh[key] ?? key;
+const analyticDays = [{day:'2026-10-03',label:'10/3'},{day:'2026-10-04',label:'10/4'},{day:'2026-10-05',label:'10/5'}];
+const rawSeries = Array.from({length:12},(_,i)=>({id:`tool-${i}`,label:`Tool ${i}`,total:i+1,values:[i+1,0,0]}));
+const grouped = exported.groupSeries(rawSeries,analyticDays,translate);
+eq(grouped.length,8,'long legends group the tail into one Other series');
+eq(grouped.reduce((sum,item)=>sum+item.total,0),78,'grouping does not drop total counts');
+eq(grouped.reduce((sum,item)=>sum+item.values[0],0),78,'grouping preserves every daily count');
+eq(rawSeries.length,12,'grouping does not mutate input');
+eq(exported.seriesColor('same'),exported.seriesColor('same'),'series colors are deterministic');
+const line = exported.LineChart({days:analyticDays,series:[{id:'model-a',label:'Model A',total:1,values:[0,1,0]}],title:'模型消息',t:translate});
+eq(line.props.role,'img','line chart has an accessible image role');
+eq(flatten(line).filter(node=>node.type==='polyline').length,1,'one model produces one trend line');
+eq(flatten(line).filter(node=>node.props?.className==='dsu-day-hit').length,3,'every day has a keyboard accessible hover target');
+ok(flatten(line).filter(node=>node.props?.className==='dsu-day-hit').every(node=>node.props.tabIndex===0 && node.props['aria-label']),'daily chart targets expose exact counts to keyboard and screen reader');
+ok(flatten(line).filter(node=>node.type==='polyline').every(node=>!node.props.points.includes('NaN')),'line geometry is finite');
+const countLabels=flatten(line).filter(node=>node.props?.className==='dsu-axis'&&node.props.textAnchor==='end').map(node=>node.children[0]);
+eq(countLabels.slice(0,4),['0','1','2','3'],'single skill load uses an integer count axis');
+const zeroLine=exported.LineChart({days:analyticDays,series:[],title:'Empty',t:translate});
+ok(flatten(zeroLine).some(node=>node.props?.className==='dsu-empty'),'empty activity has an explicit empty message');
+remount();
+const trendProps={title:'工具调用',data:{total:78,series:rawSeries},days:analyticDays,t:translate};
+let trend=render(exported.TrendCard,trendProps);
+eq(flatten(trend).filter(node=>node.type==='button').length,8,'trend legend offers a toggle for every visible series');
+eq(flatten(trend).filter(node=>node.type==='th'&&node.props.scope==='col').length,13,'exact table keeps ALL series including grouped tail');
+const legendButton=flatten(trend).find(node=>node.type==='button');
+legendButton.props.onClick();trend=render(exported.TrendCard,trendProps);
+eq(flatten(trend).find(node=>node.type==='button').props['aria-pressed'],'false','legend toggle hides the chosen series');
+eq(flatten(trend).find(node=>node.type===exported.LineChart).props.series.length,7,'legend toggle only changes visible lines');
+eq(flatten(trend).find(node=>node.props?.className==='dsu-trend-value').children[0],'78','hiding a line never changes total activity');
+remount();
+let navigated;let closed=false;
+const rankingCtx={get:name=>name==='uiWorkspace'?{openSession:id=>{navigated=id;}}:undefined};
+const chats=Array.from({length:8},(_,i)=>({id:`session-${i}`,title:`Chat ${i}`,totalTokens:100-i,tokenSharePercent:12.5,models:[{id:'model-a',label:'Model A',input:80,output:20,requests:1}]}));
+const rankProps={analytics:{chats},rangeDays:30,t:translate,ctx:rankingCtx,close:()=>{closed=true;}};
+let ranking=render(exported.ChatRanking,rankProps);
+eq(flatten(ranking).filter(node=>node.props?.className==='dsu-chat-row').length,5,'chat ranking initially shows top five');
+eq(flatten(ranking).filter(node=>node.type==='td'&&node.children[0]==='—').length,10,'unavailable plan quotas are dashes, never fabricated percentages');
+flatten(ranking).find(node=>node.type==='button'&&node.children[0]===translate('showMore')).props.onClick();
+ranking=render(exported.ChatRanking,rankProps);
+eq(flatten(ranking).filter(node=>node.props?.className==='dsu-chat-row').length,8,'Show more reveals additional chats');
+flatten(ranking).find(node=>node.props?.className==='dsu-chat-button').props.onClick();
+ranking=render(exported.ChatRanking,rankProps);
+eq(flatten(ranking).find(node=>node.props?.className==='dsu-chat-button').props['aria-expanded'],'true','ranking expansion has aria-expanded');
+ok(flatten(ranking).some(node=>node.type==='td'&&node.children[0]==='80'),'expanded row exposes exact model token usage');
+await flatten(ranking).find(node=>node.type==='button'&&node.children[0]===translate('openChat')).props.onClick();
+eq(navigated,'session-0','Open chat navigates to the exact session');
+eq(closed,true,'Open chat closes settings through owner affordance');
+ok(nodes.some(node=>node.type===exported.ChatRanking),'usage page mounts chat ranking');
+eq(nodes.filter(node=>node.type===exported.ActivitySection).map(node=>node.props.kind),['tools','messages'],'usage page mounts both independent activity sections');
+
+// Optional workspace UI must not be a prerequisite for viewing usage.
+for (const workspace of [undefined, {}, { openSession: true }]) {
+  const isolated = { ...rankProps, ctx: { get: () => workspace } };
+  const tree = render(exported.ChatRanking, isolated);
+  ok(!flatten(tree).some(node=>node.type==='button'&&node.children[0]===translate('openChat')), 'missing/incompatible workspace hides navigation only');
+  ok(flatten(tree).some(node=>node.props?.className==='dsu-chat-row'), 'usage remains visible without workspace UI');
+}
+let workspace = { openSession: async () => { throw new Error('private diagnostic'); } };
+const dynamic = { ...rankProps, ctx: { get: () => workspace } };
+closed = false;
+ranking = render(exported.ChatRanking, dynamic);
+const oldClick = flatten(ranking).find(node=>node.type==='button'&&node.children[0]===translate('openChat')).props.onClick;
+await oldClick();
+ranking = render(exported.ChatRanking, dynamic);
+ok(flatten(ranking).some(node=>node.props?.role==='alert'&&node.children[0]===translate('openChatFailed')), 'workspace rejection becomes safe local feedback');
+eq(closed, false, 'failed navigation leaves settings open');
+workspace = undefined;
+await oldClick();
+eq(closed, false, 'service unload between render and click is safe');
+workspace = { openSession: id => { navigated = id; } };
+await oldClick();
+eq(closed, true, 'late/replaced workspace service recovers without remount');
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) {
   console.log(`${failures} FAILED`);

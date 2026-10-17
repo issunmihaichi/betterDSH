@@ -13,6 +13,9 @@
  * pure, so writes are fire-and-forget.
  */
 
+import { createHash } from 'node:crypto';
+import { createUsageTiming } from './usage-timing.js';
+import { codexSpeedConnectionKey, codexSpeedError, isCodexSpeedAccount } from './codex-speed.js';
 import { carryPoolFailure, requestRetryConfig, streamWithRequestRetry, waitForRequestRetry } from './retry.js';
 import { isPoolDetectionRetryError, matchesPoolDetection, streamWithPoolDetection, waitForPoolDetection } from './detection.js';
 import {
@@ -186,6 +189,8 @@ export function createPoolAdapter({
   requestRetryMaxDelayMs,
   retryWait = waitForRequestRetry,
   onRetry = () => {},
+  /** Host-only durable session selection; called exactly once per model request. */
+  resolveCodexSpeed = () => ({ mode: 'standard', accounts: [] }),
 } = {}) {
   const retryConfig = requestRetryConfig({ requestRetries, requestRetryDelayMs, requestRetryMaxDelayMs });
   // The transport is optional at construction: without it the adapter is still a
@@ -252,12 +257,12 @@ export function createPoolAdapter({
   }
 
   /** One detached capability snapshot shared by metadata and its prepared call. */
-  function modelCapability(provider, model, candidateOverrides) {
+  function modelCapability(provider, model, candidateOverrides, exactOwners) {
     const route = provider ?? providerName;
     const overrides = candidateOverrides ?? modelOverridesFor(route);
     const source = overrides && typeof overrides === 'object' && Object.hasOwn(overrides, model) ? overrides[model] : undefined;
     const override = source && typeof source === 'object' ? source : {};
-    const owners = candidatesFor(route, model).filter((account) => !(account.models?.length) || account.models.includes(model));
+    const owners = (exactOwners ?? candidatesFor(route, model)).filter((account) => !(account.models?.length) || account.models.includes(model));
     const nativeOwner = (account) => account.platform === 'gemini' || (account.platform === 'openai' && account.authMode === 'oauth');
     const supportsImage = owners.length > 0 && owners.every(nativeOwner);
     const nativeEfforts = (account) => nativeOwner(account) || account.openaiApi === 'responses';
@@ -319,6 +324,14 @@ export function createPoolAdapter({
     } catch { /* a synchronous throw from a bad store must not kill the request */ }
   }
 
+  /** Observer failures (including async sinks) must never change a model result. */
+  function reportUsage(payload, timing) {
+    try {
+      Promise.resolve(onUsage({ ...payload, ...timing.metrics(payload.usage) }))
+        .catch(() => { /* telemetry is best-effort */ });
+    } catch { /* malformed telemetry or a synchronous observer is not a request failure */ }
+  }
+
   function writeAccount(account) {
     accounts.set(account.id, account);
     persistCall('putAccount', account);
@@ -359,14 +372,36 @@ export function createPoolAdapter({
    * recorded — the account did fail, the request just cannot be rescued).
    */
   async function* stream(options = {}, capability = modelCapability(options.provider, options.model)) {
+    const reasoningEffort = options.reasoningEffort ?? null;
     options = mappedCallOptions(options, capability.effortMap);
+    const effortUsage = { reasoningEffort, mappedReasoningEffort: options.reasoningEffort ?? null };
     if (upstream === undefined) {
       const error = new Error('account pool has no upstream transport configured (management-only mode)');
       error.code = 'POOL_NO_UPSTREAM';
       throw error;
     }
+    // Include capability discovery in request-to-first-token latency.
+    const timing = createUsageTiming(clock);
+    // Call options cannot inject a tier or an entitlement. Only the trusted Host
+    // resolver may supply them, and one detached result owns all retry/failover.
+    options = { ...options };
+    delete options.codexServiceTier; delete options.codexSpeedIdentity; delete options.codexSpeedModel;
+    const resolvedSpeed = await resolveCodexSpeed(options);
+    const speedMode = resolvedSpeed?.mode;
+    if (!['standard', 'fast', 'ultrafast'].includes(speedMode)) throw codexSpeedError('POOL_CODEX_SPEED_INVALID');
+    const speedTier = speedMode === 'fast' ? 'priority' : speedMode === 'ultrafast' ? 'ultrafast' : undefined;
+    const speedProofs = Array.isArray(resolvedSpeed.accounts) ? resolvedSpeed.accounts.map(proof => ({
+      accountId: proof.accountId, connectionKey: proof.connectionKey, identity: proof.identity,
+    })) : [];
+    const speedProof = account => speedProofs.find(proof => proof.accountId === account.id
+      && proof.connectionKey === codexSpeedConnectionKey(account)
+      && (speedMode !== 'ultrafast' || typeof proof.identity === 'string' && proof.identity));
+    const requestCandidates = () => candidatesFor(options.provider, options.model)
+      .filter(account => speedMode === 'standard' || isCodexSpeedAccount(account) && speedProof(account));
+    if (speedTier && !requestCandidates().length) throw codexSpeedError();
     const sessionHash = typeof options?.sessionId === 'string' ? options.sessionId : '';
     const requestedModel = options?.model;
+    const timedUpstream = timing.wrap(upstream);
     const excluded = new Set();
     const attempts = [];
     let switches = 0;
@@ -378,7 +413,7 @@ export function createPoolAdapter({
       const groupMode = groups.get(groupOfProvider(options?.provider))?.selectionMode ?? 'sticky';
       const useSticky = groupMode === 'sticky';
       const selection = selectCandidate({
-        accounts: candidatesFor(options?.provider, options?.model),
+        accounts: requestCandidates(),
         bindings,
         sessionHash,
         requestedModel,
@@ -392,16 +427,16 @@ export function createPoolAdapter({
       const account = selection.account;
 
       if (account === undefined) {
-        onUsage({
+        reportUsage({
           accountId: attempts.at(-1)?.accountId ?? '',
           sessionId: sessionHash,
           platform: attempts.at(-1)?.platform ?? '',
-          model: requestedModel ?? '',
+          model: requestedModel ?? '', ...effortUsage,
           usage: null,
           switches,
           ok: false,
           errorCode: 'POOL_EXHAUSTED',
-        });
+        }, timing);
         throw new PoolExhaustedError(
           attempts.length === 0
             ? 'account pool has no schedulable account'
@@ -420,20 +455,22 @@ export function createPoolAdapter({
           const occupied = new Map(inflight);
           occupied.set(account.id, Math.max(0, (occupied.get(account.id) ?? 0) - 1));
           return selectCandidate({
-            accounts: candidatesFor(options.provider, requestedModel).filter(row => row.id === latest.id),
+            accounts: requestCandidates().filter(row => row.id === latest.id),
             bindings: new Map(), sessionHash: '', requestedModel, excluded: new Set(),
             now: clock.now(), inflight: occupied, useSticky: false,
           }).account !== undefined;
         };
         const detectingUpstream = {
-          stream: (row, request) => streamWithPoolDetection(upstream, row, request, {
+          stream: (row, request) => streamWithPoolDetection(timedUpstream, row, request, {
             getAccount, canRetry, wait: detectionWait,
           }),
         };
-        for await (const chunk of streamWithRequestRetry(detectingUpstream, account, options, {
+        const requestOptions = speedTier ? { ...options, codexServiceTier: speedTier,
+          ...(speedMode === 'ultrafast' ? { codexSpeedIdentity: speedProof(account)?.identity, codexSpeedModel: options.model } : {}) } : options;
+        for await (const chunk of streamWithRequestRetry(detectingUpstream, account, requestOptions, {
           getAccount, canRetry, config: retryConfig, failurePolicy, wait: retryWait, onRetry,
           canRetryRateLimit: () => selectCandidate({
-            accounts: candidatesFor(options.provider, requestedModel), bindings, sessionHash, requestedModel,
+            accounts: requestCandidates(), bindings, sessionHash, requestedModel,
             excluded: new Set([...excluded, account.id]), now: clock.now(), inflight, useSticky: false,
           }).account === undefined,
         })) {
@@ -449,6 +486,7 @@ export function createPoolAdapter({
         }
         options.signal?.throwIfAborted();
       } catch (failure) {
+        timing.finish();
         const failedAt = clock.now();
         const detection = isPoolDetectionRetryError(failure) || matchesPoolDetection(failure, account);
         const decision = options.signal?.aborted || failure?.name === 'AbortError' || detection
@@ -478,16 +516,16 @@ export function createPoolAdapter({
 
         const retryable = decision.kind !== 'none' && committed === false && switches < maxSwitches;
         if (!retryable) {
-          onUsage({
+          reportUsage({
             accountId: account.id,
             sessionId: sessionHash,
             platform: account.platform,
-            model: requestedModel ?? '',
+            model: requestedModel ?? '', ...effortUsage,
             usage: attemptUsage,
             switches,
             ok: false,
             errorCode: String(failure?.code ?? ''),
-          });
+          }, timing);
           if (options.signal?.aborted || failure?.name === 'AbortError') throw failure;
           throw carryPoolFailure(failure, committed && !isPoolDetectionRetryError(failure) ? { code: 'POOL_PARTIAL_RESPONSE' } : {});
         }
@@ -498,24 +536,29 @@ export function createPoolAdapter({
         release(account.id);
       }
 
-      // Success path.
+      // Success path. Timing is already frozen at upstream completion, before writes.
+      timing.finish();
       const doneAt = clock.now();
       const current = accounts.get(account.id);
       if (current !== undefined) writeAccount(applySuccess(current, doneAt));
-      if (current !== undefined && useSticky && sessionHash !== '' && selection.bindingState !== 'hit') {
-        writeBinding(makeBinding(sessionHash, current, doneAt));
+      const codexSticky = current?.platform === 'openai' && current.authMode === 'oauth';
+      if (current !== undefined && useSticky && sessionHash !== '' && (codexSticky || selection.bindingState !== 'hit')) {
+        // A hit is activity, not an old fixed creation deadline. Only Codex gets
+        // the longer idle window; explicit non-sticky group policies and all
+        // cooldown/capacity/failover rules remain authoritative.
+        writeBinding(makeBinding(sessionHash, current, doneAt, codexSticky ? DURATIONS.codexStickyTtlMs : DURATIONS.stickyTtlMs));
       }
       attempts.push({ accountId: account.id, platform: account.platform, outcome: 'ok' });
-      onUsage({
+      reportUsage({
         accountId: account.id,
         sessionId: sessionHash,
         platform: account.platform,
-        model: requestedModel ?? '',
+        model: requestedModel ?? '', ...effortUsage,
         usage: attemptUsage,
         switches,
         ok: true,
         errorCode: '',
-      });
+      }, timing);
       return;
     }
   }
@@ -531,6 +574,8 @@ export function createPoolAdapter({
       throw Object.assign(new Error('account is already testing or at capacity'), { code: 'POOL_TEST_BUSY' });
     }
     const startedAt = clock.now();
+    const timing = createUsageTiming(clock, startedAt);
+    const timedUpstream = upstream === undefined ? undefined : timing.wrap(upstream);
     const controller = new AbortController();
     probing.add(id);
     acquire(id);
@@ -547,7 +592,7 @@ export function createPoolAdapter({
           // Probes may start disabled/error accounts for diagnosis, but stop if the
           // operator changes their scheduling state while a retry is waiting.
           const canRetry = latest => latest.status === account.status && latest.schedulable === account.schedulable;
-          const detectingUpstream = { stream: (row, request) => streamWithPoolDetection(upstream, row, request, {
+          const detectingUpstream = { stream: (row, request) => streamWithPoolDetection(timedUpstream, row, request, {
             getAccount, canRetry, wait: detectionWait,
           }) };
           for await (const chunk of streamWithRequestRetry(detectingUpstream, account, {
@@ -570,6 +615,7 @@ export function createPoolAdapter({
         })(),
         new Promise((_, reject) => {
           timer = setTimeout(() => {
+            timing.finish();
             completed = true;
             reject(Object.assign(new Error('test timed out'), { code: 'POOL_TEST_TIMEOUT' }));
             controller.abort();
@@ -579,6 +625,7 @@ export function createPoolAdapter({
     } catch (error) {
       failure = error;
     } finally {
+      timing.finish();
       completed = true;
       clearTimeout(timer);
       controller.abort();
@@ -629,13 +676,84 @@ export function createPoolAdapter({
         lastTestModel: model, lastTestLatencyMs: result.latencyMs,
         lastTestErrorCode: errorCode, lastTestMessage: message, updatedAt: result.at });
     }
-    onUsage({ accountId: id, sessionId: `account-pool-test-${id}`, platform: account.platform,
-      model, usage: attemptUsage, switches: 0, ok: result.ok, errorCode });
+    reportUsage({ accountId: id, sessionId: `account-pool-test-${id}`, platform: account.platform,
+      model, reasoningEffort: 'off', mappedReasoningEffort: 'off', usage: attemptUsage, switches: 0, ok: result.ok, errorCode }, timing);
     return result;
+  }
+
+  // Host-only, fixed-account diagnostic capability. Never expose a credential,
+  // connection URL, arbitrary request options, or ordinary scheduling/failover.
+  function accountProbeKey(account) {
+    const keys = ['id', 'createdAt', 'platform', 'authMode', 'credentialRef', 'baseUrl',
+      'chatgptAccountId', 'projectId', 'openaiApi', 'openaiTransport', 'mimicry', 'betas', 'models'];
+    return createHash('sha256').update(JSON.stringify(keys.map(key => [key, account[key] ?? null]))).digest('hex');
+  }
+  function describeAccountProbe(id) {
+    const account = accounts.get(id);
+    if (!account) throw Object.assign(new Error('Account no longer exists.'), { code: 'POOL_TEST_TARGET_CHANGED' });
+    return { id, label: account.label || id, platform: account.platform,
+      key: accountProbeKey(account), models: [...(account.models ?? [])] };
+  }
+  function prepareAccountProbe(id, { model, reasoningEffort, maxTokens = 8192 } = {}) {
+    const account = accounts.get(id);
+    if (!account) throw Object.assign(new Error('Account no longer exists.'), { code: 'POOL_TEST_TARGET_CHANGED' });
+    if (typeof model !== 'string' || !model.trim() || model.length > 256) throw new RangeError('A probe needs an exact model.');
+    if (account.models?.length && !account.models.includes(model)) throw new RangeError('This account does not allow the selected model.');
+    if (!Number.isSafeInteger(maxTokens) || maxTokens < 1024 || maxTokens > 32768) throw new RangeError('Invalid probe output budget.');
+    const capability = modelCapability(providerName, model, undefined, [account]);
+    if (reasoningEffort !== undefined && !capability.info.reasoning?.efforts.some(row => row.id === reasoningEffort)) throw new RangeError('The selected effort is unsupported by this account/model.');
+    const target = Object.freeze(describeAccountProbe(id));
+    const options = Object.freeze(mappedCallOptions({ model, maxTokens,
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }, capability.effortMap));
+    const effortUsage = { reasoningEffort: reasoningEffort ?? null, mappedReasoningEffort: options.reasoningEffort ?? null };
+    function assertTarget() {
+      const latest = accounts.get(id);
+      if (!latest || accountProbeKey(latest) !== target.key) throw Object.assign(new Error('Account connection changed; start a new test.'), { code: 'POOL_TEST_TARGET_CHANGED' });
+      return latest;
+    }
+    return Object.freeze({ target, selection: Object.freeze({ provider: providerName, model,
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }),
+      async *stream(prompt, signal) {
+        signal?.throwIfAborted();
+        const latest = assertTarget();
+        if (typeof prompt !== 'string' || !prompt || prompt.length > 16384) throw new RangeError('Invalid fixed probe prompt.');
+        if (probing.has(id) || !hasCapacity(latest, inflight)) throw Object.assign(new Error('Account is testing or at capacity.'), { code: 'POOL_TEST_BUSY' });
+        if (!upstream) throw Object.assign(new Error('Upstream unavailable.'), { code: 'POOL_NO_UPSTREAM' });
+        const timing = createUsageTiming(clock);
+        const timedUpstream = timing.wrap(upstream);
+        probing.add(id); acquire(id);
+        let usage = null, stopped = false, failure;
+        try {
+          // No retries, sticky session, tools, history, cooldown, or fallback account.
+          for await (const chunk of timedUpstream.stream(latest, { ...options, system: '', purpose: 'model-attribution',
+            messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }], signal })) {
+            signal?.throwIfAborted(); assertTarget();
+            if (chunk.type === 'usage') usage = accumulateUsage(usage, chunk.usage);
+            if (chunk.type === 'finish') { stopped = chunk.reason?.kind === 'stop'; failure = failureOfFinish(chunk.reason); }
+            yield chunk;
+          }
+        } catch (error) { failure = error; throw error; }
+        finally {
+          timing.finish();
+          probing.delete(id); release(id);
+          reportUsage({ accountId: id, sessionId: '', platform: account.platform, model, ...effortUsage, usage, switches: 0,
+            ok: stopped && !failure, errorCode: stopped && !failure ? '' : 'POOL_MODEL_PROBE_FAILED' }, timing);
+        }
+      },
+    });
   }
 
   return {
     testAccount,
+    describeAccountProbe,
+    prepareAccountProbe,
+    /** Host-only scheduling write; the Host owns lifecycle and durable ack. */
+    pauseAccountProbeScheduling(id, key) {
+      const current = accounts.get(id);
+      if (!current || accountProbeKey(current) !== key) throw Object.assign(new Error('Account connection changed; start a new test.'), { code: 'POOL_TEST_TARGET_CHANGED' });
+      // Unlike a management upsert, do not change updatedAt or any other field.
+      writeAccount({ ...current, schedulable: false });
+    },
     /** Apply the host's current live setting without rebuilding the adapter. */
     setProviderDisplayName(value) {
       providerDisplayName = value;
@@ -769,6 +887,12 @@ export function createPoolAdapter({
     },
     getGroup(id) {
       return groups.get(id);
+    },
+    /** Trusted Host projection; unlike generic provider parsing, unknown routes
+     * never alias the default pool. Account/group allow-lists remain authoritative. */
+    listRouteAccounts(provider, model) {
+      if (!this.callableRoutesFor().includes(provider)) return [];
+      return candidatesFor(provider, model).filter(account => !account.models?.length || account.models.includes(model));
     },
     /** Seed/replace the group registry (host: when the domain opens). */
     setGroups(next) {

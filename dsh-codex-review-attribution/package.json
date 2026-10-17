@@ -1,0 +1,34 @@
+{
+  "name": "dsh-codex-review-attribution",
+  "version": "0.1.2",
+  "description": "Host-only companion attributing official Auto review requests without changing its authorization gate",
+  "license": "MIT",
+  "type": "module",
+  "main": "./lib/host.js",
+  "exports": {
+    ".": "./lib/host.js"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.4"
+  },
+  "engines": {
+    "node": ">=22.12",
+    "dsh": "0.2.0-rc.2 || 0.2.1-rc.2"
+  },
+  "scripts": {
+    "test": "node --test tools/mock-test.mjs tools/reviewer-model-test.mjs",
+    "test:mock": "node --test tools/mock-test.mjs tools/reviewer-model-test.mjs",
+    "test:compat": "node --import ./tools/offline-hooks.mjs --test tools/update-compat-test.mjs tools/authorization-update-test.mjs tools/cordis-update-test.mjs"
+  }
+}

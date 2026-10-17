@@ -1,126 +1,89 @@
 # dsh-usage-report — 设置里的「用量」页
 
-在 DSH 设置的侧栏里加一个 **用量** 页，按天统计**本机**会话的输入 / 输出 token。
+在 DSH 设置侧栏增加 **用量** 页，按天统计本机会话的输入/输出 token。数据来自本机日志，只向 DSH 的同源认证路由读取；不访问供应商，不包含费用/账单数据。
 
-**纯本地**：数据全部来自本机保存的会话日志，只在本机 loopback 的 GUI 路由上读取，
-不发起任何外部网络请求，不涉及费用、账单或供应商费率。
+## 0.2.1 独立运行保护
 
-![设置 → 用量（最近 30 天）](docs/screenshots/live-settings-usage-30d.png)
+无需安装账号池、GitHub、MCP 与技能或上下文窗口插件。可选 `uiWorkspace` 服务缺失或不提供 `openSession` 时，只隐藏“打开聊天”，统计继续可用；服务在点击前卸载、同步抛错或异步拒绝时，保留设置页并给出局部错误。需要 DSH 核心的连接和会话读取能力，不代表可以脱离宿主运行。
 
-![设置 → 用量（最近 7 天）](docs/screenshots/live-settings-usage-7d.png)
+## 页面与恢复
 
-上图为真实运行中的 DSH（`desktop` profile）截图，不是设计稿。
+- 输入/输出两张总量卡；输入显示未缓存、缓存读/写，输出显示模型回复次数。
+- 日用量柱状图支持 7/30/90 天，主题色区分输入/输出。切换范围时不把旧图标成新范围。
+- 「查看每日精确数据」提供语义表格：日期、输入、输出、回复次数；重要数值不只靠鼠标悬停。
+- 「刷新」发出 `refresh=1` 绕过 Host 60 秒缓存；同范围并发仍共享一次统计。
+- 刷新失败保留同范围上次成功结果，明确标记更新失败并提供重试；首次读取失败也有重试按钮。
+- 部分统计显示跳过及未扫描数量；会话全部无法读取时，不把零值解释为“没有用量”。
+- 状态行采用 `status`/`alert`，更新中的根区域标记 `aria-busy`。
 
-## 界面内容
+## 0.2.0 新增统计
 
-- **两个数字卡**
-  - 输入 token：并给出 `未缓存 / 缓存读 / 缓存写` 明细
-  - 输出 token：并给出模型回复次数
-- **每日 Token 用量图**：输入（橙）/ 输出（绿）两条系列的分组柱状图，
-  纵轴自适应取整（`120M` 这类刻度）、横轴取 8 个等距日期、悬停显示当天数值；
-  右上角 `7 天 / 30 天 / 90 天` 切换与 `刷新`
-- **页脚**：`仅本机` 标记、统计范围、扫描 / 跳过会话数、生成时间
+- **聊天用量排行**：跟随顶部 7/30/90 天范围，按输入 + 输出 Token 降序排列，默认前 5 条；支持显示更多、展开模型明细、打开对应聊天。Token 占比以本次已扫描会话的总 Token 为分母。
+- **工具活动**：独立 7/30 天切换；工具调用与成功加载技能分别显示总数、每日多折线和图例。历史工具没有稳定的插件归属，按真实工具名显示，不伪造插件名称。
+- **消息趋势**：独立 7/30 天切换，支持按模型/使用端。统计 `assistant/message` 模型回复消息（包括工具调用消息，缺失 usage 的回复仍计入），**不是用户发送消息数**。
+- 图例可点击隐藏/恢复折线；超过 7 个分组汇总为“其他”，每日精确表仍保留所有原始分组。悬停/键盘聚焦日期可查看数值。
+- 工具按 `tool/call` 计数；技能按对应 `skill` 调用的成功 `tool/result` 日期计数，失败、重复结果和 fork 继承前缀不重复计入。
+- **套餐限额不可用**：本机日志无 5 小时、每周套餐限额或计费额度，限额列显示 `—`，不把 Token 占比当作套餐额度占比。
+- **使用端不可用**：历史日志没有可靠的 Desktop/Web/CLI 来源，按使用端显示“未记录”及说明，不按当前浏览器猜测历史来源。
+- 所有新增统计复用本机同源认证接口，不读取凭证、不请求外部服务、不返回消息正文或工具参数。
 
-## 数据来源与统计口径
+## 统计口径
 
-- 通过宿主服务 `ctx.sessionQuery.listSessions()` + `readSession()` 读取本机会话，
-  只统计 `assistant/message` 事件中 `data.usage` 携带的 token。
-- 分桶按事件时间 `time` 落在**本机日历日**（截图机器为 UTC+8）。
-- 两条系列的定义：
-  - **输入** = `inputTokens + cacheReadTokens + cacheWriteTokens`
-  - **输出** = `outputTokens`
-  - 本机数据里缓存读占绝大多数，因此“输入远大于输出”是正常现象，卡片里给了明细。
-- fork 会话的**继承前缀会被跳过**（那部分是父会话的花费），与 DSH 自身口径一致。
-- **口径校验**：对每条存在投影缓存的会话，本模块折出的总数与 DSH 自己的
-  `tokenUsage` 投影**逐字段完全相等**（12/12；另 1 条是运行测试时正在写入的本会话，
-  其日志必然领先于缓存快照，改用“不小于”断言）。见 `tools/report-test.mjs`。
+通过 `ctx.sessionQuery.listSessions()` / `readSession()` 读取 `assistant/message` 中的 `data.usage`：
 
-## 架构
+- 输入 = `inputTokens + cacheReadTokens + cacheWriteTokens`，输出 = `outputTokens`。
+- 按事件时间落在本机日历日分桶，跨日会话不会整段算在开始那一天。
+- fork 继承前缀被跳过，不重复统计父会话使用量。
+- 缓存读是输入的一部分，因此输入比输出大不一定是错误。
+- 默认最多扫描 500 条，优先 live 会话；失败会话不会导致整个聚合失败。
 
-| 半边 | 文件 | 职责 |
-| --- | --- | --- |
-| Host | `lib/host.js` | 在认证的 `/api` 通道上注册精确路由 `GET /api/usage.report?range=30`，聚合并缓存（默认 60s、同范围单飞） |
-| Client | `lib/client.js` | `window.__ModuleLoader__.load` 形态的纯 JS 包（**无需构建步骤**），向 `settings.section` 注册 `id: usage`、`order: 13`，读取 `api/usage.report`，用 `--dsw-alias-*` 主题变量渲染 |
-| 共用 | `lib/report.js` | 纯函数聚合核心，两个半边与离线测试共用 |
+**已知真实数据差异：**此前另行对账 78 条本机会话，72 条与投影缓存精确一致，6 条不一致（完整检查 183/189）。该兼容性差异未在本轮修复。确定性测试通过不代表真实对账全通过，也不保证模型 API 的计费口径。
 
-数据流：Client 页 → `fetch('api/usage.report?range=N')`（同源、带会话 cookie）
-→ Host 路由 → `sessionQuery` 折叠本机会话 → JSON → 页内 SVG 柱状图。出口只有本机 loopback。
+## 安装
 
-## 已安装的位置（本机现状）
+使用 DSH 官方插件管理器安装本地目录的绝对路径，例如：
 
-`plugin_manager` 已把它装进 `desktop` profile：
+```text
+plugin_manager install_bundle target = "D:/path/to/betterDSH/dsh-usage-report"
+```
 
-- `C:\Users\Administrator\.dsh\profiles\desktop\package.json`
-  - `dependencies`：`"dsh-usage-report": "link:D:/Backup/Documents/deepseek-harness/default-workspace/dsh-usage-report"`
-  - `dsh.profile.bundles`：追加 `dsh-usage-report`
-- profile 的 `cordis.patch.yml` 末尾由管理器记录了一行 `- id: usage-report` / `disabled: false`
-- profile 的 `node_modules/dsh-usage-report` 是指向本目录的链接，所以**改这里的文件就是改运行中的插件**
+也可由安装向导勾选安装。发行 patch 使用可移植包名入口，不携带开发机器路径或诊断输出设置。
+更新 Host 后重启 DSH，更新 Client 后刷新 GUI。只有确认对应开发 watcher 在运行才能期待自动热更新；禁用/重新启用相同 Host 模块通常不会绕过 ESM 缓存。
 
-安装 / 卸载：
+## 实现边界
+
+| 模块 | 职责 |
+| --- | --- |
+| [Host](lib/host.js) | 认证 `GET /api/usage.report?range=30`，范围限制、TTL 缓存、单飞、失败隔离；`refresh=1` 强制重算 |
+| [Client](lib/client.js) | 单一 ModuleLoader bundle，`settings.section` id `usage`；状态过渡、生命周期 guard、图表与精确表 |
+| [report](lib/report.js) | 零依赖纯函数聚合、按本地日分桶、报告组装 |
+
+共享统计不会绑定第一位调用者的取消信号，避免一个浏览器离开页面就让另一个调用者的统计失败。已经启动的有界 fold 会完成并缓存，后续请求复用结果。
+
+## 离线回归
 
 ```powershell
-# 卸载（插件页里移除该 bundle 亦可）
-plugin_manager remove_bundle  target = "dsh-usage-report"
-# 重新安装
-plugin_manager install_bundle target = "D:\Backup\Documents\deepseek-harness\default-workspace\dsh-usage-report"
+node tools/report-test.mjs --synthetic-only
+node tools/host-test.mjs
+node tools/client-test.mjs
 ```
 
-安装前的 profile 配置备份在
-`_usage-work\backup-20261005-045443\`（`package.json`、`cordis.patch.yml`、`pnpm-lock.yaml` 等）。
+本轮验证：纯聚合 29/29、Host 46/46、Client 74/74。覆盖普通缓存与强制刷新、单飞、调用者取消隔离、统计截断，以及范围切换不混数据、旧请求反序返回、失败保留、首屏重试、精确表格语义。
 
-## 验证（本机实测）
+默认 `pnpm test` 运行以上确定性测试；真实日志与投影缓存对账另用 `pnpm test:local`，读取操作者本机日志，已知可能存在差异。不要把它绑定到跨机器 CI。仓库根 `node tools/test.mjs usage` 不读取真实日志、不修改 profile。
 
-| 项目 | 结果 |
-| --- | --- |
-| `node tools/report-test.mjs` | **59/59** 通过，含 12/12 与 DSH `tokenUsage` 投影逐会话对账 |
-| `node tools/host-test.mjs` | **41/41** 通过：路由契约、报告内容、范围回退、缓存/单飞、失败隔离 |
-| `node tools/client-test.mjs` | **63/63** 通过：bundle 可解析、注册、`loading / ready / error` 三态渲染、图表几何与坐标轴 |
-| 合计 | **163/163**（`node --test` 之外的三支零依赖脚本，`package.json` 的 `npm test` 串起全部三支） |
-| 实机渲染 | 无头 Chrome 打开认证 URL → 设置 → 用量：控制台**零错误**；`7 天 / 30 天 / 90 天` 切换正常（两张截图） |
-| 运行期 Inspector | `settings.section` 占用者出现 `{ registrant: "dsh-usage-report", id: "usage", order: 13, active: true }` |
-| Host 半 | 该条目 `application: applied`、无 warning；路由实测返回真实报告（13 个会话、0 跳过、3 个活跃日） |
+测试中的 React 为轻量 hook/tree 模拟，尚未完成本轮实际浏览器布局、键盘和屏幕阅读器验收。
 
-两个测试都不需要网络，也都可以在任意机器上重跑（会读本机 `$DSH_HOME` 下的会话）。
+## 历史截图与限制
 
-## 已知限制
+![历史：设置 → 用量（30 天）](docs/screenshots/live-settings-usage-30d.png)
 
-- 侧栏**图标是设置面板的通用齿轮**：`settings.section` 没有图标位，DSH 的设置外壳按
-  section id 硬编码图标（`navIcon(id)`），第三方 section 只能拿到默认齿轮。
-- 一次统计最多扫描 `maxSessions`（默认 500）条会话，被截断的数量记在 `meta.truncatedSessions`。
-- 读取失败 / 无法回放的会话不会让页面失败，页脚 `title` 里给出前 5 条原因。
-- 长会话跨天时按**事件时间**精确分桶，不会整段算到会话开始那天。
-- 文案跟随 DSH 语言（内置 zh / en 词条），目前其余语言回退到 en。
-- 输出条在输入极大的日子会显得很细（共享线性刻度）；非零值保证至少 2px，可用悬停看准确数。
+该截图来自此前版本，**不是本轮新增刷新反馈和精确表的实机验收截图**；截图不打进运行包。
 
-## 改完怎么生效（重要）
+- 第三方设置分区的侧栏图标由宿主决定。
+- 输入/输出共享线性刻度，输出极小时柱子较细；精确表可读原始数。
+- 使用 zh/en 词条，其他语言回退到 en。
+- 统计过程中日志可继续变化，报告是生成时点的近似本机快照，不是完整账单。
+- 单飞统计尚无插件级 dispose 取消机制；通过最大会话数与并发数限制工作量。
 
-- **改 `lib/client.js`**：DSH 的 client HMR 按产物 rev 自动重载，刷新页面即可见（本目录是链接安装，改文件即改产物）。
-- **改 `lib/host.js`**：加载器按 **specifier** 记忆已导入的宿主模块，同一个条目**不会**重新导入。
-  需要重载该条目才生效（插件页里开关一次，或 `plugin_manager set_bundle` 关 → 开）。
-  `cordis.patch.yml` 里条目名用绝对路径，正是为了在**不重启应用**的前提下换文件生效；
-  若把条目名改回包名（移植写法，见该文件注释），改动只在下次启动进程时生效。
-
-## 文件
-
-```
-dsh-usage-report/
-├── package.json          # dsh.bundle.patch + dsh.client(platform: web) 声明
-├── cordis.patch.yml      # 往 profile 里插一行：id=usage-report
-├── lib/
-│   ├── host.js           # Host 半：/api/usage.report 路由 + 聚合缓存
-│   ├── client.js         # Client 半：settings.section「用量」页（手写 JS，无构建）
-│   └── report.js         # 纯函数：按本地日分桶、汇总、组装报告
-├── docs/screenshots/     # 实机截图（30 天 / 7 天）
-├── tools/
-│   ├── report-test.mjs   # 聚合 + 真实日志对账（59 项）
-│   ├── client-test.mjs   # 客户端 bundle 离线渲染测试（63 项）
-│   ├── screenshot.mjs    # 无头 Chrome CDP 驱动：打开设置→用量并截图
-│   ├── asar.mjs          # 读已安装 app.asar 的条目（研究用）
-│   ├── scan.mjs          # 在 app.asar 里按字面量搜代码（研究用）
-│   ├── zstd-jsonl.mjs    # 解码 DSH 的 zstd 分帧 JSONL 会话日志（研究/测试用）
-│   └── probe-session.mjs # 打印某个会话的事件类型与 usage 汇总（研究用）
-└── refs/                 # 从本机已安装 app.asar 抽出的 DSH 源码片段（只读参考，不参与运行）
-```
-
-`refs/` 仅作实现参考：它们解释了 `settings.section` 注册形态、`connection.fetch` 路由契约、
-client bundle 的加载与 HMR 规则。运行时不依赖其中任何文件。
+MIT。

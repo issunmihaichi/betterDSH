@@ -1,0 +1,3 @@
+- insert:
+    - id: betterdsh-installer
+      name: dsh-installer

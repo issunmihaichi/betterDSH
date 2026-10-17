@@ -10,6 +10,9 @@ import {
   accumulateSnapshot,
   aggregateSnapshots,
   buildReport,
+  createAggregationState,
+  accumulateAnalyticsSnapshot,
+  buildAnalyticsReport,
   dayKeys,
   dayLabel,
   emptyBuckets,
@@ -105,6 +108,24 @@ eq(empty.totals.requests, 0, 'empty report counts no requests');
 eq(empty.days.length, 7, 'empty report still has its axis');
 eq(emptyBuckets().requests, 0, 'empty bucket factory');
 
+// Defensive token fold remains compatible while rejecting invalid timestamps,
+// malformed usage containers, and non-numeric/negative token fields.
+const defensive = new Map();
+eq(accumulateEvents(defensive, [
+  ...[NaN, Infinity, -Infinity, 1e20, '2026-03-05', undefined].map(time => assistantMessage(time, { inputTokens: 999 })),
+  ...[undefined, null, [], 123, 'bad'].map(usage => assistantMessage(now, usage)),
+  assistantMessage(now, { inputTokens: 2, outputTokens: 3, cacheReadTokens: -10, cacheWriteTokens: Infinity }),
+  assistantMessage(now, { inputTokens: NaN, outputTokens: '9' }),
+]), 2, 'only valid-time usage objects contribute to token requests');
+eq(JSON.stringify(totalOf(defensive)), JSON.stringify({ uncachedInput: 2, cacheRead: 0, cacheWrite: 0, output: 3, requests: 2, input: 2 }), 'invalid token fields become zero without string coercion');
+ok(!defensive.has('NaN-NaN-NaN'), 'invalid Date never creates a bogus bucket');
+const snapshotOnly = new Map();
+eq(accumulateSnapshot(snapshotOnly, { events: [assistantMessage(now, { inputTokens: 999 }), assistantMessage(now, { inputTokens: 1 })], inheritedEventCount: 1 }), 1, 'legacy snapshot token fold is still supported');
+eq(totalOf(snapshotOnly).input, 1, 'legacy snapshot respects inherited prefix');
+eq(report.analytics.messages.unit, 'assistant-message', 'whole-report aggregation adds analytics without renaming token fields');
+eq(report.analytics.messages.total, 1, 'analytics messages use the same selected window');
+eq(report.analytics.quota.available, false, 'quota is explicitly unavailable');
+
 console.log('== real session logs ==');
 
 const HOME = process.env.DSH_HOME || 'C:/Users/Administrator/.dsh';
@@ -122,7 +143,10 @@ if (process.argv.includes('--synthetic-only')) {
   // The session running this very test keeps appending after its projection
   // snapshot was written, so its log is legitimately ahead of the cache.
   const liveSessionId = process.env.DSH_SESSION_ID;
-  const snapshots = [];
+  // Fold and discard each decoded log, just like the bounded Host workers.
+  const generatedAt = Date.now();
+  const widestState = createAggregationState(3650, generatedAt);
+  const last30State = createAggregationState(30, generatedAt);
   let matched = 0;
   let compared = 0;
   let liveCompared = 0;
@@ -136,7 +160,9 @@ if (process.argv.includes('--synthetic-only')) {
     const inherited = fs.existsSync(cachePath)
       ? (JSON.parse(fs.readFileSync(cachePath, 'utf8')).record?.identity?.inheritedEventCount ?? 0)
       : 0;
-    snapshots.push({ events, inheritedEventCount: inherited });
+    const snapshot = { session: { id }, events, inheritedEventCount: inherited };
+    accumulateAnalyticsSnapshot(widestState, snapshot);
+    accumulateAnalyticsSnapshot(last30State, snapshot);
     accumulateEvents(allDays, events, inherited);
 
     const expected = fs.existsSync(cachePath)
@@ -168,7 +194,7 @@ if (process.argv.includes('--synthetic-only')) {
     ok(header !== undefined, `session header present for ${id}`);
   }
 
-  const widest = aggregateSnapshots(snapshots, 3650, Date.now(), { sessionCount: snapshots.length });
+  const widest = buildAnalyticsReport(widestState, { sessionCount: ids.length });
   console.log(`sessions: ${ids.length}, compared with projection: ${compared} (exact matches: ${matched}), live session checked separately: ${liveCompared}`);
   console.log(`all-time fold: input=${widest.totals.input} output=${widest.totals.output} cacheRead=${widest.totals.cacheRead} requests=${widest.totals.requests}`);
   console.log(`active days: ${widest.meta.activeDays} (${widest.meta.firstActiveDay} .. ${widest.meta.lastActiveDay})`);
@@ -176,7 +202,7 @@ if (process.argv.includes('--synthetic-only')) {
   ok(widest.totals.input > 0 && widest.totals.output > 0, 'real logs produce non-zero tokens');
   ok(widest.meta.activeDays > 0, 'real logs produce active days');
 
-  const last30 = aggregateSnapshots(snapshots, 30, Date.now(), {});
+  const last30 = buildAnalyticsReport(last30State);
   ok(last30.totals.input <= widest.totals.input, '30-day window never exceeds all-time');
   console.log(`last 30 days: input=${last30.totals.input} output=${last30.totals.output} activeDays=${last30.meta.activeDays}`);
 }

@@ -1,14 +1,14 @@
 /**
  * Account pool — browser half.
  *
- * Registers one `settings.section` page ("账号池") that renders the pool's
- * live state: which accounts exist, which are cooling and for how long, the
- * sticky bindings, and the most recent usage records.
+ * Registers the account-pool and Codex compatibility `settings.section` pages.
+ * The pool renders live accounts, cooldowns, bindings and recent usage; the
+ * compatibility page manages an explicit, capability-gated compaction setting.
  *
  * Every number comes from the Host half over its two authenticated routes on
- * the `/api` channel. The page makes no other network request and never sees a
- * credential: the account rows it reads contain `credentialRef` (an opaque
- * handle) and nothing more.
+ * the `/api` channel. Account rows never expose upstream credentials. The local
+ * API card can receive its separate client API key once, on explicit creation
+ * or rotation; that key stays in the card's memory until dismissed or left.
  *
  * Shipped as a DSH client bundle (`window.__ModuleLoader__.load`), hand-written
  * in plain JavaScript: React arrives through the module table, and the page is
@@ -78,6 +78,7 @@ window.__ModuleLoader__.load({
 			connectSupplier: '接入供应商', advancedAdd: '高级新增账号', supplierTitle: '接入供应商',
 			supplierHint: '填写供应商信息与 API Key。接入后，在聊天的模型列表里选择该供应商下的模型。',
 			openaiApi: '请求格式', openaiTransport: '传输方式', openaiChat: 'Chat Completions（/chat/completions）', openaiResponses: 'Responses（/responses）', openaiHttp: 'HTTP 流式（SSE）', openaiWebSocket: 'WebSocket', openaiWebSocketHint: 'WebSocket 需要上游支持 Responses WebSocket；模型目录仍通过 HTTP 获取。',
+			codexWebSocketHint: 'Codex OAuth 使用固定的原生端点，无需选择请求格式。默认使用 HTTP；WebSocket 支持原生连接复用与增量续接，不可用时回退到 HTTP。',
 			supplierName: '供应商名称', supplierProtocol: '调用协议', supplierAddress: 'API 地址', supplierKey: 'API Key', supplierModels: '可用模型',
 			supplierModelsHint: '多个模型用逗号或换行分隔，也可以从上游获取。', supplierDiscover: '获取模型目录', supplierDiscovering: '正在获取…',
 			supplierDiscoveryFailed: '获取失败：{message}。可以手动填写模型后接入。', supplierDiscoveryEmpty: '上游没有返回模型，请手动填写。', supplierDiscoveryDone: '已获取 {n} 个模型，可以编辑后接入。',
@@ -93,6 +94,7 @@ window.__ModuleLoader__.load({
 			connectSupplier: 'Connect supplier', advancedAdd: 'Advanced account setup', supplierTitle: 'Connect supplier',
 			supplierHint: 'Enter the supplier details and API key. After connecting, choose one of its models in the chat model list.',
 			openaiApi: 'Request format', openaiTransport: 'Transport', openaiChat: 'Chat Completions (/chat/completions)', openaiResponses: 'Responses (/responses)', openaiHttp: 'HTTP streaming (SSE)', openaiWebSocket: 'WebSocket', openaiWebSocketHint: 'WebSocket requires upstream Responses WebSocket support; model discovery still uses HTTP.',
+			codexWebSocketHint: 'Codex OAuth uses a fixed native endpoint, with no request format to choose. HTTP is the default; WebSocket supports native connection reuse and incremental continuation, with HTTP fallback when unavailable.',
 			supplierName: 'Supplier name', supplierProtocol: 'API protocol', supplierAddress: 'API URL', supplierKey: 'API key', supplierModels: 'Available models',
 			supplierModelsHint: 'Separate models with commas or newlines, or fetch them from the supplier.', supplierDiscover: 'Fetch model list', supplierDiscovering: 'Fetching…',
 			supplierDiscoveryFailed: 'Could not fetch models: {message}. You can enter models manually and connect.', supplierDiscoveryEmpty: 'The supplier returned no models. Enter them manually.', supplierDiscoveryDone: 'Fetched {n} models. You can edit them before connecting.',
@@ -113,6 +115,64 @@ window.__ModuleLoader__.load({
 
 		const zh = {
 			...SUPPLIER_ZH,
+			colFirstToken: "首字",
+			colOutputDuration: "输出时长",
+			colOutputTps: "TPS",
+			firstTokenHint: "从请求开始到首个文字、思考或工具参数输出，包含重试与换号等待。",
+			outputDurationHint: "从首个输出到流结束的耗时，不含首字等待。",
+			outputTpsHint: "上游实际输出 Token ÷ 输出秒数；按上游口径包含思考 Token，不估算缺失值。",
+			usageTimingUnavailable: "未记录或无法计算",
+			usageTimingHint: "首字包含思考与工具参数输出；历史记录未采集的计时显示 —。",
+			codexCompatibilityTitle: 'Codex兼容',
+			codexCompatibilityIntro: '管理账号池的 Codex OAuth 兼容设置；不会改变其他账号的请求格式或传输方式。',
+			codexCompactionTitle: 'v2 加密压缩上下文',
+			codexCompactionEnable: '启用 v2 加密压缩上下文（默认关闭）',
+			codexCompactionScope: '仅适用于 Codex OAuth 账号，不影响 API Key 或其他平台账号。',
+			codexCompactionTiming: '使用原有的自动或手动上下文压缩时机；打开此设置页或保存开关不会发起 LLM 请求。',
+			codexCompactionHistory: '切换账号、切换模型或关闭开关后，恢复使用原始对话历史。',
+			codexCompactionFallback: '上游不支持时，会在返回 unsupported 前尝试回退到文字摘要；这一尝试可能产生额外用量。',
+			codexCompatibilityLoading: '正在读取 Codex 兼容设置…',
+			codexCompatibilityRestart: '当前 Host 尚未提供兼容的 Codex 设置接口。请更新并重启 DSH，然后刷新此页。',
+			codexCompatibilityUnavailable: 'Codex v2 加密压缩上下文当前不可用，开关无法保存。请确认后端能力已启用并重启 DSH，然后刷新重试。',
+			codexCompatibilityReadFailed: '无法读取 Codex 兼容设置。草稿已保留，请刷新重试；不会自动重发保存请求。',
+			codexCompatibilitySaved: '已保存 Codex 兼容设置。',
+			localApiTitle: '本机 API',
+			localApiIntro: '仅监听 127.0.0.1，提供 OpenAI Chat Completions（/v1/chat/completions）；新版 Host 另支持 Responses（/v1/responses）。使用独立 API Key，原始池内密钥不会外泄给调用方。',
+			localApiEnable: '启用本机 API', localApiPort: '端口（1024–65535）',
+			localApiPortHint: '默认 19389。修改端口并保存会关闭旧监听端口，中断其进行中的调用。',
+			localApiInvalidPort: '请输入 1024–65535 之间的整数端口。',
+			localApiKeyRequired: '首次使用请先生成并保存 API Key，再启用本机 API。',
+			localApiRuntime: '运行状态 (running)', localApiRunning: '运行中', localApiStopped: '未运行',
+			localApiBaseUrl: 'Base URL', localApiKeyConfigured: 'API Key (keyConfigured)', localApiError: '服务错误 (error)', localApiNoError: '无',
+			localApiLoading: '正在读取本机 API 状态…',
+			localApiRestart: '当前 Host 尚未提供兼容的本机 API 接口，无法保存。请更新并重启 DSH，然后刷新。',
+			localApiReadFailed: '无法读取最新本机 API 状态，操作已暂停。草稿已保留，请刷新重试。',
+			localApiSaved: '已保存本机 API 设置。请以运行状态和服务错误为准。',
+			localApiGenerate: '生成 API Key', localApiRotate: '轮换 API Key', localApiConfirmRotate: '确认轮换 API Key',
+			localApiRotateWarning: '旧 API Key 将立即失效，使用旧 Key 的后续调用会失败。请更新所有本机客户端；已开始的请求可以完成。确认轮换？',
+			localApiKeyCreated: '已生成新的 API Key。',
+			localApiKeyOnce: '此 Key 仅在本次响应中显示，请立即复制并妥善保存。关闭显示或离开「设置」后无法再次查看；不会写入浏览器存储或日志。',
+			localApiKeyLabel: '本机 API Key（仅显示一次）', localApiCloseKey: '关闭并清除 Key 显示',
+			localApiCopyBaseUrl: '复制 Base URL', localApiCopyKey: '复制 API Key',
+			localApiBaseUrlCopied: '已复制 Base URL。', localApiKeyCopied: '已复制 API Key。',
+			localApiCopyFailed: '未能确认复制成功，请手动选择并复制。',
+			localApiDraft: '有未保存的更改；刷新状态不会覆盖草稿。', localApiDiscard: '放弃草稿',
+			localApiInvalidReply: 'Host 返回了不兼容的本机 API 响应，未确认成功。请刷新核对状态，不会自动重发操作。',
+			tabAutoReview: "Auto Review",
+			reviewTitle: "Auto Review 判断模型",
+			reviewHint: "选择用于判断指令风险的模型；独立于当前聊天模型。配置保存后，从下一次审核开始生效。",
+			reviewPolicyHint: "这里只设置审核模型，不开启自动审批，也不改变审批策略。只有审批流程调用 Auto Review 时才会使用。",
+			reviewMode: "判断模型来源",
+			reviewSession: "跟随当前会话模型（默认）",
+			reviewFixed: "使用指定账号池模型",
+			reviewProvider: "账号池 / 分组",
+			reviewModel: "判断模型",
+			reviewChooseProvider: "请选择账号池",
+			reviewChooseModel: "请选择模型",
+			reviewLoading: "正在读取审核模型配置…",
+			reviewUnavailable: "Auto Review 模型配置暂不可用。请确认审核插件已启用并已更新，然后刷新重试。",
+			reviewInvalid: "所选模型当前不可用，请重新选择。审核不会自动回退到聊天模型。",
+			reviewSaved: "已保存，下次 Auto Review 判断时生效。",
 			usageSummary: '最近 {n} 条 · 成功 {ok} · 失败 {failed} · 输入 {input} / 输出 {output}', usageAccount: '全部账号用量', usageModel: '筛选模型…', cacheDetail: '缓存写 {write} · 推理 {reasoning}',
 			fieldPoolDetectionRetry: '池检测重试',
 			poolDetectionHint: '命中检测关键词时不冷却账号，仅在输出前重试同一账号；达到重试上限后明确返回失败。次数为额外尝试次数，0 表示不重试。',
@@ -164,7 +224,7 @@ window.__ModuleLoader__.load({
 
 			title: '账号池',
 			intro: '管理账号与分组，让每次请求都有清晰的去向。',
-			tabAccounts: '账号管理', tabGroups: '分组管理', tabUsage: '请求用量', tabLabel: '账号池管理页面',
+			tabAccounts: '账号管理', tabGroups: '分组管理', tabUsage: '请求用量', tabSettings: '设置', poolSettingsTitle: '账号池设置', poolSettingsIntro: '管理账号池的独立功能设置。每项单独保存，沿用原有持久化配置，不会自动开启或改变账号连接。', tabLabel: '账号池管理页面',
 			cardGroups: '账号分组', cardGroupsHint: '独立路由，灵活调度',
 			accountsHint: '查看账号状态，维护连接与调度配置。', groupsHint: '把账号组织成独立号池，在模型菜单中快速切换。', usageHint: '最近请求的结果、Token 消耗与换号记录。',
 			colConnection: '连接 / 凭据', colScheduling: '调度', colActivity: '用量 / 额度',
@@ -181,6 +241,8 @@ window.__ModuleLoader__.load({
 			loadFailedHint: 'Host 没有返回账号数据。检查后端是否已重启，然后重试。',
 			retryLoad: '重新读取',
 			noConnection: '当前环境没有可用的连接',
+			readTimeout: '读取超时，请重试。', refreshFailed: '刷新失败，仍显示上次成功读取的数据。',
+			oauthDirectoryLoading: '正在读取 OAuth 提供商…', oauthDirectoryFailed: '无法读取 OAuth 提供商',
 			empty: '账号池还没有账号。点击「接入供应商」、导入配置或通过 OAuth 登录添加。',
 			cardAccounts: '账号',
 			cardAccountsHint: '可用 {ready} · 冷却 {cooling} · 异常 {failed}',
@@ -197,6 +259,10 @@ window.__ModuleLoader__.load({
 			colFailures: '连续失败',
 			colTime: '时间',
 			colModel: '模型',
+			usageEffort: '等级 {level}', usageEffortMapped: '等级 {requested} → {mapped}',
+			usageEffortUnknown: '等级未记录', usageEffortOmitted: '不发送',
+			usageEffortDetail: '选择等级：{requested}；请求映射：{mapped}。按本次请求记录，不代表上游确认。',
+			usageEffortUnknownHint: '本条请求未记录等级信息，不根据当前配置推测历史等级。',
 			colTokens: '输入 / 输出 / 缓存读',
 			colSwitches: '换号',
 			colResult: '结果',
@@ -302,6 +368,7 @@ window.__ModuleLoader__.load({
 			fieldGroups: '所属分组',
 			fieldGroupPriority: '组内优先级（留空=用账号自身优先级）',
 			fieldGroupPriorityInherit: '继承',
+			accountSaveCheckpoint: '账号 {id} 已保存；组内优先级逐项另存。再次保存会继续未完成步骤；如修改账号字段，则更新此账号，不会再次创建。这不是事务回滚。',
 			noGroups: '未分组',
 			statusActive: '可用',
 			statusError: '异常',
@@ -322,6 +389,64 @@ window.__ModuleLoader__.load({
 
 		const en = {
 			...SUPPLIER_EN,
+			colFirstToken: "First token",
+			colOutputDuration: "Output duration",
+			colOutputTps: "TPS",
+			firstTokenHint: "Request start to first text, reasoning or tool-argument output, including retries and account-switch waits.",
+			outputDurationHint: "Time from first output to stream termination, excluding the first-token wait.",
+			outputTpsHint: "Actual upstream output tokens divided by output seconds; includes reasoning according to the upstream token definition. Missing values are not estimated.",
+			usageTimingUnavailable: "Not recorded or cannot be calculated",
+			usageTimingHint: "First token includes reasoning and tool arguments; historical records without timing show —.",
+			codexCompatibilityTitle: 'Codex compatibility',
+			codexCompatibilityIntro: 'Manage Codex OAuth compatibility for the account pool without changing other accounts’ request formats or transports.',
+			codexCompactionTitle: 'v2 encrypted context compaction',
+			codexCompactionEnable: 'Enable v2 encrypted context compaction (off by default)',
+			codexCompactionScope: 'Applies only to Codex OAuth accounts, not API keys or other platforms.',
+			codexCompactionTiming: 'Uses the existing automatic or manual context compaction timing. Opening this page or saving the switch does not send an LLM request.',
+			codexCompactionHistory: 'Switching accounts, switching models or turning this off restores the original conversation history.',
+			codexCompactionFallback: 'If the upstream does not support it, a text-summary fallback is attempted before reporting unsupported. This attempt may incur additional usage.',
+			codexCompatibilityLoading: 'Loading Codex compatibility settings…',
+			codexCompatibilityRestart: 'This Host does not expose a compatible Codex settings API yet. Update and restart DSH, then refresh this page.',
+			codexCompatibilityUnavailable: 'Codex v2 encrypted context compaction is unavailable and cannot be saved. Check backend support and restart DSH, then refresh to retry.',
+			codexCompatibilityReadFailed: 'Could not read Codex compatibility settings. Your draft is kept; refresh to retry. Save requests are never replayed automatically.',
+			codexCompatibilitySaved: 'Codex compatibility settings saved.',
+			localApiTitle: 'Local API',
+			localApiIntro: 'Listens only on 127.0.0.1 and exposes OpenAI Chat Completions (/v1/chat/completions); updated Hosts also support Responses (/v1/responses). Uses a separate API key; original pool credentials are never exposed to callers.',
+			localApiEnable: 'Enable local API', localApiPort: 'Port (1024–65535)',
+			localApiPortHint: 'Default: 19389. Saving a new port closes the old listener and interrupts its in-flight calls.',
+			localApiInvalidPort: 'Enter an integer port between 1024 and 65535.',
+			localApiKeyRequired: 'First generate and safely save an API key, then enable the local API.',
+			localApiRuntime: 'Runtime (running)', localApiRunning: 'Running', localApiStopped: 'Stopped',
+			localApiBaseUrl: 'Base URL', localApiKeyConfigured: 'API key (keyConfigured)', localApiError: 'Service error (error)', localApiNoError: 'None',
+			localApiLoading: 'Reading local API status…',
+			localApiRestart: 'This Host does not expose a compatible local API. Saving is disabled. Update and restart DSH, then refresh.',
+			localApiReadFailed: 'Could not read the latest local API status; actions are paused. Your draft is kept. Refresh to retry.',
+			localApiSaved: 'Local API settings saved. Check the runtime status and service error below.',
+			localApiGenerate: 'Generate API key', localApiRotate: 'Rotate API key', localApiConfirmRotate: 'Confirm API key rotation',
+			localApiRotateWarning: 'The old API key will become invalid immediately and subsequent calls using it will fail. Update every local client; requests already started may finish. Rotate the key?',
+			localApiKeyCreated: 'A new API key was generated.',
+			localApiKeyOnce: 'This key is shown only in this response. Copy it now and store it safely. Closing this display or leaving Settings clears it; it is never written to browser storage or logs.',
+			localApiKeyLabel: 'Local API key (shown once)', localApiCloseKey: 'Close and clear key display',
+			localApiCopyBaseUrl: 'Copy Base URL', localApiCopyKey: 'Copy API key',
+			localApiBaseUrlCopied: 'Base URL copied.', localApiKeyCopied: 'API key copied.',
+			localApiCopyFailed: 'Could not confirm the copy succeeded. Select and copy the value manually.',
+			localApiDraft: 'Unsaved changes; status refreshes will not overwrite your draft.', localApiDiscard: 'Discard draft',
+			localApiInvalidReply: 'The Host returned an incompatible local API response; success was not confirmed. Refresh to check its status. Actions are never replayed automatically.',
+			tabAutoReview: "Auto Review",
+			reviewTitle: "Auto Review classifier model",
+			reviewHint: "Choose the model used to classify command risk, independently of the chat model. Saved changes apply to the next review.",
+			reviewPolicyHint: "This setting does not enable automatic approval or change the approval policy. It is used only when the approval flow invokes Auto Review.",
+			reviewMode: "Classifier model source",
+			reviewSession: "Follow current session model (default)",
+			reviewFixed: "Use a specific account pool model",
+			reviewProvider: "Account pool / group",
+			reviewModel: "Classifier model",
+			reviewChooseProvider: "Select an account pool",
+			reviewChooseModel: "Select a model",
+			reviewLoading: "Loading reviewer model settings…",
+			reviewUnavailable: "Auto Review model settings are unavailable. Enable and update the reviewer plugin, then refresh to retry.",
+			reviewInvalid: "The selected model is unavailable. Select another; reviews will not silently fall back to the chat model.",
+			reviewSaved: "Saved. Applies to the next Auto Review classification.",
 			usageSummary: 'Latest {n} records · Success {ok} · Failed {failed} · Input {input} / Output {output}', usageAccount: 'All account usage', usageModel: 'Filter models…', cacheDetail: 'Cache write {write} · Reasoning {reasoning}',
 			fieldPoolDetectionRetry: 'Pool detection retry',
 			poolDetectionHint: 'Matched detection keywords do not cool down the account. Retry the same account only before output; report failure when the retry limit is reached. The count is additional attempts; 0 disables retries.',
@@ -373,7 +498,7 @@ window.__ModuleLoader__.load({
 
 			title: 'Account pool',
 			intro: 'Manage accounts and groups, and see where each request goes.',
-			tabAccounts: 'Accounts', tabGroups: 'Groups', tabUsage: 'Usage', tabLabel: 'Account pool pages',
+			tabAccounts: 'Accounts', tabGroups: 'Groups', tabUsage: 'Usage', tabSettings: 'Settings', poolSettingsTitle: 'Account pool settings', poolSettingsIntro: 'Manage independent account-pool features. Each setting saves separately using existing persistence; nothing is enabled automatically and account connections stay unchanged.', tabLabel: 'Account pool pages',
 			cardGroups: 'Account groups', cardGroupsHint: 'Independent routes and scheduling',
 			accountsHint: 'Monitor account health and manage connections and scheduling.', groupsHint: 'Organize accounts into pools you can select from the model menu.', usageHint: 'Recent request results, token usage and account switches.',
 			colConnection: 'Connection / credential', colScheduling: 'Scheduling', colActivity: 'Usage / quota',
@@ -390,6 +515,8 @@ window.__ModuleLoader__.load({
 			loadFailedHint: 'The Host returned no account data. Check that the backend has restarted, then retry.',
 			retryLoad: 'Read again',
 			noConnection: 'No usable connection in this environment',
+			readTimeout: 'The read timed out. Please retry.', refreshFailed: 'Refresh failed. Showing the last successfully read data.',
+			oauthDirectoryLoading: 'Reading OAuth providers…', oauthDirectoryFailed: 'OAuth providers could not be read',
 			empty: 'The pool has no accounts yet. Add accounts to the plugin config and reload the entry.',
 			cardAccounts: 'Accounts',
 			cardAccountsHint: '{ready} ready · {cooling} cooling · {failed} failed',
@@ -406,6 +533,10 @@ window.__ModuleLoader__.load({
 			colFailures: 'Failures',
 			colTime: 'Time',
 			colModel: 'Model',
+			usageEffort: 'Level {level}', usageEffortMapped: 'Level {requested} → {mapped}',
+			usageEffortUnknown: 'Level not recorded', usageEffortOmitted: 'Not sent',
+			usageEffortDetail: 'Selected level: {requested}; request mapping: {mapped}. Recorded for this request, not confirmed by the upstream.',
+			usageEffortUnknownHint: 'This request has no recorded level. Historical levels are not inferred from current settings.',
 			colTokens: 'in / out / cache-read',
 			colSwitches: 'Switches',
 			colResult: 'Result',
@@ -511,6 +642,7 @@ window.__ModuleLoader__.load({
 			fieldGroups: 'Groups',
 			fieldGroupPriority: 'Priority within each pool (blank = inherit the account’s own)',
 			fieldGroupPriorityInherit: 'inherit',
+			accountSaveCheckpoint: 'Account {id} was saved; group priorities are separate writes. Save again to continue unfinished steps, or update this account if its fields changed. It will not be created again. This is not a transaction rollback.',
 			noGroups: 'ungrouped',
 			statusActive: 'ready',
 			statusError: 'failed',
@@ -529,6 +661,12 @@ window.__ModuleLoader__.load({
 			footer: 'Local account management · Usage and reset card data come from the provider',
 		};
 
+		Object.assign(zh, { attributionTest: '模型归因测试', attributionStart: '确认开始 · 3 次调用', attributionCost: '固定此账号执行 3 次采样，可能消耗额度；每次请求预算 {tokens} 输出 token，超时 {seconds} 秒。当前 Codex OAuth 不发送此 token 上限，不能保证最大账单。', attributionModel: '测试模型：{model}', attributionConfigure: '开关和参数在「模型归因」插件设置', attributionRunning: '归因中 · {done}/3', attributionCancel: '取消归因', attributionReference: '参考接近：{model}', attributionDetails: '归因结果', attributionCaveat: '仅为参考集行为匹配，不是模型身份认证；内置参考库 astra/sol 合并，更新后的参考库按其标签比较。', attributionNoScore: '样本不足，未确认', attributionCancelled: '归因已取消', attributionFailed: '归因出错', attributionRefresh: '刷新归因状态', attributionChanged: '账号或测试设置已变更，请刷新并重新确认。' });
+		Object.assign(en, { attributionTest: 'Model attribution test', attributionStart: 'Confirm · 3 calls', attributionCost: 'Pin this account for 3 probes; usage may be charged. Request budget: {tokens} output tokens, {seconds}s per probe. Current Codex OAuth does not send this token cap; it is not a billing limit.', attributionModel: 'Probe model: {model}', attributionConfigure: 'Configure in the Model attribution plugin', attributionRunning: 'Attribution · {done}/3', attributionCancel: 'Cancel attribution', attributionReference: 'Closest reference: {model}', attributionDetails: 'Attribution result', attributionCaveat: 'Closed-set behavioral comparison, not identity authentication. The bundled reference merges astra/sol; updated references use their own labels.', attributionNoScore: 'Insufficient samples; unconfirmed', attributionCancelled: 'Attribution cancelled', attributionFailed: 'Attribution failed', attributionRefresh: 'Refresh attribution status', attributionChanged: 'Account or probe settings changed. Refresh and confirm again.' });
+		Object.assign(zh, { attributionPaused: '行为不匹配 · 已自动暂停调度', attributionAlreadyPaused: '行为不匹配 · 账号已经暂停调度', attributionPauseFailed: '自动暂停失败，请刷新并检查账号调度', attributionPauseUnavailable: '自动暂停不可用，请升级账号池或手动暂停', attributionAutoPauseNote: '已开启不匹配自动暂停：3 条有效采样且其他参考模型库内概率 ≥90% 时暂停此账号。可在「模型归因」插件设置关闭；行为比较不是身份认证。' });
+		Object.assign(en, { attributionPaused: 'Behavior mismatch · scheduling paused automatically', attributionAlreadyPaused: 'Behavior mismatch · account already paused', attributionPauseFailed: 'Automatic pause failed; refresh and check scheduling', attributionPauseUnavailable: 'Automatic pause unavailable; upgrade the pool or pause manually', attributionAutoPauseNote: 'Automatic pause enabled: 3 valid samples and ≥90% closed-set probability for another reference model pauses this account. Disable in Model attribution settings. Not identity verification.' });
+		Object.assign(zh, { attributionBatch: '批量模型归因', attributionBatchConfirm: '确认批量归因 · {n} 个账号 · {calls} 次调用', attributionBatchCost: '按顺序逐个账号执行，每个账号 3 次模型调用，共 {n} 个账号、最多 {calls} 次调用；可能产生费用，不自动重试提交。', attributionBatchLimit: '每批最多 100 个账号，请减少选择后重试。', attributionBatchUnready: '所选账号中有未就绪或未提供模型归因的账号；请调整选择。', attributionBatchProgress: '批量归因 · {done}/{total} 个账号 · {state}', attributionBatchCancel: '取消批量归因', attributionBatchUnavailable: '无法读取批量归因状态，请刷新重试；不会自动重新提交。', attributionBatchQueued: '排队中', attributionBatchRunning: '执行中', attributionBatchCompleted: '已完成', attributionBatchSkipped: '已跳过', attributionBatchError: '出错', attributionBatchCancelled: '已取消', attributionBatchCancelling: '正在取消，等待当前账号退出…' });
+		Object.assign(en, { attributionBatch: 'Batch model attribution', attributionBatchConfirm: 'Confirm batch · {n} accounts · {calls} calls', attributionBatchCost: 'Run accounts sequentially, 3 model calls per account: {n} accounts, up to {calls} calls. Usage may be charged. Submissions are never retried automatically.', attributionBatchLimit: 'At most 100 accounts per batch. Reduce the selection and retry.', attributionBatchUnready: 'Some selected accounts are not ready or do not support model attribution. Adjust the selection.', attributionBatchProgress: 'Batch attribution · {done}/{total} accounts · {state}', attributionBatchCancel: 'Cancel batch attribution', attributionBatchUnavailable: 'Could not read batch attribution status. Refresh to retry; the batch will not be resubmitted automatically.', attributionBatchQueued: 'Queued', attributionBatchRunning: 'Running', attributionBatchCompleted: 'Completed', attributionBatchSkipped: 'Skipped', attributionBatchError: 'Error', attributionBatchCancelled: 'Cancelled', attributionBatchCancelling: 'Cancellation requested; waiting for the current account to stop…' });
 		const dicts = { zh, en };
 
 		// =====================================================================
@@ -538,6 +676,7 @@ window.__ModuleLoader__.load({
 		// =====================================================================
 
 		const CSS = `
+.dap-attribution{display:grid;gap:5px;margin-top:14px;max-width:190px;font-size:11px;overflow-wrap:anywhere}.dap-attribution .dap-btn{padding:4px 7px;font-size:11px;min-height:28px;justify-self:start}.dap-attribution p{margin:0}.dap-attribution-confirm{display:grid;gap:6px}.dap-attribution details{max-width:100%;white-space:normal}
 .dap-root{--dap-accent:var(--dsw-alias-brand-primary,#4263eb);--dap-surface:var(--dsw-alias-bg-layer-1,#fff);--dap-base:var(--dsw-alias-bg-base,#f7f8fb);--dap-border:var(--dsw-alias-border-l1,#e8ebf1);--dap-text:var(--dsw-alias-label-primary,#202635);--dap-muted:var(--dsw-alias-label-secondary,#7b8495);--dap-soft:color-mix(in srgb,var(--dap-accent) 7%,var(--dap-surface));display:flex;flex-direction:column;gap:22px;min-width:0;padding:8px 0 24px;color:var(--dap-text);font-size:13px;line-height:1.55}
 .dap-root *{box-sizing:border-box}.dap-root [hidden]{display:none!important}
 .dap-models-provider[data-native-edit=true] .dap-provider-edit-fallback{display:none}.dap-models-provider{padding:12px 20px;gap:12px}.dap-models-provider[data-expanded=false]{display:none}.dap-models-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.dap-provider-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none;background:var(--dsw-alias-state-success-primary,#20c56b)}.dap-provider-dot[data-enabled=false]{background:var(--dsw-alias-label-tertiary,#777)}.dap-provider-state{font-size:12px;color:var(--dap-muted)}.dap-provider-state[data-enabled=true]{color:var(--dsw-alias-state-success-primary,#208669)}
@@ -556,6 +695,7 @@ window.__ModuleLoader__.load({
 .dap-workspace{display:flex;flex-direction:column;gap:16px;min-width:0}.dap-tabs{display:flex;gap:6px;border-bottom:1px solid var(--dap-border);padding:0 2px;overflow-x:auto}.dap-tab{display:inline-flex;align-items:center;justify-content:center;gap:8px;flex:none;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--dap-muted);font:inherit;font-size:13px;font-weight:500;padding:11px 14px 13px;cursor:pointer}.dap-tab[aria-selected=true]{border-bottom-color:var(--dap-accent);color:var(--dap-accent)}.dap-tab:hover{color:var(--dap-text)}.dap-tab-count{font-size:10px;line-height:18px;min-width:20px;text-align:center;padding:0 5px;border-radius:5px;background:color-mix(in srgb,var(--dap-muted) 9%,var(--dap-surface));color:var(--dap-muted)}.dap-tab[aria-selected=true] .dap-tab-count{background:var(--dap-soft);color:var(--dap-accent)}
 .dap-panel{min-width:0;border:1px solid var(--dap-border);border-radius:13px;background:var(--dap-surface)}.dap-panel-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:18px 20px 14px;flex-wrap:wrap}.dap-panel-title{margin:0;font-size:14px;font-weight:600;color:var(--dap-text)}.dap-panel-subtitle{font-size:11px;color:var(--dap-muted);margin:3px 0 0}.dap-panel-count{font-size:11px;color:var(--dap-muted)}
 .dap-toolbar{display:flex;gap:9px;flex-wrap:wrap;align-items:center;padding:0 20px 16px}.dap-toolbar .dap-input{max-width:100%;min-height:34px}.dap-toolbar .dap-check-label{margin-left:auto;color:var(--dap-muted);font-size:11px}.dap-search-box{position:relative;flex:1 1 240px;min-width:180px}.dap-search-box>.dap-icon{position:absolute;top:10px;left:10px;color:var(--dap-muted);pointer-events:none}.dap-search-box>.dap-search{width:100%;padding-left:34px}.dap-filter-meta{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-basis:100%;padding-top:3px;font-size:11px;color:var(--dap-muted)}.dap-pagination{border-top:1px solid var(--dap-border);padding:12px 20px;justify-content:space-between}.dap-pagination .dap-input{width:68px;min-height:30px}.dap-pagination .dap-check-label{margin-left:0}.dap-pagination-nav{display:flex;align-items:center;gap:10px}.dap-page-label{font-size:11px;color:var(--dap-muted)}
+.dap-usage-table{min-width:1050px}.dap-usage-table td:first-child,.dap-usage-table td:nth-child(2){white-space:nowrap}.dap-usage-table td:nth-child(3){min-width:140px}.dap-usage-table .dap-timing{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.dap-timing-hint{margin:0 22px 12px;color:var(--dap-muted);font-size:11px;line-height:1.6}
 .dap-table-wrap{max-width:100%;overflow-x:auto;border-radius:0 0 12px 12px}.dap-table{width:100%;border-collapse:collapse;font-size:12px;line-height:1.5}.dap-table th{text-align:left;font-weight:500;font-size:11px;color:var(--dap-muted);padding:11px 16px;background:color-mix(in srgb,var(--dap-muted) 4%,var(--dap-surface));border-block:1px solid var(--dap-border);white-space:nowrap}.dap-table td{padding:15px 16px;border-bottom:1px solid var(--dap-border);color:var(--dap-text);vertical-align:top}.dap-table tbody tr:last-child td{border-bottom:0}.dap-table tbody tr:hover{background:color-mix(in srgb,var(--dap-accent) 3%,var(--dap-surface))}.dap-table tr[data-selected=true]{background:var(--dap-soft)}.dap-account-table{min-width:850px}.dap-account-table .dap-cell-select{width:35px;padding-left:18px;padding-right:0}.dap-account-table .dap-cell-account{width:23%;min-width:170px}.dap-account-table .dap-cell-protocol{width:15%}.dap-account-table .dap-cell-status{width:14%}.dap-account-table .dap-cell-schedule{width:12%}.dap-account-table .dap-cell-activity{width:18%}.dap-account-table .dap-cell-actions{width:18%;white-space:nowrap}.dap-account-table th,.dap-account-table td{padding-left:12px;padding-right:12px}
 .dap-identity{display:flex;gap:10px;align-items:flex-start;min-width:0}.dap-avatar{display:grid;place-items:center;flex:none;width:32px;height:32px;border:1px solid var(--dap-border);background:var(--dap-base);color:var(--dap-accent);border-radius:9px;font-size:12px;font-weight:600}.dap-identity-copy{min-width:0}.dap-account-name{font-size:12px;font-weight:600;overflow-wrap:anywhere;max-width:240px}.dap-cell-meta{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:5px;font-size:11px;color:var(--dap-muted)}.dap-cell-stack{display:flex;flex-direction:column;gap:5px;font-size:11px}.dap-row-tags{display:flex;gap:4px;flex-wrap:wrap;margin-top:7px}.dap-tag{display:inline-block;padding:1px 6px;border:1px solid var(--dap-border);border-radius:5px;font-size:10px;color:var(--dap-muted);max-width:100%;overflow-wrap:anywhere}.dap-protocol{font-weight:500;font-size:12px}.dap-num{font-variant-numeric:tabular-nums;white-space:nowrap}.dap-mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px}.dap-dim{color:var(--dsw-alias-label-secondary,#7b8495)}.dap-note{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;line-height:1.6;margin-top:3px}.dap-pill{display:inline-flex;align-items:center;gap:5px;border-radius:6px;padding:2px 7px;font-size:11px;line-height:18px;white-space:nowrap;border:1px solid transparent;font-weight:500}.dap-pill::before{content:'';width:5px;height:5px;border-radius:50%;background:currentColor}.dap-pill-ready{color:var(--dsw-alias-state-success-primary,#208669);background:color-mix(in srgb,var(--dsw-alias-state-success-primary,#208669) 9%,transparent)}.dap-pill-cooling{color:var(--dsw-alias-state-warn-primary,#b78224);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#b78224) 10%,transparent)}.dap-pill-failed{color:var(--dsw-alias-state-error-primary,#d04f60);background:color-mix(in srgb,var(--dsw-alias-state-error-primary,#d04f60) 9%,transparent)}.dap-pill-idle{color:var(--dap-muted);background:color-mix(in srgb,var(--dap-muted) 9%,transparent)}
 .dap-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.dap-cell-actions .dap-btn{min-height:28px;padding:3px 8px;font-size:11px}.dap-more{position:relative;display:inline-block}.dap-more>summary{display:flex;align-items:center;justify-content:center;gap:4px;list-style:none;cursor:pointer;min-height:28px;border-radius:7px;padding:4px 6px;color:var(--dap-muted);font-size:11px}.dap-more>summary>span{font-size:20px;line-height:20px}.dap-more>summary::-webkit-details-marker{display:none}.dap-more[open]>summary,.dap-more>summary:hover{background:var(--dap-soft);color:var(--dap-accent)}.dap-more-menu{position:fixed;z-index:1000;min-width:176px;border:1px solid var(--dap-border);background:var(--dap-surface);border-radius:10px;padding:6px;box-shadow:0 8px 26px #00000016;display:flex;flex-direction:column;gap:2px}.dap-more-menu .dap-btn{justify-content:flex-start;width:100%;border:0;background:transparent;min-height:32px;padding:6px 9px;font-weight:400}.dap-more-menu .dap-btn-danger{border-top:1px solid var(--dap-border);border-radius:0 0 5px 5px;margin-top:3px}.dap-row-more{padding:0;border:0;background:transparent;color:var(--dap-muted);font:inherit;font-size:10px;cursor:pointer}.dap-row-more>summary{list-style:none}.dap-row-more>summary::-webkit-details-marker{display:none}.dap-row-more[open]>summary{color:var(--dap-accent);margin-bottom:8px}.dap-row-more .dap-quota{min-width:0;max-width:230px}
@@ -569,6 +709,8 @@ window.__ModuleLoader__.load({
 .dap-quota{min-width:0;max-width:none;font-size:12px;line-height:1.65}.dap-quota-window{margin:7px 0;min-width:0}.dap-quota-window-head{display:flex;justify-content:space-between;gap:8px;align-items:baseline}.dap-quota-window-head>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dap-quota-window-head>strong{font-weight:600;font-size:11px}.dap-quota-window>progress{display:block;width:100%;height:5px;margin:5px 0;border:0;border-radius:6px;overflow:hidden;background:var(--dap-base);--dap-meter:var(--dsw-alias-state-success-primary,#208669);accent-color:var(--dap-meter)}.dap-quota-window>progress[data-tone=warn]{--dap-meter:var(--dsw-alias-state-warn-primary,#b78224)}.dap-quota-window>progress[data-tone=low]{--dap-meter:var(--dsw-alias-state-error-primary,#d04f60)}.dap-quota-window>progress::-webkit-progress-bar{background:var(--dap-base);border-radius:6px}.dap-quota-window>progress::-webkit-progress-value{background:var(--dap-meter);border-radius:6px}.dap-quota-window>progress::-moz-progress-bar{background:var(--dap-meter);border-radius:6px}.dap-quota-summary{min-width:140px;display:flex;flex-direction:column;align-items:stretch;gap:3px}.dap-quota-summary .dap-quota-window{margin:2px 0}.dap-quota-summary .dap-quota-window-head{font-size:10px}.dap-quota-summary .dap-quota-reset{font-size:9px;overflow-wrap:anywhere}.dap-quota-summary>.dap-error{font-size:10px}.dap-quota-plan{display:inline-flex;align-items:center;align-self:flex-start;justify-self:start;width:fit-content;max-width:100%;padding:1px 7px;border:1px solid var(--dap-border);border-radius:5px;color:var(--dap-accent);font-size:10px;font-weight:600;overflow-wrap:anywhere;background:var(--dap-soft)}.dap-usage-link{text-align:left;color:var(--dap-accent);font-size:11px;margin-top:4px;align-self:flex-start}.dap-usage-link:hover{text-decoration:underline}.dap-last-used{font-size:10px;overflow-wrap:anywhere}.dap-reset-count{font-size:10px;margin-top:3px}.dap-account-usage-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap}.dap-account-usage-head .dap-form-title{margin:0;overflow-wrap:anywhere}.dap-account-usage-head p{margin:6px 0 0}.dap-account-usage-grid{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);gap:22px}.dap-account-usage .dap-quota{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-content:start}.dap-account-usage .dap-quota>.dap-quota-plan,.dap-account-usage .dap-quota>.dap-dim,.dap-account-usage .dap-quota>.dap-error,.dap-quota-balance{grid-column:1/-1}.dap-account-usage .dap-quota-window{padding:12px;border:1px solid var(--dap-border);border-radius:9px;margin:0;background:var(--dap-base)}.dap-account-usage .dap-quota-window>progress{background:var(--dap-border);margin:10px 0}.dap-account-usage .dap-quota-window>progress::-webkit-progress-bar{background:var(--dap-border)}.dap-quota-balance{overflow-wrap:anywhere}.dap-reset-credits{display:flex;flex-direction:column;gap:10px;border-left:1px solid var(--dap-border);padding-left:22px;min-width:0;font-size:12px}.dap-reset-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}.dap-reset-heading>strong{font-size:13px}.dap-reset-credits p{margin:0;font-size:11px;line-height:1.7}.dap-reset-credits>.dap-btn{align-self:flex-start;margin-top:4px}.dap-reset-expiry{overflow-wrap:anywhere}.dap-reset-confirm{padding:14px;border:1px solid color-mix(in srgb,var(--dap-accent) 25%,var(--dap-border));border-radius:9px;background:var(--dap-soft);display:flex;flex-direction:column;gap:10px;min-width:0}.dap-reset-confirm>strong{font-size:12px;overflow-wrap:anywhere}.dap-reset-confirm .dap-actions{gap:8px}.dap-reset-confirm .dap-btn{white-space:normal;text-align:center}.dap-usage-summary{display:flex;gap:20px;flex-wrap:wrap;margin:0 20px 18px;padding:14px 16px;border-radius:9px;background:var(--dap-base);font-size:11px;color:var(--dap-muted)}.dap-usage-summary strong{display:block;font-size:17px;line-height:1.4;color:var(--dap-text);font-weight:600;font-variant-numeric:tabular-nums}
 .dap-upstream-models{display:flex;flex-direction:column;gap:10px;padding:12px;border:1px solid var(--dap-border);border-radius:8px}.dap-model-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 14px;max-height:220px;overflow:auto}.dap-model-option{display:flex;align-items:center;gap:7px;min-width:0;font-size:12px;overflow-wrap:anywhere}.dap-model-option input{flex:none}
 .dap-models-hint{font-size:11px;color:var(--dsw-alias-label-secondary,#7b8495)}
+.dap-local-api{margin-bottom:18px}.dap-local-api-status{display:grid;grid-template-columns:minmax(130px,auto) minmax(0,1fr);gap:8px 18px;margin:0;font-size:12px}.dap-local-api-status dt{color:var(--dap-muted)}.dap-local-api-status dd{margin:0;overflow-wrap:anywhere}.dap-local-api-confirm,.dap-local-api-secret{display:flex;flex-direction:column;gap:12px;padding:16px;border:1px solid var(--dap-border);border-radius:10px;background:var(--dap-base);min-width:0}.dap-local-api-confirm p{margin:0}.dap-local-api-secret{border-color:color-mix(in srgb,var(--dap-accent) 35%,var(--dap-border));background:var(--dap-soft)}.dap-local-api-secret input{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}@media(max-width:580px){.dap-local-api-status{grid-template-columns:1fr;gap:4px}.dap-local-api-status dd{margin-bottom:8px}.dap-local-api .dap-actions{gap:8px}.dap-local-api .dap-btn{white-space:normal;text-align:center}}
+.dap-usage-table .dap-usage-model{min-width:174px}.dap-usage-model-name{display:block;white-space:nowrap}.dap-usage-effort{display:inline-block;margin-top:5px;padding:1px 6px;border:1px solid var(--dap-border);border-radius:5px;background:var(--dap-soft);color:var(--dap-accent);font-size:10px;line-height:18px;overflow-wrap:anywhere}.dap-usage-effort[data-recorded=false]{padding:0;border:0;background:transparent;color:var(--dap-muted)}
 @media(max-width:1100px){.dap-head{align-items:flex-start}.dap-head-actions{flex-basis:100%}.dap-cards{gap:10px}.dap-card{padding:15px}.dap-account-table .dap-cell-actions .dap-actions{gap:3px}}
 @media(max-width:760px){.dap-account-usage-grid{grid-template-columns:1fr;gap:18px}.dap-reset-credits{padding:18px 0 0;border-left:0;border-top:1px solid var(--dap-border)}.dap-root{gap:18px}.dap-cards{grid-template-columns:repeat(2,minmax(0,1fr))}.dap-card-value{font-size:25px}.dap-group-grid{grid-template-columns:1fr}.dap-panel-head{padding:16px}.dap-toolbar{padding-left:16px;padding-right:16px}.dap-batch,.dap-form{margin-left:16px;margin-right:16px}.dap-form{padding:18px}.dap-toolbar .dap-input{flex:1 1 120px}.dap-search-box{flex-basis:100%}.dap-tabs{gap:0}.dap-tab{padding-left:12px;padding-right:12px}.dap-usage-summary{margin-left:16px;margin-right:16px}}
 @media(max-width:580px){.dap-tabs{overflow-x:visible}.dap-tab{flex:1 1 0;min-width:0;gap:6px;padding:11px 6px}.dap-tab .dap-icon{width:15px;height:15px}.dap-tab-count{display:none}.dap-pagination .dap-check-label{white-space:nowrap}.dap-pagination .dap-input{flex:none;width:58px}.dap-title{font-size:22px}.dap-brand-mark{width:40px;height:40px;border-radius:12px}.dap-head-actions{gap:6px}.dap-head-actions>.dap-btn,.dap-head-actions>.dap-refresh{font-size:11px;padding:5px 9px}.dap-card-hint{font-size:10px}.dap-form-grid{grid-template-columns:1fr}.dap-account-table{display:block;min-width:0}.dap-account-table thead{display:none}.dap-account-table tbody{display:block}.dap-account-table tr{display:grid;grid-template-columns:1fr 1fr;gap:12px 18px;padding:20px 16px;border-top:1px solid var(--dap-border);position:relative}.dap-account-table td{display:block;padding:0!important;border:0;min-width:0;width:auto!important}.dap-account-table .dap-cell-select{position:absolute;right:18px;top:22px}.dap-account-table .dap-cell-account{grid-column:1/-1;min-width:0;padding-right:30px!important}.dap-account-table .dap-cell-activity{grid-column:1/-1}.dap-account-table .dap-cell-activity .dap-quota-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 14px}.dap-cell-activity .dap-quota-summary>.dap-quota-plan,.dap-cell-activity .dap-quota-summary>.dap-dim,.dap-cell-activity .dap-quota-summary>.dap-error,.dap-cell-activity .dap-quota-summary>.dap-usage-link{grid-column:1/-1}.dap-account-usage .dap-quota{grid-template-columns:1fr}.dap-account-usage-head>.dap-actions{width:100%}.dap-account-usage-head>.dap-actions>.dap-btn{flex:1}.dap-account-table .dap-cell-actions{grid-column:1/-1;border-top:1px solid var(--dap-border);padding-top:12px!important}.dap-account-table .dap-cell-actions .dap-actions{gap:7px}.dap-account-table .dap-cell-schedule::before{content:attr(data-label);display:block;color:var(--dap-muted);font-size:10px;margin-bottom:5px}.dap-account-name{max-width:none}.dap-more-menu{left:0;right:auto}.dap-table-wrap{overflow:visible}.dap-panel:has(.dap-usage-table) .dap-table-wrap{overflow-x:auto}.dap-usage-table{min-width:700px}.dap-note{max-width:230px}.dap-pagination{gap:12px}.dap-form-actions{justify-content:stretch}.dap-form-actions>.dap-btn{flex:1}.dap-status{padding:18px 16px}.dap-empty{padding:36px 20px}}
@@ -649,32 +791,42 @@ window.__ModuleLoader__.load({
 		//      useNow.
 		// =====================================================================
 
+		/** Authenticated JSON transport shared by reads and operator actions. */
+		async function poolJson(route, init, t) {
+			if (typeof fetch !== 'function') throw new Error(t('noConnection'));
+			const response = await fetch(route, { ...init, credentials: 'same-origin' });
+			const body = await response.json().catch(() => null);
+			if (!response.ok || body === null) {
+				const error = new Error(body?.error?.message ?? `HTTP ${String(response.status)}`);
+				error.actionBody = body;
+				throw error;
+			}
+			return body;
+		}
+
 		/** Read one Host route; `nonce` re-runs it. */
 		function useJson(route, nonce, t) {
 			const [state, setState] = React.useState({ status: 'loading', body: null, error: null });
 			React.useEffect(() => {
 				let alive = true;
+				const controller = new AbortController();
+				const timeout = setTimeout(() => controller.abort(), 30000);
 				setState((previous) => ({ status: 'loading', body: previous.body, error: null }));
 				(async () => {
 					try {
-						if (typeof fetch !== 'function') throw new Error(t('noConnection'));
-						const response = await fetch(route, {
+						const body = await poolJson(route, {
 							method: 'GET',
 							headers: { accept: 'application/json' },
-							credentials: 'same-origin',
-						});
-						const body = await response.json().catch(() => null);
+							signal: controller.signal,
+						}, t);
 						if (!alive) return;
-						if (!response.ok || body === null) {
-							throw new Error(body?.error?.message ?? `HTTP ${String(response.status)}`);
-						}
 						setState({ status: 'ready', body, error: null });
 					} catch (error) {
 						if (!alive) return;
-						setState({ status: 'error', body: null, error: error instanceof Error ? error.message : String(error) });
-					}
+						setState((previous) => ({ status: 'error', body: previous.body, error: error.name === 'AbortError' ? t('readTimeout') : error instanceof Error ? error.message : String(error) }));
+					} finally { clearTimeout(timeout); }
 				})();
-				return () => { alive = false; };
+				return () => { alive = false; clearTimeout(timeout); controller.abort(); };
 			}, [route, nonce, t]);
 			return state;
 		}
@@ -689,7 +841,13 @@ window.__ModuleLoader__.load({
 		function useAction(refresh, t) {
 			const [state, setState] = React.useState({ pending: false, error: null, result: null });
 			const [busyId, setBusyId] = React.useState(null);
+			const locked = React.useRef(false);
+			const mounted = React.useRef(true);
+			React.useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 			function run(id, action, extra, onResult, onFailure) {
+				// React's disabled state lands on the next render, not this event turn.
+				if (locked.current || !mounted.current) return Promise.resolve(false);
+				locked.current = true;
 				setState({ pending: true, error: null });
 				setBusyId(id);
 				// Returns a promise resolving to whether it succeeded, so a form can
@@ -710,17 +868,19 @@ window.__ModuleLoader__.load({
 							failure.actionBody = body;
 							throw failure;
 						}
+						if (!mounted.current) return false;
 						setState({ pending: false, error: null, result: body });
 						setBusyId(null);
 						onResult?.(body);
 						refresh();
 						return true;
 					} catch (error) {
+						if (!mounted.current) return false;
 						setState({ pending: false, error: error instanceof Error ? error.message : String(error) });
 						setBusyId(null);
 						onFailure?.(error.actionBody ?? null);
 						return false;
-					}
+					} finally { locked.current = false; }
 				})();
 			}
 			return { pending: state.pending, busyId, error: state.error, result: state.result, dismiss: () => setState((previous) => ({ ...previous, result: null })), run };
@@ -956,6 +1116,23 @@ window.__ModuleLoader__.load({
 			return t('hoursShort', { n: String(Math.round(minutes / 60)) });
 		}
 
+		/** Nullable measurements stay unknown; never coerce null or strings into zero. */
+		function usageMetric(value) {
+			return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+		}
+
+		function formatUsageDuration(value) {
+			const ms = usageMetric(value);
+			if (ms === null) return '—';
+			if (ms < 1000) return `${Math.round(ms)} ms`;
+			return `${(ms / 1000).toFixed(2)} s`;
+		}
+
+		function formatUsageTps(value) {
+			const tps = usageMetric(value);
+			return tps === null ? '—' : `${tps.toFixed(1)} tok/s`;
+		}
+
 		function compact(value) {
 			const n = Number(value);
 			if (!Number.isFinite(n)) return '0';
@@ -1088,6 +1265,276 @@ window.__ModuleLoader__.load({
 		// § 8  Row components — one account row and one usage row.
 		// =====================================================================
 
+		// Validate every optional field consumed by the row renderer. An installed but
+		// incompatible companion is no more authoritative than a missing route.
+		function validAttribution(body) {
+			const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+			const text = value => value == null || typeof value === 'string';
+			const number = value => value == null || (typeof value === 'number' && Number.isFinite(value));
+			if (!object(body) || body.version !== 1 || typeof body.available !== 'boolean' || typeof body.enabled !== 'boolean' || typeof body.busy !== 'boolean' || !Array.isArray(body.rows)) return false;
+			if (body.autoPauseOnMismatch != null && typeof body.autoPauseOnMismatch !== 'boolean') return false;
+			if (body.pauseAvailable != null && typeof body.pauseAvailable !== 'boolean') return false;
+			if (body.batchVersion != null && body.batchVersion !== 1) return false;
+			if (body.batchVersion === 1 && (body.batchLimit !== 100 || (body.activeBatch != null && !validAttributionBatch(body.activeBatch)))) return false;
+			if (body.limits != null && (!object(body.limits) || !number(body.limits.maxTokens) || !number(body.limits.timeoutMs))) return false;
+			const ids = new Set();
+			return body.rows.every(row => {
+				if (!object(row) || typeof row.accountId !== 'string' || !row.accountId || ids.has(row.accountId) || typeof row.ready !== 'boolean' || !text(row.key) || (row.ready && !row.key) || !text(row.model) || !text(row.reason) || !text(row.label)) return false;
+				ids.add(row.accountId);
+				const job = row.job;
+				if (job == null) return true;
+				if (!object(job) || typeof job.id !== 'string' || !job.id || !['running', 'completed', 'cancelled', 'error'].includes(job.state) || !text(job.error)) return false;
+				if (job.schedulingAction != null && (!object(job.schedulingAction) || !['paused', 'already-paused', 'pause-error', 'unavailable', 'skipped', 'matched', 'disabled'].includes(job.schedulingAction.state))) return false;
+				if (job.progress != null && (!object(job.progress) || !number(job.progress.completed))) return false;
+				if (job.probes != null && (!Array.isArray(job.probes) || !job.probes.every(probe => object(probe) && number(probe.index) && text(probe.error)))) return false;
+				const analysis = job.analysis;
+				return analysis == null || (object(analysis) && text(analysis.prediction_name) && number(analysis.used_outputs)
+					&& (analysis.results == null || (Array.isArray(analysis.results) && analysis.results.every(match => object(match) && text(match.display_name) && number(match.probability)))));
+			});
+		}
+
+		function validAttributionBatch(batch) {
+			const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+			const text = value => value == null || typeof value === 'string';
+			const count = value => Number.isInteger(value) && value >= 0 && value <= 100;
+			if (!object(batch) || typeof batch.id !== 'string' || !batch.id || !['running', 'completed', 'cancelled', 'error'].includes(batch.state)
+				|| typeof batch.cancelRequested !== 'boolean' || !Array.isArray(batch.rows) || batch.rows.length < 1 || batch.rows.length > 100) return false;
+			if (!object(batch.progress) || !count(batch.progress.completed) || batch.progress.total !== batch.rows.length || batch.progress.completed > batch.progress.total
+				|| !count(batch.progress.current) || batch.progress.current > batch.progress.total) return false;
+			if (batch.error != null && !text(batch.error)) return false;
+			if (batch.settling != null && typeof batch.settling !== 'boolean') return false;
+			const ids = new Set();
+			return batch.rows.every(row => {
+				if (!object(row) || typeof row.accountId !== 'string' || !row.accountId || ids.has(row.accountId) || typeof row.key !== 'string' || !row.key
+					|| !text(row.label) || !text(row.model) || !text(row.error) || !text(row.skipReason)
+					|| !['queued', 'running', 'completed', 'skipped', 'error', 'cancelled'].includes(row.state)) return false;
+				ids.add(row.accountId);
+				// Reuse the normal job contract; unknown companion fields remain harmless.
+				return validAttribution({ version: 1, available: true, enabled: true, busy: false, rows: [{ ...row, ready: true }] });
+			});
+		}
+
+		function useModelAttribution(nonce, t, onSchedulingChanged, selection, actionState) {
+			const observedPauses = React.useRef(new Set());
+			const [tick, setTick] = React.useState(0);
+			const [meta, setMeta] = React.useState({ status: 'loading', body: null });
+			const [confirmation, setConfirmation] = React.useState(null);
+			const [pending, setPending] = React.useState(null);
+			const [error, setError] = React.useState('');
+			const locked = React.useRef(false), alive = React.useRef(true), latest = React.useRef(null), armed = React.useRef(null);
+			const [batchConfirmation, setBatchConfirmation] = React.useState(null);
+			const [batchSnapshot, setBatchSnapshot] = React.useState(null);
+			const [batchError, setBatchError] = React.useState('');
+			const batchArmed = React.useRef(null), knownBatchBusy = React.useRef(false);
+			const renderedSelection = selection?.current;
+			const confirm = value => { armed.current = value; setConfirmation(value); };
+			const confirmBatch = value => { batchArmed.current = value; setBatchConfirmation(value); };
+			const batchRunning = body => body?.activeBatch?.state === 'running' || body?.activeBatch?.settling === true;
+			const batchSupported = body => body?.available === true && body.enabled === true && body.batchVersion === 1 && body.batchLimit === 100;
+			function validBatchConfirmation(body, captured) {
+				if (!captured || !batchSupported(body) || body.busy || batchRunning(body) || actionState?.current.pending
+					|| body.limits?.maxTokens !== captured.limits.maxTokens || body.limits?.timeoutMs !== captured.limits.timeoutMs
+					|| (body.autoPauseOnMismatch === true) !== captured.autoPauseOnMismatch || body.pauseAvailable !== captured.pauseAvailable || selection?.current.size !== captured.rows.length) return false;
+				return captured.rows.every(row => selection.current.has(row.accountId) && body.rows.some(current => current.accountId === row.accountId && current.ready && current.key === row.key));
+			}
+			React.useEffect(() => { alive.current = true; return () => { alive.current = false; latest.current = null; armed.current = null; batchArmed.current = null; }; }, []);
+			// Unlike ordinary pool reads, a capability must never retain a failed read's
+			// old body. Revoke its ref synchronously, before React commits another render.
+			React.useEffect(() => {
+				let active = true;
+				const controller = new AbortController();
+				const timeout = setTimeout(() => controller.abort(), 30000);
+				latest.current = null;
+				setMeta({ status: 'loading', body: null });
+				(async () => {
+					try {
+						const response = await fetch('api/lm-detector/pool', { method: 'GET', credentials: 'same-origin', cache: 'no-store', headers: { accept: 'application/json' }, signal: controller.signal });
+						const rawBody = await response.json();
+						// Do not consume unadvertised fields from older optional companions.
+						const body = rawBody?.batchVersion === 1 ? rawBody : { ...rawBody, activeBatch: null };
+						if (!active) return;
+						if (controller.signal.aborted || !response.ok || !validAttribution(body)) throw new Error('unavailable');
+						latest.current = body;
+						knownBatchBusy.current = batchRunning(body);
+						const row = body.rows.find(item => item.accountId === armed.current?.accountId);
+						if (!body.available || !body.enabled || !row?.ready || row.key !== armed.current?.key || body.busy
+							|| body.limits?.maxTokens !== armed.current?.limits.maxTokens || body.limits?.timeoutMs !== armed.current?.limits.timeoutMs
+							|| (body.autoPauseOnMismatch === true) !== armed.current?.autoPauseOnMismatch || body.pauseAvailable !== armed.current?.pauseAvailable) confirm(null);
+						if (!validBatchConfirmation(body, batchArmed.current)) confirmBatch(null);
+						if (body.activeBatch) setBatchSnapshot(body.activeBatch);
+						setMeta({ status: 'ready', body });
+					} catch {
+						if (!active) return;
+						latest.current = null; confirm(null); confirmBatch(null);
+						setMeta({ status: 'unavailable', body: null });
+					} finally { clearTimeout(timeout); }
+				})();
+				return () => { active = false; latest.current = null; clearTimeout(timeout); controller.abort(); };
+			}, [nonce, tick]);
+			const refresh = () => { latest.current = null; setTick(value => value + 1); };
+			React.useEffect(() => {
+				if (meta.status === 'loading') return;
+				// Low-frequency discovery also runs after initial 404, disable or unload.
+				const delay = meta.body?.available && meta.body.enabled ? (meta.body.busy || batchRunning(meta.body) ? 1500 : 6000) : 30000;
+				const timer = setTimeout(refresh, delay);
+				return () => clearTimeout(timer);
+			}, [meta]);
+			React.useEffect(() => {
+				if (meta.status !== 'ready' || !meta.body?.available || !meta.body.enabled) return;
+				let changed = false;
+				for (const row of [...meta.body.rows, ...(meta.body.activeBatch?.rows ?? [])]) {
+					const job = row.job;
+					if (job?.state !== 'running' && ['paused', 'already-paused', 'pause-error'].includes(job?.schedulingAction?.state) && !observedPauses.current.has(job.id)) {
+						observedPauses.current.add(job.id); changed = true;
+					}
+				}
+				// A failed durable pause may still have changed memory; read the pool
+				// once per job, never send a scheduling write or trigger a polling loop.
+				if (changed) onSchedulingChanged?.();
+			}, [meta]);
+			function currentRow(row) {
+				const body = latest.current;
+				if (!alive.current || locked.current || !body?.available || !body.enabled || body !== meta.body || !row) return null;
+				const current = body.rows.find(item => item.accountId === row.accountId);
+				return current?.key === row.key ? current : null;
+			}
+			async function run(kind, row) {
+				const current = currentRow(row);
+				if (!current) return;
+				if (batchRunning(latest.current) || (kind === 'start' ? armed.current !== row || !current.ready || latest.current.busy : current.job?.state !== 'running' || current.job.id !== row.job?.id)) return;
+				locked.current = true; setPending({ accountId: row.accountId, kind }); setError('');
+				try {
+					const response = await fetch(`api/lm-detector/${kind === 'start' ? 'pool-start' : 'cancel'}`, { method: 'POST', credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(30000), headers: { 'content-type': 'application/json' }, body: JSON.stringify(kind === 'start' ? { accountId: row.accountId, expectedKey: row.key } : { id: current.job.id }) });
+					const next = await response.json();
+					if (!response.ok || typeof next?.id !== 'string' || !next.id) throw new Error(next?.error?.message || `HTTP ${response.status}`);
+					if (alive.current) confirm(null);
+				} catch (failure) {
+					if (alive.current) { latest.current = null; confirm(null); setMeta({ status: 'unavailable', body: null }); setError(failure.name === 'TimeoutError' ? t('readTimeout') : failure.message || t('failed')); }
+				} finally { locked.current = false; if (alive.current) { setPending(null); refresh(); } }
+			}
+			function batchSelectionReason(body = latest.current) {
+				if ((selection?.current.size ?? 0) > 100) return t('attributionBatchLimit');
+				if (!selection?.current.size || [...selection.current].some(id => !body?.rows.some(row => row.accountId === id && row.ready && row.key))) return t('attributionBatchUnready');
+				return '';
+			}
+			function armBatch() {
+				const body = latest.current;
+				if (!alive.current || locked.current || body !== meta.body || selection?.current !== renderedSelection || !batchSupported(body) || body.busy || batchRunning(body) || actionState?.current.pending || batchSelectionReason(body)) return;
+				confirm(null); setBatchError('');
+				// Capture EVERY selected row and its key; never filter unready accounts or
+				// substitute freshly configured rows behind an already approved prompt.
+				confirmBatch({ rows: [...selection.current].map(id => ({ ...body.rows.find(row => row.accountId === id) })), limits: { ...body.limits }, autoPauseOnMismatch: body.autoPauseOnMismatch === true, pauseAvailable: body.pauseAvailable });
+			}
+			async function runBatchAttribution(kind, captured) {
+				const body = latest.current;
+				if (!alive.current || locked.current || !batchSupported(body) || body !== meta.body) return;
+				if (kind === 'start' ? batchArmed.current !== captured || !validBatchConfirmation(body, captured)
+					: !batchRunning(body) || body.activeBatch.id !== captured?.id || body.activeBatch.cancelRequested) return;
+				locked.current = true; knownBatchBusy.current = true; setPending({ kind: `batch-${kind}` }); setBatchError(''); confirm(null); confirmBatch(null);
+				try {
+					const response = await fetch(`api/lm-detector/pool-batch-${kind}`, { method: 'POST', credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(30000), headers: { 'content-type': 'application/json' }, body: JSON.stringify(kind === 'start' ? { targets: captured.rows.map(row => ({ accountId: row.accountId, expectedKey: row.key })) } : { id: captured.id }) });
+					const next = await response.json();
+					if (!response.ok || !validAttributionBatch(next?.batch)) throw new Error(typeof next?.error?.message === 'string' ? next.error.message : !response.ok ? `HTTP ${response.status}` : t('attributionBatchUnavailable'));
+					if (alive.current) { knownBatchBusy.current = next.batch.state === 'running' || next.batch.settling === true; setBatchSnapshot(next.batch); }
+				} catch (failure) {
+					if (alive.current) setBatchError(failure.name === 'TimeoutError' ? t('readTimeout') : failure.message || t('failed'));
+				} finally {
+					// Read to reconcile an ambiguous POST; never replay a paid operation.
+					if (alive.current) { latest.current = null; setPending(null); refresh(); }
+					locked.current = false;
+				}
+			}
+			return { body: meta.body, loading: meta.status === 'loading', pending, error, confirmation,
+				arm: row => { const current = currentRow(row); if (!current?.ready || latest.current.busy || batchRunning(latest.current)) return; setError(''); confirmBatch(null); confirm({ ...current, limits: { ...latest.current.limits }, autoPauseOnMismatch: latest.current.autoPauseOnMismatch === true, pauseAvailable: latest.current.pauseAvailable }); },
+				dismiss: () => confirm(null), start: row => run('start', row), cancel: row => run('cancel', row), refresh,
+				batchConfirmation, batch: meta.body?.activeBatch || batchSnapshot, batchError,
+				batchAvailable: batchSupported(meta.body), batchDisabled: !batchSupported(meta.body) || meta.status !== 'ready' || !!pending || meta.body.busy || batchRunning(meta.body) || actionState?.current.pending || !!batchSelectionReason(meta.body),
+				batchReason: batchSelectionReason(meta.body), armBatch, dismissBatch: () => confirmBatch(null),
+				startBatch: captured => runBatchAttribution('start', captured), cancelBatch: batch => runBatchAttribution('cancel', batch),
+				batchBusy: () => locked.current || (latest.current ? batchRunning(latest.current) : knownBatchBusy.current),
+				batchStale: !!batchSnapshot && (meta.status !== 'ready' || !batchSupported(meta.body) || meta.body.activeBatch?.id !== batchSnapshot.id),
+				batchCancelDisabled: meta.status !== 'ready' || !!pending || !batchRunning(meta.body) || meta.body?.activeBatch?.cancelRequested === true };
+		}
+
+		function AttributionRowControl({ account, attribution, actionPending, t }) {
+			if (attribution?.body?.version !== 1 || attribution.body.available !== true || attribution.body.enabled !== true) return null;
+			const row = attribution.body.rows?.find(item => item.accountId === account.id);
+			if (!row) return null;
+			const job = row.job, active = job?.state === 'running';
+			const armed = attribution.confirmation?.accountId === account.id;
+			const waiting = !!attribution.pending || actionPending;
+			const batchOwned = attribution.body.activeBatch?.state === 'running' || attribution.body.activeBatch?.settling === true;
+			const disabled = waiting || !row.ready || attribution.loading || attribution.body.busy || batchOwned;
+			const analysis = job?.analysis;
+			const pauseState = job?.schedulingAction?.state;
+			const pauseLabel = { paused: 'attributionPaused', 'already-paused': 'attributionAlreadyPaused', 'pause-error': 'attributionPauseFailed', unavailable: 'attributionPauseUnavailable' }[pauseState];
+			const result = analysis?.prediction_name ? t('attributionReference', { model: analysis.prediction_name }) : job?.state === 'cancelled' ? t('attributionCancelled') : job?.state === 'error' ? t('attributionFailed') : t('attributionNoScore');
+			const btn = (key, label, onClick, off) => h('button', { key, type: 'button', className: 'dap-btn', disabled: off, onClick }, label);
+			return h('div', { className: 'dap-attribution', 'aria-busy': active || attribution.pending?.accountId === account.id }, [
+				btn('test', active ? t('attributionRunning', { done: String(job.progress?.completed ?? 0) }) : t('attributionTest'), () => attribution.arm(row), disabled),
+				h('span', { key: 'model', className: 'dap-dim', title: t('attributionConfigure') }, t('attributionModel', { model: row.model || '—' })),
+				pauseLabel ? h('p', { key: 'pauseAction', role: ['pause-error', 'unavailable'].includes(pauseState) ? 'alert' : 'status', className: ['pause-error', 'unavailable'].includes(pauseState) ? 'dap-error' : 'dap-dim' }, t(pauseLabel)) : null,
+				!row.ready ? h('span', { key: 'reason', className: 'dap-dim' }, row.reason) : null,
+				armed ? h('div', { key: 'confirmation', role: 'group', 'aria-label': t('attributionTest'), className: 'dap-attribution-confirm' }, [
+					h('p', { key: 'cost' }, t('attributionCost', { tokens: String(attribution.confirmation.limits.maxTokens ?? 8192), seconds: String((attribution.confirmation.limits.timeoutMs ?? 250000) / 1000) })),
+					attribution.confirmation.autoPauseOnMismatch ? h('p', { key: 'autoPause', className: 'dap-dim' }, t('attributionAutoPauseNote')) : null,
+					attribution.confirmation.autoPauseOnMismatch && attribution.confirmation.pauseAvailable === false ? h('p', { key: 'pauseUnavailable', className: 'dap-error', role: 'alert' }, t('attributionPauseUnavailable')) : null,
+					btn('start', t('attributionStart'), () => attribution.start(attribution.confirmation), disabled), btn('dismiss', t('cancel'), attribution.dismiss, waiting),
+				]) : null,
+				active && !batchOwned ? btn('cancel', t('attributionCancel'), () => attribution.cancel(row), waiting) : null,
+				job && !active ? h('details', { key: 'result', className: 'dap-row-more' }, [
+					h('summary', { key: 'summary', title: t('attributionCaveat') }, result),
+					h('p', { key: 'caveat', className: 'dap-dim' }, t('attributionCaveat')),
+					h('p', { key: 'samples', className: 'dap-dim' }, `${analysis?.used_outputs ?? 0}/3 · ${row.model}`),
+					...(analysis?.results ?? []).slice(0, 5).map((match, index) => h('div', { key: index, className: 'dap-dim' }, `${index + 1}. ${match.display_name}${typeof match.probability === 'number' && Number.isFinite(match.probability) ? ` · ${(match.probability * 100).toFixed(1)}%` : ''}`)),
+					job.error ? h('p', { key: 'error', className: 'dap-error' }, job.error) : null,
+					...(job.probes ?? []).filter(probe => probe.error).map(probe => h('p', { key: `probe-${probe.index}`, className: 'dap-error' }, `${probe.index}: ${probe.error}`)),
+				]) : null,
+				attribution.error && (armed || active || attribution.pending?.accountId === account.id) ? h('p', { key: 'error', className: 'dap-error', role: 'alert' }, attribution.error) : null,
+			]);
+		}
+
+		function AttributionBatchPanel({ attribution, t, pending }) {
+			const captured = attribution.batchConfirmation, batch = attribution.batch;
+			if (!captured && !batch && !attribution.batchError) return null;
+			const stateLabel = state => t({ queued: 'attributionBatchQueued', running: 'attributionBatchRunning', completed: 'attributionBatchCompleted', skipped: 'attributionBatchSkipped', error: 'attributionBatchError', cancelled: 'attributionBatchCancelled' }[state]);
+			const btn = (key, label, onClick, disabled) => h('button', { key, type: 'button', className: 'dap-btn', onClick, disabled }, label);
+			const active = batch?.state === 'running' || batch?.settling === true;
+			return h('section', { className: 'dap-form dap-attribution-batch', 'aria-label': t('attributionBatch'), 'aria-busy': !!attribution.pending || active }, [
+				h('h4', { key: 'title', className: 'dap-form-title' }, t('attributionBatch')),
+				captured ? h('div', { key: 'confirmation', role: 'group', 'aria-label': t('attributionBatchConfirm', { n: captured.rows.length, calls: captured.rows.length * 3 }) }, [
+					h('p', { key: 'cost' }, t('attributionBatchCost', { n: captured.rows.length, calls: captured.rows.length * 3 })),
+					h('p', { key: 'budget' }, t('attributionCost', { tokens: captured.limits.maxTokens ?? 8192, seconds: (captured.limits.timeoutMs ?? 250000) / 1000 })),
+					captured.autoPauseOnMismatch ? h('p', { key: 'autoPause', className: 'dap-dim' }, t('attributionAutoPauseNote')) : null,
+					captured.autoPauseOnMismatch && captured.pauseAvailable === false ? h('p', { key: 'pauseUnavailable', className: 'dap-error', role: 'alert' }, t('attributionPauseUnavailable')) : null,
+					h('ul', { key: 'targets' }, captured.rows.map(row => h('li', { key: row.accountId }, `${row.label || row.accountId} · ${row.model || '—'}`))),
+					btn('start', t('attributionBatchConfirm', { n: captured.rows.length, calls: captured.rows.length * 3 }), () => attribution.startBatch(captured), pending || attribution.batchDisabled),
+					btn('dismiss', t('cancel'), attribution.dismissBatch, !!attribution.pending),
+				]) : null,
+				batch ? h('div', { key: 'progress' }, [
+					h('p', { key: 'status', role: 'status', 'aria-live': 'polite' }, t('attributionBatchProgress', { done: batch.progress.completed, total: batch.progress.total, state: stateLabel(batch.state) })),
+					active && batch.cancelRequested ? h('p', { key: 'cancelling', role: 'status' }, t('attributionBatchCancelling')) : null,
+					active ? btn('cancel', t('attributionBatchCancel'), () => attribution.cancelBatch(batch), attribution.batchCancelDisabled) : null,
+					attribution.batchStale && !attribution.loading ? h('p', { key: 'unavailable', role: 'alert', className: 'dap-error' }, t('attributionBatchUnavailable')) : null,
+					h('p', { key: 'caveat', className: 'dap-dim' }, t('attributionCaveat')),
+					h('ul', { key: 'rows' }, batch.rows.map(row => {
+						const job = row.job, pauseState = job?.schedulingAction?.state;
+						const pauseLabel = { paused: 'attributionPaused', 'already-paused': 'attributionAlreadyPaused', 'pause-error': 'attributionPauseFailed', unavailable: 'attributionPauseUnavailable' }[pauseState];
+						return h('li', { key: row.accountId }, [
+							h('strong', { key: 'name' }, `${row.label || row.accountId} · ${row.model || '—'} · ${stateLabel(row.state)}`),
+							job?.analysis?.prediction_name ? h('p', { key: 'prediction' }, t('attributionReference', { model: job.analysis.prediction_name })) : null,
+							job?.state === 'completed' && !job.analysis?.prediction_name ? h('p', { key: 'noScore' }, t('attributionNoScore')) : null,
+							pauseLabel ? h('p', { key: 'pause', role: ['pause-error', 'unavailable'].includes(pauseState) ? 'alert' : 'status' }, t(pauseLabel)) : null,
+							row.error || row.skipReason || job?.error ? h('p', { key: 'error', className: 'dap-error' }, row.error || row.skipReason || job.error) : null,
+						]);
+					})),
+					batch.error ? h('p', { key: 'error', className: 'dap-error', role: 'alert' }, batch.error) : null,
+				]) : null,
+				attribution.batchError ? h('p', { key: 'error', className: 'dap-error', role: 'alert' }, attribution.batchError) : null,
+				btn('refresh', t('attributionRefresh'), attribution.refresh, !!attribution.pending),
+			]);
+		}
+
 		function AccountRow(props) {
 			const { account, now, t, action, pool, selected, onSelect } = props;
 			const cooling = coolingOf(account, now);
@@ -1130,6 +1577,7 @@ window.__ModuleLoader__.load({
 					h(Pill, { key: 'pill', tone: status.tone }, t(status.key)),
 					cooling === null ? null : h('div', { className: 'dap-cell-meta dap-num', key: 'cooling' }, `${formatRemaining(cooling.until - now, t)} · ${t(cooling.reasonKey)}`),
 					(account.consecutiveFailures ?? 0) === 0 ? null : h('div', { className: 'dap-cell-meta', key: 'failures' }, `${t('colFailures')} ${account.consecutiveFailures}`),
+					h(AttributionRowControl, { key: 'attribution', account, attribution: pool.attribution, actionPending: action.pending, t }),
 				]),
 				h('td', { key: 'pr', className: 'dap-cell-schedule', 'data-label': t('colScheduling') }, h('div', { className: 'dap-cell-stack' }, [
 					h('span', { className: 'dap-num', key: 'priority' }, [h('span', { className: 'dap-dim', key: 'l' }, `${t('colPriority')} `), String(account.priority)]),
@@ -1176,15 +1624,37 @@ window.__ModuleLoader__.load({
 			menu.style.top = `${Math.max(inset, rect.bottom + height + 6 > window.innerHeight ? rect.top - height - 6 : rect.bottom + 6)}px`;
 		}
 
+		/** Use only the per-request snapshot, never the model's current mapping. */
+		function usageEffortDisplay(row, t) {
+			const requested = row.reasoningEffort;
+			if (typeof requested !== 'string' || requested === '') {
+				return { label: t('usageEffortUnknown'), title: t('usageEffortUnknownHint'), recorded: false };
+			}
+			const mapped = row.mappedReasoningEffort;
+			const effective = typeof mapped === 'string' && mapped !== '' ? mapped : t('usageEffortOmitted');
+			return {
+				label: requested === mapped ? t('usageEffort', { level: requested }) : t('usageEffortMapped', { requested, mapped: effective }),
+				title: t('usageEffortDetail', { requested, mapped: effective }),
+				recorded: true,
+			};
+		}
+
 		function UsageRow(props) {
 			const { row, t } = props;
+			const effort = usageEffortDisplay(row, t);
 			return h('tr', null, [
 				h('td', { key: 't', className: 'dap-dim dap-num', title: row.at }, new Date(row.at).toLocaleString()),
 				h('td', { key: 'a', className: 'dap-mono' }, row.accountId === '' ? t('none') : row.accountId),
-				h('td', { key: 'm', className: 'dap-dim' }, row.model === '' ? t('none') : row.model),
+				h('td', { key: 'm', className: 'dap-usage-model' }, [
+					h('span', { key: 'name', className: 'dap-usage-model-name', title: row.model }, row.model === '' ? t('none') : row.model),
+					h('span', { key: 'effort', className: 'dap-usage-effort', 'data-recorded': effort.recorded, title: effort.title }, effort.label),
+				]),
 				h('td', { key: 'k', className: 'dap-num', title: t('cacheDetail', { write: compact(row.cacheWriteTokens), reasoning: compact(row.reasoningTokens) }) }, [
 					compact(row.inputTokens), ' / ', compact(row.outputTokens), ' / ', compact(row.cacheReadTokens),
 				]),
+				h('td', { key: 'first', className: 'dap-num dap-timing', title: usageMetric(row.firstTokenMs) === null ? t('usageTimingUnavailable') : t('firstTokenHint') }, formatUsageDuration(row.firstTokenMs)),
+				h('td', { key: 'duration', className: 'dap-num dap-timing', title: usageMetric(row.outputDurationMs) === null ? t('usageTimingUnavailable') : t('outputDurationHint') }, formatUsageDuration(row.outputDurationMs)),
+				h('td', { key: 'tps', className: 'dap-num dap-timing', title: usageMetric(row.outputTps) === null ? t('usageTimingUnavailable') : t('outputTpsHint') }, formatUsageTps(row.outputTps)),
 				h('td', { key: 's', className: 'dap-num' }, String(row.accountSwitches)),
 				h('td', { key: 'r', title: row.errorCode || '' }, h(Pill, { tone: row.ok ? 'ready' : 'failed' }, t(row.ok ? 'ok' : 'failed'))),
 			]);
@@ -1293,13 +1763,46 @@ window.__ModuleLoader__.load({
 			]);
 		}
 
+		const isCodexOAuth = (values) => values.platform === 'openai' && values.authMode === 'oauth';
+		const isOpenaiApiKey = (values) => ['openai', 'grok', 'custom'].includes(values.platform) && (values.authMode ?? 'api-key') === 'api-key';
+
+		/** Normalize protocol fields at mode/platform changes and the save boundary.
+		 * Codex's endpoint ignores openaiApi; its capability is independent of the
+		 * generic Responses API capability. Never send WS to an older OAuth host.
+		 */
+		function accountProtocol(values, openaiProtocolReady, codexWebSocketReady) {
+			if (isCodexOAuth(values) && codexWebSocketReady) return { openaiApi: 'chat-completions', openaiTransport: values.openaiTransport === 'websocket' ? 'websocket' : 'http' };
+			if (isOpenaiApiKey(values) && openaiProtocolReady) {
+				const openaiApi = values.openaiApi === 'responses' ? 'responses' : 'chat-completions';
+				return { openaiApi, openaiTransport: openaiApi === 'responses' && values.openaiTransport === 'websocket' ? 'websocket' : 'http' };
+			}
+			return { openaiApi: 'chat-completions', openaiTransport: 'http' };
+		}
+
+		function CodexTransportField({ t, values, set, pending }) {
+			return h('label', { className: 'dap-field' }, [
+				h('span', { key: 'label', className: 'dap-field-label' }, t('openaiTransport')),
+				h('select', { key: 'select', className: 'dap-input', 'aria-label': t('openaiTransport'), 'aria-describedby': 'dap-codex-transport-hint', value: values.openaiTransport ?? 'http', disabled: pending, onChange: (event) => set('openaiTransport')(event.target.value) }, [
+					h('option', { key: 'http', value: 'http' }, t('openaiHttp')),
+					h('option', { key: 'websocket', value: 'websocket' }, t('openaiWebSocket')),
+				]),
+				h('span', { key: 'hint', id: 'dap-codex-transport-hint', className: 'dap-dim' }, t('codexWebSocketHint')),
+			]);
+		}
+
 		/** Add / edit form. The secret is write-only: it is never pre-filled. */
 		function AccountForm(props) {
-			const { t, mode, initial, configured, pending, error, onSave, onCancel, allGroups, managementReady, quotaReady, detectionReady, openaiProtocolReady } = props;
+			const { t, mode, initial, configured, pending, error, onSave, onCancel, allGroups, managementReady, quotaReady, detectionReady, openaiProtocolReady, codexWebSocketReady, savedId } = props;
 			const [values, setValues] = React.useState(() => ({ ...initial }));
 			const [credential, setCredential] = React.useState('');
 			const [validationError, setValidationError] = React.useState(null);
-			const set = (key) => (value) => { setValidationError(null); setValues((previous) => ({ ...previous, [key]: value })); };
+			const set = (key) => (value) => {
+				setValidationError(null);
+				setValues((previous) => {
+					const next = { ...previous, [key]: value };
+					return key === 'platform' || key === 'authMode' ? { ...next, ...accountProtocol(next, openaiProtocolReady, codexWebSocketReady) } : next;
+				});
+			};
 
 			function submit() {
 				const retries = Number(values.poolDetectionRetries ?? 2);
@@ -1312,8 +1815,8 @@ window.__ModuleLoader__.load({
 					return;
 				}
 				setValidationError(null);
-				onSave({
-					id: values.id,
+				return onSave({
+					id: savedId || values.id,
 					account: {
 						label: values.label,
 						...(detectionReady ? {
@@ -1329,7 +1832,7 @@ window.__ModuleLoader__.load({
 						autoPauseOnExpired: values.autoPauseOnExpired !== false,
 						schedulable: values.schedulable !== false,
 						loadFactor: values.loadFactor === '' || values.loadFactor == null ? null : Number(values.loadFactor) } : {}),
-						...(openaiProtocolReady && ['openai', 'grok', 'custom'].includes(values.platform) && (values.authMode ?? 'api-key') === 'api-key' ? { openaiApi: values.openaiApi ?? 'chat-completions', openaiTransport: values.openaiTransport ?? 'http' } : openaiProtocolReady ? { openaiApi: 'chat-completions', openaiTransport: 'http' } : {}),
+						...(openaiProtocolReady || (codexWebSocketReady && (isCodexOAuth(values) || isCodexOAuth(initial))) ? accountProtocol(values, openaiProtocolReady, codexWebSocketReady) : {}),
 						platform: values.platform,
 						baseUrl: values.baseUrl === '' ? null : values.baseUrl,
 						models: String(values.models).split(',').map((part) => part.trim()).filter((part) => part !== ''),
@@ -1352,12 +1855,12 @@ window.__ModuleLoader__.load({
 			}
 
 			const fields = [
-					mode === 'create' ? h(Field, { key: 'id', label: t('fieldId'), value: values.id, onChange: set('id') }) : null,
+					mode === 'create' ? h(Field, { key: 'id', label: t('fieldId'), value: savedId || values.id, disabled: pending || !!savedId, onChange: set('id') }) : null,
 					h(Field, { key: 'label', label: t('fieldLabel'), value: values.label, onChange: set('label') }),
 					h('label', { className: 'dap-field', key: 'platform' }, [
 						h('span', { className: 'dap-field-label', key: 'l' }, t('fieldPlatform')),
 						h('select', {
-							key: 's', className: 'dap-input', value: values.platform,
+							key: 's', className: 'dap-input', 'aria-label': t('fieldPlatform'), value: values.platform, disabled: pending,
 							onChange: (event) => set('platform')(event.target.value),
 						}, PLATFORMS.map((name) => h('option', { key: name, value: name }, name))),
 					]),
@@ -1366,7 +1869,7 @@ window.__ModuleLoader__.load({
 					h('label', { className: 'dap-field', key: 'authMode' }, [
 						h('span', { className: 'dap-field-label', key: 'l' }, t('fieldAuthMode')),
 						h('select', {
-							key: 's', className: 'dap-input', value: values.authMode ?? AUTH_MODES[0],
+							key: 's', className: 'dap-input', 'aria-label': t('fieldAuthMode'), value: values.authMode ?? AUTH_MODES[0], disabled: pending,
 							onChange: (event) => set('authMode')(event.target.value),
 						}, AUTH_MODES.map((name) => h('option', { key: name, value: name },
 							t(name === 'oauth' ? 'authModeOauth' : 'authModeApiKey')))),
@@ -1383,7 +1886,8 @@ window.__ModuleLoader__.load({
 					]),
 					!quotaReady || values.platform !== 'gemini' || values.authMode !== 'oauth' ? null : h(Field, { key: 'projectId', label: t('fieldProjectId'), value: values.projectId ?? '', onChange: set('projectId') }),
 					!quotaReady || values.platform !== 'openai' || values.authMode !== 'oauth' ? null : h(Field, { key: 'chatgptAccountId', label: t('fieldChatgptAccountId'), value: values.chatgptAccountId ?? '', onChange: set('chatgptAccountId') }),
-					openaiProtocolReady && ['openai', 'grok', 'custom'].includes(values.platform) && (values.authMode ?? 'api-key') === 'api-key' ? h(OpenaiProtocolFields, { key: 'openai-protocol', t, values, set, pending }) : null,
+					openaiProtocolReady && isOpenaiApiKey(values) ? h(OpenaiProtocolFields, { key: 'openai-protocol', t, values, set, pending }) : null,
+					codexWebSocketReady && isCodexOAuth(values) ? h(CodexTransportField, { key: 'codex-transport', t, values, set, pending }) : null,
 					h(Field, { key: 'baseUrl', label: t('fieldBaseUrl'), value: values.baseUrl, onChange: set('baseUrl') }),
 					h(Field, {
 						key: 'credential', label: t('fieldCredential'), type: 'password', value: credential,
@@ -1405,8 +1909,9 @@ window.__ModuleLoader__.load({
 				h('legend', { key: 'title' }, t(label)),
 				h('div', { className: 'dap-form-grid', key: 'grid' }, fields.filter((field) => field && schedulingKeys.has(field.key ?? field.props.key) === scheduling)),
 			]);
-			return h('form', { className: 'dap-form', onSubmit: (event) => { event.preventDefault(); submit(); } }, [
+			return h('form', { className: 'dap-form', onSubmit: (event) => { event.preventDefault(); return submit(); } }, [
 				h('div', { className: 'dap-form-title', key: 'title' }, mode === 'create' ? t('formCreate') : t('formEdit', { id: values.id })),
+				savedId ? h('p', { key: 'save-checkpoint', className: 'dap-models-hint', role: 'status' }, t('accountSaveCheckpoint', { id: savedId })) : null,
 				section('connection', 'sectionConnection', false),
 				section('scheduling', 'sectionScheduling', true),
 				!detectionReady ? h('div', { className: 'dap-dim', key: 'detection-restart' }, t('poolDetectionRestart')) : h('div', { className: 'dap-field dap-detection', key: 'detection' }, [
@@ -1472,7 +1977,7 @@ window.__ModuleLoader__.load({
 						]);
 					})),
 				]),
-				error === null ? null : h('div', { className: 'dap-error', key: 'err' }, error),
+				error === null ? null : h('div', { className: 'dap-error', role: 'alert', key: 'err' }, error),
 				h('div', { className: 'dap-form-actions', key: 'actions' }, [
 					h('button', {
 						key: 'save', type: 'submit', className: 'dap-btn dap-btn-primary',
@@ -1597,6 +2102,17 @@ window.__ModuleLoader__.load({
 		// =====================================================================
 		// § 10  OAuth panel — the provider directory and the live login flow.
 		// =====================================================================
+
+		function OAuthDirectoryState({ t, status, error, onRetry, onClose }) {
+			return h('div', { className: 'dap-form', role: status === 'error' ? 'alert' : 'status' }, [
+				h('strong', { key: 'title' }, t(status === 'error' ? 'oauthDirectoryFailed' : 'oauthDirectoryLoading')),
+				error ? h('p', { key: 'error', className: 'dap-error' }, error) : null,
+				h('div', { key: 'actions', className: 'dap-form-actions' }, [
+					status === 'error' ? h('button', { key: 'retry', type: 'button', className: 'dap-btn', onClick: onRetry }, t('retryLoad')) : null,
+					h('button', { key: 'close', type: 'button', className: 'dap-btn', onClick: onClose }, t('cancel')),
+				]),
+			]);
+		}
 
 		function OAuthPanel(props) {
 			const { t, onClose, onChanged, providers, credentialsAvailable } = props;
@@ -2007,6 +2523,85 @@ window.__ModuleLoader__.load({
 		 * (arrow keys move focus and selection together), so it lives here rather
 		 * than in the page state.
 		 */
+		/** Independent reviewer settings: never writes chat models or approval policy. */
+		function AutoReviewPanel({ t }) {
+			const [nonce, setNonce] = React.useState(0);
+			const state = useJson('api/autoReview.model', nonce, t);
+			const [draft, setDraft] = React.useState({ mode: 'session' });
+			const [pending, setPending] = React.useState(false);
+			const [error, setError] = React.useState(null);
+			const [saved, setSaved] = React.useState(false);
+			const dirty = React.useRef(false);
+			const flight = React.useRef(null);
+			const mounted = React.useRef(true);
+			React.useEffect(() => { mounted.current = true; return () => { mounted.current = false; flight.current?.abort(); }; }, []);
+			const body = state.body;
+			const ready = state.status === 'ready' && body?.version === 1 && body.available === true && body.compatible === true;
+			React.useEffect(() => {
+				if (ready && !dirty.current) setDraft(body.selection);
+			}, [body, ready]);
+			const choices = ready && Array.isArray(body.choices) ? body.choices : [];
+			const providers = [...new Map(choices.map((row) => [row.provider, row.providerName || row.provider])).entries()];
+			const models = choices.filter((row) => row.provider === draft.provider);
+			const valid = draft.mode === 'session' || choices.some((row) => row.provider === draft.provider && row.model === draft.model);
+			function change(next) { if (flight.current) return; dirty.current = true; setDraft(next); setSaved(false); setError(null); }
+			async function save(event) {
+				event.preventDefault();
+				if (!mounted.current || flight.current || !ready || !valid) return;
+				const controller = new AbortController(); flight.current = controller;
+				const timeout = setTimeout(() => controller.abort(), 30000);
+				setPending(true); setError(null); setSaved(false);
+				try {
+					const response = await fetch('api/autoReview.model', {
+						method: 'POST', credentials: 'same-origin', signal: controller.signal,
+						headers: { 'content-type': 'application/json', accept: 'application/json' },
+						body: JSON.stringify({ selection: draft, expectedRevision: body.revision }),
+					});
+					const result = await response.json().catch(() => null);
+					if (!response.ok || result?.version !== 1 || result.available !== true) throw new Error(result?.error?.message || `HTTP ${response.status}`);
+					if (!mounted.current) return;
+					dirty.current = false; setDraft(result.selection); setSaved(true); setNonce((value) => value + 1);
+				} catch (failure) {
+					if (mounted.current) setError(failure.name === 'AbortError' ? t('readTimeout') : failure.message);
+				} finally {
+					clearTimeout(timeout);
+					if (flight.current === controller) flight.current = null;
+					if (mounted.current) setPending(false);
+				}
+			}
+			const disabled = pending || !ready;
+			return h('section', { className: 'dap-section', 'aria-busy': pending || state.status === 'loading' }, [
+				h('h3', { key: 'title' }, t('reviewTitle')),
+				h('p', { className: 'dap-muted', key: 'hint' }, t('reviewHint')),
+				h('p', { className: 'dap-muted', key: 'policy' }, t('reviewPolicyHint')),
+				state.status === 'loading' ? h('p', { key: 'loading', role: 'status' }, t('reviewLoading')) : null,
+				state.status !== 'loading' && !ready ? h('div', { key: 'unavailable', className: 'dap-error', role: 'alert' }, [t('reviewUnavailable'), state.error ? h('div', { key: 'detail' }, state.error) : null]) : null,
+				h('form', { key: 'form', onSubmit: save }, [
+					h('label', { key: 'mode', className: 'dap-field' }, [t('reviewMode'), h('select', { className: 'dap-input', value: draft.mode, disabled, onChange: (event) => change(event.target.value === 'session' ? { mode: 'session' } : { mode: 'fixed', provider: providers[0]?.[0] || '', model: choices[0]?.model || '' }) }, [
+						h('option', { key: 'session', value: 'session' }, t('reviewSession')),
+						h('option', { key: 'fixed', value: 'fixed' }, t('reviewFixed')),
+					])]),
+					draft.mode !== 'fixed' ? null : h('div', { key: 'fixed', className: 'dap-form-grid' }, [
+						h('label', { key: 'provider', className: 'dap-field' }, [t('reviewProvider'), h('select', { className: 'dap-input', value: draft.provider, disabled, onChange: (event) => change({ mode: 'fixed', provider: event.target.value, model: choices.find((row) => row.provider === event.target.value)?.model || '' }) }, [
+							!providers.some(([provider]) => provider === draft.provider) ? h('option', { key: 'missing', value: draft.provider || '' }, draft.provider || t('reviewChooseProvider')) : null,
+							...providers.map(([provider, label]) => h('option', { key: provider, value: provider }, label)),
+						])]),
+						h('label', { key: 'model', className: 'dap-field' }, [t('reviewModel'), h('select', { className: 'dap-input', value: draft.model, disabled, onChange: (event) => change({ ...draft, model: event.target.value }) }, [
+							!models.some((row) => row.model === draft.model) ? h('option', { key: 'missing', value: draft.model || '' }, draft.model || t('reviewChooseModel')) : null,
+							...models.map((row) => h('option', { key: row.model, value: row.model }, row.modelName || row.model)),
+						])]),
+					]),
+					ready && draft.mode === 'fixed' && !valid ? h('p', { key: 'invalid', className: 'dap-error', role: 'alert' }, t('reviewInvalid')) : null,
+					h('div', { key: 'actions', className: 'dap-form-actions' }, [
+						h('button', { key: 'save', type: 'submit', className: 'dap-btn dap-btn-primary', disabled: disabled || !valid }, pending ? t('saving') : t('save')),
+						h('button', { key: 'refresh', type: 'button', className: 'dap-btn', disabled: pending, onClick: () => { dirty.current = false; setError(null); setSaved(false); setNonce((value) => value + 1); } }, t('refresh')),
+					]),
+				]),
+				error ? h('p', { key: 'error', className: 'dap-error', role: 'alert' }, error) : null,
+				saved ? h('p', { key: 'saved', role: 'status' }, t('reviewSaved')) : null,
+			]);
+		}
+
 		function PoolTabs(props) {
 			const { t, tabs, activeTab, onSelect } = props;
 			return h('div', { className: 'dap-tabs', role: 'tablist', 'aria-label': t('tabLabel'), key: 'tabs' }, tabs.map(([id, label, count, icon], index) => h('button', {
@@ -2019,7 +2614,7 @@ window.__ModuleLoader__.load({
 					event.preventDefault(); onSelect(tabs[next][0]);
 					event.currentTarget.parentElement.querySelectorAll('[role="tab"]')[next].focus();
 				},
-			}, [h(Icon, { key: 'icon', name: icon }), t(label), h('span', { className: 'dap-tab-count', key: 'count' }, String(count))])));
+			}, [h(Icon, { key: 'icon', name: icon }), t(label), count == null ? null : h('span', { className: 'dap-tab-count', key: 'count' }, String(count))])));
 		}
 
 		/**
@@ -2050,15 +2645,29 @@ window.__ModuleLoader__.load({
 			]);
 		}
 
+		/** Shared, named two-step confirmation; deleting a group keeps its accounts. */
+		function GroupDeleteConfirmation({ t, group, pending, onConfirm, onCancel }) {
+			return h('div', { className: 'dap-form', role: 'group', 'aria-label': t('providerDeleteHint', { name: group.label || group.id }), onKeyDown: (event) => {
+				if (event.key === 'Escape' && !pending) { event.preventDefault(); event.stopPropagation(); onCancel(); }
+			} }, [
+				h('p', { key: 'hint' }, t('providerDeleteHint', { name: group.label || group.id })),
+				h('div', { key: 'buttons', className: 'dap-actions' }, [
+					h('button', { key: 'confirm', type: 'button', className: 'dap-btn dap-btn-danger', 'aria-label': `${t('confirmDelete')} ${group.label || group.id}`, disabled: pending, onClick: onConfirm }, t('confirmDelete')),
+					h('button', { key: 'cancel', type: 'button', className: 'dap-btn', disabled: pending, onClick: onCancel }, t('cancel')),
+				]),
+			]);
+		}
+
 		/** The group cards: one per group, with member count, strategy and model tags. */
 		function GroupsPanel(props) {
-			const { t, groups, groupCounts, managementReady, pending, form, onCreate, onEdit, onDelete } = props;
+			const { t, groups, groupCounts, managementReady, pending, form, confirmation, onCreate, onEdit, onDelete } = props;
 			return h('div', { className: 'dap-panel', key: 'groups' }, [
 				h('div', { className: 'dap-panel-head', key: 'h' }, [
 					h('div', { key: 'copy' }, [h('h4', { className: 'dap-panel-title', key: 't' }, t('groupsTitle')), h('p', { className: 'dap-panel-subtitle', key: 'hint' }, t('groupsHint'))]),
 					h('button', { className: 'dap-btn dap-btn-primary', key: 'add', type: 'button', disabled: pending, onClick: onCreate }, [h(Icon, { name: 'plus', key: 'icon' }), t('groupAdd')]),
 				]),
 				form,
+				confirmation,
 				groups.length === 0
 					? h(PoolEmptyState, { key: 'empty', icon: 'groups', message: t('groupEmpty') })
 					: h('div', { className: 'dap-group-grid', key: 'list' }, groups.map((group) => h('div', { className: 'dap-group-card', key: group.id }, [
@@ -2092,6 +2701,7 @@ window.__ModuleLoader__.load({
 					h('select', { className: 'dap-input', 'aria-label': t('usageAccount'), value: filters.account, onChange: (event) => onFilter('account', event.target.value) }, [h('option', { value: '', key: '__all' }, t('usageAccount')), ...list.map((account) => h('option', { value: account.id, key: account.id }, account.label || account.id))]),
 					h('input', { className: 'dap-input', type: 'search', 'aria-label': t('usageModel'), placeholder: t('usageModel'), value: filters.model, onChange: (event) => onFilter('model', event.target.value) }),
 				]),
+				h('p', { key: 'timing-hint', className: 'dap-timing-hint' }, t('usageTimingHint')),
 				status === 'error' ? h('div', { key: 'error', className: 'dap-status dap-error' }, error) : null,
 				h('div', { className: 'dap-usage-summary', key: 'summary', 'aria-label': t('usageSummary', { n: String(rows.length), ok: String(summary.ok), failed: String(summary.failed), input: compact(summary.input), output: compact(summary.output) }) }, [
 					['usageRequests', rows.length], ['usageSuccess', summary.ok], ['usageFailures', summary.failed], ['usageInput', compact(summary.input)], ['usageOutput', compact(summary.output)],
@@ -2102,8 +2712,11 @@ window.__ModuleLoader__.load({
 						h('thead', { key: 'head' }, h('tr', null, [
 							h('th', { key: 't', scope: 'col' }, t('colTime')),
 							h('th', { key: 'a', scope: 'col' }, t('colAccount')),
-							h('th', { key: 'm', scope: 'col' }, t('colModel')),
+							h('th', { key: 'm', scope: 'col', className: 'dap-usage-model' }, t('colModel')),
 							h('th', { key: 'k', scope: 'col' }, t('colTokens')),
+							h('th', { key: 'first', scope: 'col', className: 'dap-timing', title: t('firstTokenHint') }, t('colFirstToken')),
+							h('th', { key: 'duration', scope: 'col', className: 'dap-timing', title: t('outputDurationHint') }, t('colOutputDuration')),
+							h('th', { key: 'tps', scope: 'col', className: 'dap-timing', title: t('outputTpsHint') }, t('colOutputTps')),
 							h('th', { key: 's', scope: 'col' }, t('colSwitches')),
 							h('th', { key: 'r', scope: 'col' }, t('colResult')),
 						])),
@@ -2239,9 +2852,11 @@ window.__ModuleLoader__.load({
 		 * host validates every id and reports per-account outcomes.
 		 */
 		function BatchBar(props) {
-			const { t, count, groups, group, confirming, pending, managementReady, onGroup, onRun, onDelete, onToggleEdit, onClear } = props;
+			const { t, count, groups, group, confirming, pending, managementReady, attribution, onGroup, onRun, onDelete, onToggleEdit, onClear } = props;
 			return h('div', { className: 'dap-batch', key: 'batch' }, [
 				h('span', { className: 'dap-batch-count', key: 'n' }, t('batchSelected', { n: String(count) })),
+				attribution.batchAvailable ? h('button', { key: 'attribution', type: 'button', className: 'dap-btn', disabled: pending || attribution.batchDisabled, onClick: attribution.armBatch, title: attribution.batchReason || t('attributionConfigure') }, t('attributionBatch')) : null,
+				attribution.batchAvailable && attribution.batchReason ? h('span', { key: 'attribution-reason', className: 'dap-dim' }, attribution.batchReason) : null,
 				h('button', { key: 'on', type: 'button', className: 'dap-btn', disabled: pending, onClick: () => onRun('enable') }, t('actEnable')),
 				h('button', { key: 'off', type: 'button', className: 'dap-btn', disabled: pending, onClick: () => onRun('disable') }, t('actDisable')),
 				h('button', { key: 'cool', type: 'button', className: 'dap-btn', disabled: pending, onClick: () => onRun('clear-cooldown') }, t('actClearCooldown')),
@@ -2318,21 +2933,37 @@ window.__ModuleLoader__.load({
 			useStyles();
 
 			const [nonce, setNonce] = React.useState(0);
+			const [oauthNonce, setOauthNonce] = React.useState(0);
 			const action = useAction(() => setNonce((value) => value + 1), t);
 			const accounts = useJson(ACCOUNTS_ROUTE, nonce, t);
 			const usage = useJson(`${USAGE_ROUTE}?limit=${String(USAGE_LIMIT)}`, nonce, t);
 			// The OAuth provider directory is its own request, and deliberately not
 			// part of the accounts payload: the accounts route is on the hot path for
 			// every page render, while the provider list is static reference data.
-			const oauth = useJson(OAUTH_ROUTE, 0, t);
+			const oauth = useJson(OAUTH_ROUTE, oauthNonce, t);
 			const now = useNow();
 			const [editing, setEditing] = React.useState(null);
+			const editorRef = React.useRef(null);
+			const editorGeneration = React.useRef(0);
+			React.useEffect(() => () => { editorRef.current = null; }, []);
+			function setEditor(next) {
+				// Every opening is a distinct editing session, even for the same ID.
+				editorRef.current = next === null ? null : { ...next, generation: ++editorGeneration.current, progress: { pending: false, savedId: null, signature: null, priorities: new Map() } };
+				setEditing(editorRef.current);
+			}
 			const [confirmingId, setConfirmingId] = React.useState(null);
 			const [importing, setImporting] = React.useState(null);
 			const [importGroup, setImportGroup] = React.useState('');
 			const [oauthOpen, setOauthOpen] = React.useState(false);
 			const [editingGroup, setEditingGroup] = React.useState(null);
-			const [selected, setSelected] = React.useState(() => new Set());
+			const [confirmingGroupId, setConfirmingGroupId] = React.useState(null);
+			const [selected, setSelectedState] = React.useState(() => new Set());
+			const selectedRef = React.useRef(selected);
+			function setSelected(next) {
+				selectedRef.current = typeof next === 'function' ? next(selectedRef.current) : next;
+				attribution.dismissBatch();
+				setSelectedState(selectedRef.current);
+			}
 			const [batchGroup, setBatchGroup] = React.useState('');
 			// Arming state for the destructive batch verb, so one click never deletes.
 			const [confirmingBatch, setConfirmingBatch] = React.useState(false);
@@ -2347,7 +2978,13 @@ window.__ModuleLoader__.load({
 			const [pageSize, setPageSize] = React.useState(50);
 			const [supplierOpen, setSupplierOpen] = React.useState(false);
 			const [activeTab, setActiveTab] = React.useState('accounts');
+			// Mount settings only when visited, then retain unsaved drafts across tabs.
+			const [settingsVisited, setSettingsVisited] = React.useState(false);
 			const quotaData = useAccountQuotas(t);
+			const actionState = React.useRef(action);
+			actionState.current = action;
+			const attribution = useModelAttribution(nonce, t, () => setNonce(value => value + 1), selectedRef, actionState);
+			const batchAttributionBusy = attribution.batchBusy();
 			const [usageAccountId, setUsageAccountId] = React.useState(null);
 			const reset = useResetCredits(t, action, quotaData);
 			const { confirmation: resetConfirmation, error: resetError } = reset;
@@ -2357,6 +2994,7 @@ window.__ModuleLoader__.load({
 			const quotaReady = accounts.body?.quotaVersion >= 1;
 			const detectionReady = (accounts.body?.detectionVersion ?? 0) >= 1;
 			const openaiProtocolReady = (accounts.body?.openaiProtocolVersion ?? 0) >= 1;
+			const codexWebSocketReady = (accounts.body?.codexWebSocketVersion ?? 0) >= 1;
 
 			/** Row-level handlers plus the pending delete confirmation. */
 			const pool = {
@@ -2364,6 +3002,7 @@ window.__ModuleLoader__.load({
 				managementReady,
 				quotaReady,
 				quotaData,
+				attribution,
 				onViewUsage: (account) => {
 					setActiveTab('accounts');
 					setUsageAccountId(account.id);
@@ -2377,7 +3016,7 @@ window.__ModuleLoader__.load({
 					setActiveTab('accounts');
 					setSupplierOpen(false);
 					setConfirmingId(null);
-					setEditing({
+					setEditor({
 						mode: 'edit',
 						id: account.id,
 						configured: account.credential?.configured === true,
@@ -2426,7 +3065,7 @@ window.__ModuleLoader__.load({
 			function startCreate() {
 				setActiveTab('accounts');
 				setConfirmingId(null);
-				setEditing({
+				setEditor({
 					mode: 'create',
 					id: '',
 					configured: false,
@@ -2440,49 +3079,65 @@ window.__ModuleLoader__.load({
 			}
 
 			async function saveForm(payload) {
-				const verb = editing.mode === 'create' ? 'create' : 'update';
-				const ok = await action.run(payload.id, verb, {
-					account: payload.account,
-					// Omit the key entirely when untouched: the host treats `undefined`
-					// as "leave the stored secret alone".
-					...(payload.credential === undefined ? {} : { credential: payload.credential }),
-				});
-				if (!ok) return;
-
-				// The per-pool priorities follow as their OWN requests, because the write
-				// route takes one action at a time. Awaiting each one means the first
-				// failure stops the rest and surfaces, instead of being swallowed.
-				// An empty box means "inherit the account's own priority", i.e. clear.
-				for (const [groupId, raw] of Object.entries(payload.groupPriorities ?? {})) {
-					const text = String(raw ?? '').trim();
-					const sent = text === ''
-						? await action.run(payload.id, 'priority-clear', { group: groupId })
-						: await action.run(payload.id, 'priority-set', { group: groupId, priority: Number(text) });
-					if (!sent) return;
-				}
-				setEditing(null);
+				const session = editing;
+				if (!session || editorRef.current?.progress !== session.progress || session.progress.pending || action.pending) return false;
+				const progress = session.progress;
+				const current = () => editorRef.current?.progress === progress;
+				const publish = () => { if (current()) setEditing((previous) => ({ ...previous })); };
+				const extra = { account: payload.account, ...(payload.credential === undefined ? {} : { credential: payload.credential }) };
+				const signature = JSON.stringify(extra);
+				progress.pending = true;
+				publish();
+				try {
+					// Only a confirmed main save arms this checkpoint; ambiguous failures
+					// are not silently treated as committed or automatically replayed.
+					if (progress.signature !== signature) {
+						const verb = progress.savedId || session.mode === 'edit' ? 'update' : 'create';
+						const ok = await action.run(progress.savedId || payload.id, verb, extra, (body) => {
+							progress.savedId = body.account?.id || String(payload.id).trim();
+							progress.signature = signature;
+							progress.priorities.clear();
+						});
+						if (!ok || !current()) return false;
+						publish();
+					}
+					// Each priority is independently acknowledged. Same-draft retries
+					// continue only unfinished steps; changed main fields update the saved ID.
+					for (const [groupId, raw] of Object.entries(payload.groupPriorities ?? {})) {
+						if (!current()) return false;
+						const text = String(raw ?? '').trim();
+						if (progress.priorities.get(groupId) === text) continue;
+						const sent = text === ''
+							? await action.run(progress.savedId, 'priority-clear', { group: groupId })
+							: await action.run(progress.savedId, 'priority-set', { group: groupId, priority: Number(text) });
+						if (!sent || !current()) return false;
+						progress.priorities.set(groupId, text);
+					}
+					if (current()) setEditor(null);
+					return true;
+				} finally { progress.pending = false; publish(); }
 			}
 
 			const form = editing === null ? null : h(AccountForm, {
-				// Keyed by the account id so switching straight from one account's editor
-				// to another's REMOUNTS the form. With a fixed key React reuses the same
-				// instance and preserves `useState` — the form would still show the
-				// previous account's values and then save them into the new account.
-				key: `form-${editing.id ?? ''}`,
+				// Each opening has its own key/checkpoint, including reopening the same
+				// account while an old completion is still pending. Drafts stay mounted
+				// across read retries, but never leak between editing sessions.
+				key: `form-${editing.generation}`,
 				t,
 				mode: editing.mode,
 				initial: editing.initial,
 				configured: editing.configured === true,
-				pending: action.pending,
+				pending: action.pending || editing.progress.pending,
+				savedId: editing.progress.savedId,
 				error: action.error,
 				onSave: saveForm,
-				onCancel: () => setEditing(null),
+				onCancel: () => setEditor(null),
 				// Read inline: the `allGroups` const is declared further down, and a
 				// `const` does not hoist.
 				allGroups: accounts.body?.groups ?? [],
 				managementReady,
 				quotaReady,
-				detectionReady, openaiProtocolReady,
+				detectionReady, openaiProtocolReady, codexWebSocketReady,
 			});
 
 			const supplierForm = !supplierOpen || !supplierReady ? null : h(SupplierForm, {
@@ -2528,6 +3183,8 @@ window.__ModuleLoader__.load({
 			}
 
 			async function runBatch(verb, extra = {}) {
+				if (attribution.batchBusy()) return;
+				attribution.dismissBatch();
 				// Disarm FIRST: a stale armed state must never delete on a later click.
 				setConfirmingBatch(false);
 				const ok = await action.run('', 'batch', { ids: [...selected], verb, ...extra }, (body) => setSelected(new Set((body.failed ?? []).map((entry) => entry.id))));
@@ -2535,15 +3192,17 @@ window.__ModuleLoader__.load({
 			}
 
 			const batchGroups = accounts.body?.groups ?? [];
-			const batchBar = selected.size === 0 ? null : h(BatchBar, {
+			const selectionBar = selected.size === 0 ? null : h(BatchBar, {
 				t, count: selected.size, groups: batchGroups, group: batchGroup, confirming: confirmingBatch,
-				pending: action.pending, managementReady,
+				pending: action.pending || batchAttributionBusy, managementReady, attribution,
 				onGroup: setBatchGroup,
 				onRun: (verb, extra) => { void runBatch(verb, extra); },
-				onDelete: () => { if (!confirmingBatch) setConfirmingBatch(true); else void runBatch('delete'); },
-				onToggleEdit: () => setBatchEditing((value) => !value),
+				onDelete: () => { if (attribution.batchBusy()) return; attribution.dismissBatch(); if (!confirmingBatch) setConfirmingBatch(true); else void runBatch('delete'); },
+				onToggleEdit: () => { if (attribution.batchBusy()) return; attribution.dismissBatch(); setBatchEditing((value) => !value); },
 				onClear: () => setSelected(new Set()),
 			});
+
+			const batchBar = [selectionBar, h(AttributionBatchPanel, { key: 'attribution-batch', attribution, t, pending: action.pending })];
 
 			// --- groups ----------------------------------------------------------
 			const allGroups = accounts.body?.groups ?? [];
@@ -2555,6 +3214,7 @@ window.__ModuleLoader__.load({
 			}
 
 			function startGroupCreate() {
+				setConfirmingGroupId(null);
 				setEditingGroup({
 					mode: 'create',
 					id: '',
@@ -2563,6 +3223,7 @@ window.__ModuleLoader__.load({
 			}
 
 			function startGroupEdit(group) {
+				setConfirmingGroupId(null);
 				setEditingGroup({
 					mode: 'edit',
 					id: group.id,
@@ -2597,11 +3258,17 @@ window.__ModuleLoader__.load({
 				managementReady,
 			});
 
+			const confirmingGroup = allGroups.find((group) => group.id === confirmingGroupId);
+			const groupConfirmation = confirmingGroup ? h(GroupDeleteConfirmation, {
+				t, group: confirmingGroup, pending: action.pending,
+				onCancel: () => setConfirmingGroupId(null),
+				onConfirm: () => action.run(confirmingGroup.id, 'group-delete', {}, () => setConfirmingGroupId((id) => id === confirmingGroup.id ? null : id)),
+			}) : null;
 			const groupsPanel = h(GroupsPanel, {
-				t, groups: allGroups, groupCounts, managementReady, pending: action.pending, form: groupForm,
+				t, groups: allGroups, groupCounts, managementReady, pending: action.pending, form: groupForm, confirmation: groupConfirmation,
 				onCreate: startGroupCreate,
 				onEdit: startGroupEdit,
-				onDelete: (group) => { void action.run(group.id, 'group-delete'); },
+				onDelete: (group) => { setEditingGroup(null); setConfirmingGroupId(group.id); },
 			});
 
 			const list = accounts.body?.accounts ?? [];
@@ -2638,10 +3305,10 @@ window.__ModuleLoader__.load({
 			// Each group is a separate provider route; ranking lives on its accounts.
 
 			React.useEffect(() => {
-				if (!autoRefresh || action.pending || resetConfirmation || supplierOpen || editing || editingGroup || importing !== null || oauthOpen || testing || batchEditing) return;
+				if (!autoRefresh || action.pending || resetConfirmation || supplierOpen || editing || editingGroup || confirmingGroupId || importing !== null || oauthOpen || testing || batchEditing) return;
 				const timer = setInterval(() => setNonce((value) => value + 1), 15000);
 				return () => clearInterval(timer);
-			}, [autoRefresh, action.pending, resetConfirmation, supplierOpen, editing, editingGroup, importing, oauthOpen, testing, batchEditing]);
+			}, [autoRefresh, action.pending, resetConfirmation, supplierOpen, editing, editingGroup, confirmingGroupId, importing, oauthOpen, testing, batchEditing]);
 			React.useEffect(() => {
 				if (!usageAccountId) return;
 				const panel = document.querySelector('.dap-account-usage');
@@ -2663,9 +3330,9 @@ window.__ModuleLoader__.load({
 				},
 				onToggleOauth: () => { setActiveTab('accounts'); setOauthOpen((current) => !current); },
 				onToggleImport: () => { setActiveTab('accounts'); setImporting((current) => (current === null ? '' : null)); },
-				onToggleSupplier: () => { setActiveTab('accounts'); if (supplierReady) { setEditing(null); setSupplierOpen((current) => !current); } else startCreate(); },
+				onToggleSupplier: () => { setActiveTab('accounts'); if (supplierReady) { setEditor(null); setSupplierOpen((current) => !current); } else startCreate(); },
 				onAdvancedAdd: () => { setSupplierOpen(false); startCreate(); },
-				onRefresh: () => setNonce((value) => value + 1),
+				onRefresh: () => { setNonce((value) => value + 1); setOauthNonce((value) => value + 1); },
 			});
 
 			if (accounts.status === 'loading' && accounts.body === null) {
@@ -2686,7 +3353,10 @@ window.__ModuleLoader__.load({
 				groupCount: allGroups.length, counts,
 			});
 
-			const oauthPanel = oauthOpen !== true ? null : h(OAuthPanel, {
+			const oauthPanel = oauthOpen !== true ? null : oauth.body === null ? h(OAuthDirectoryState, {
+				t, status: oauth.status, error: oauth.error,
+				onRetry: () => setOauthNonce((value) => value + 1), onClose: () => setOauthOpen(false),
+			}) : h(OAuthPanel, {
 				// Remounted per open, so a half-finished login from a previous visit is
 				// not resurrected into a form that no longer matches the server's flows.
 				key: 'oauth-panel',
@@ -2719,7 +3389,7 @@ window.__ModuleLoader__.load({
 				onCancel: () => setTesting(null),
 			});
 			const batchEditPanel = !batchEditing || selected.size === 0 ? null : h(BatchEditPanel, {
-				t, values: batchValues, pending: action.pending,
+				t, values: batchValues, pending: action.pending || batchAttributionBusy,
 				onValue: (key, value) => setBatchValues((previous) => ({ ...previous, [key]: value })),
 				onSave: () => {
 					const account = {};
@@ -2752,17 +3422,27 @@ window.__ModuleLoader__.load({
 				onFilter: (key, value) => setUsageFilters((previous) => ({ ...previous, [key]: value })),
 			});
 
-			const tabs = [['accounts', 'tabAccounts', list.length, 'accounts'], ['groups', 'tabGroups', allGroups.length, 'groups'], ['usage', 'tabUsage', recentRows.length, 'activity']];
-			const tabBar = h(PoolTabs, { t, tabs, activeTab, onSelect: setActiveTab });
+			const tabs = [['accounts', 'tabAccounts', list.length, 'accounts'], ['groups', 'tabGroups', allGroups.length, 'groups'], ['usage', 'tabUsage', recentRows.length, 'activity'], ['auto-review', 'tabAutoReview', null, 'activity'], ['settings', 'tabSettings', null, 'settings']];
+			const tabBar = h(PoolTabs, { t, tabs, activeTab, onSelect: (tab) => { if (tab === 'settings') setSettingsVisited(true); setActiveTab(tab); if (tab !== 'groups') setConfirmingGroupId(null); } });
 
-			return h('div', { className: 'dap-root' }, [
+			return h('div', { className: 'dap-root', 'aria-busy': accounts.status === 'loading' }, [
 				head, cards,
 				h('div', { className: 'dap-workspace', key: 'workspace' }, [
 					tabBar,
+					accounts.error ? h('div', { key: 'refresh-error', className: 'dap-result', role: 'alert' }, [
+						h('strong', { key: 'hint' }, t('refreshFailed')),
+						h('div', { key: 'detail', className: 'dap-error' }, accounts.error),
+						h('button', { key: 'retry', type: 'button', className: 'dap-btn', onClick: () => setNonce((value) => value + 1) }, t('retryLoad')),
+					]) : null,
+					oauthOpen && oauth.body !== null && oauth.error ? h('div', { key: 'oauth-refresh-error', className: 'dap-result', role: 'alert' }, [
+						h('strong', { key: 'hint' }, t('refreshFailed')),
+						h('div', { key: 'detail', className: 'dap-error' }, oauth.error),
+						h('button', { key: 'retry', type: 'button', className: 'dap-btn', onClick: () => setOauthNonce((value) => value + 1) }, t('retryLoad')),
+					]) : null,
 					action.error === null ? null : h('div', { className: 'dap-error dap-result', role: 'alert', key: 'action-error' }, t('actFailed', { message: action.error })),
 					exportError ? h('div', { className: 'dap-error dap-result', role: 'alert', key: 'export-error' }, exportError) : null,
 					resultPanel,
-					...[['accounts', accountPanel], ['groups', groupsPanel], ['usage', usagePanel]].map(([id, panel]) => h('div', {
+					...[['accounts', accountPanel], ['groups', groupsPanel], ['usage', usagePanel], ['auto-review', activeTab === 'auto-review' ? h(AutoReviewPanel, { t }) : null], ['settings', settingsVisited ? h(PoolSettingsPanel, { t, active: activeTab === 'settings' }) : null]].map(([id, panel]) => h('div', {
 						key: id, id: `dap-panel-${id}`, role: 'tabpanel', 'aria-labelledby': `dap-tab-${id}`, hidden: activeTab !== id,
 					}, panel)),
 				]),
@@ -2855,16 +3535,292 @@ window.__ModuleLoader__.load({
 				]),
 				accounts.error ? h('p', { key: 'read-error', className: 'dap-error', role: 'alert' }, accounts.error) : null,
 				!editing && action.error ? h('p', { key: 'error', className: 'dap-error', role: 'alert' }, action.error) : null,
-				confirming && group ? h('div', { key: 'confirmation', className: 'dap-form', role: 'group' }, [
-					h('p', { key: 'hint' }, t('providerDeleteHint', { name: group.label || group.id })),
-					h('div', { className: 'dap-actions', key: 'buttons' }, [h('button', { key: 'delete', type: 'button', className: 'dap-btn dap-btn-danger', disabled, onClick: () => action.run(groupId, 'group-delete', {}, () => setConfirming(false)) }, t('confirmDelete')), h('button', { key: 'cancel', type: 'button', className: 'dap-btn', disabled, onClick: () => setConfirming(false) }, t('cancel'))]),
-				]) : null,
+				confirming && group ? h(GroupDeleteConfirmation, {
+					key: 'confirmation', t, group, pending: disabled,
+					onConfirm: () => action.run(groupId, 'group-delete', {}, () => setConfirming(false)),
+					onCancel: () => setConfirming(false),
+				}) : null,
 				!editing || !group ? null : h(GroupForm, {
 					key: `provider-form-${group.id}`, t, mode: 'edit', managementReady: true,
 					initial: { ...group, models: (group.models ?? []).join(', ') }, pending: action.pending, error: action.error,
 					onCancel: () => setEditing(false),
 					onSave: ({ id, group: edits }) => action.run(id, 'group-update', { group: edits }, () => setEditing(false)),
 				}),
+			]);
+		}
+
+		/** Account-pool-owned settings, separate from management and review tabs. */
+		function PoolSettingsPanel({ t, active }) {
+			return h('section', { className: 'dap-settings', 'aria-label': t('poolSettingsTitle') }, [
+				h('div', { key: 'head', className: 'dap-panel-head' }, h('div', { className: 'dap-heading-copy' }, [
+					h('h2', { key: 'title', className: 'dap-panel-title' }, t('poolSettingsTitle')),
+					h('p', { key: 'intro', className: 'dap-intro' }, t('poolSettingsIntro')),
+				])),
+				h(LocalApiSettings, { key: 'local-api', t, active }),
+				h(CodexCompactionSettings, { key: 'v2-compaction', t }),
+			]);
+		}
+		/** Only public status fields are retained; an API key never enters a shared action result. */
+		function localApiSnapshot(value) {
+			if (!value || typeof value !== 'object' || Array.isArray(value)
+				|| typeof value.enabled !== 'boolean' || !Number.isInteger(value.port) || value.port < 1024 || value.port > 65535
+				|| typeof value.running !== 'boolean' || typeof value.baseUrl !== 'string'
+				|| typeof value.keyConfigured !== 'boolean' || (value.error !== null && typeof value.error !== 'string')) return null;
+			const { enabled, port, running, baseUrl, keyConfigured, error } = value;
+			return { enabled, port, running, baseUrl, keyConfigured, error };
+		}
+
+		function LocalApiSettings({ t, active }) {
+			const [remote, setRemote] = React.useState({ status: 'loading', settings: null, error: null });
+			const [draft, setDraft] = React.useState({ enabled: false, port: '19389' });
+			const [pending, setPending] = React.useState(null);
+			const [confirmation, setConfirmation] = React.useState(false);
+			const [apiKey, setApiKey] = React.useState('');
+			const [notice, setNotice] = React.useState('');
+			const [error, setError] = React.useState('');
+			const [copying, setCopying] = React.useState(false);
+			const control = React.useRef({ alive: true, active, ready: false, reading: false, writing: false, dirty: false,
+				readId: 0, epoch: 0, copyId: 0, copying: false, key: '', confirmed: false, settings: null, draft });
+			const current = control.current;
+			current.active = active;
+			function clearKey() {
+				current.key = ''; current.copyId += 1; current.copying = false;
+				if (current.alive) { setApiKey(''); setCopying(false); setNotice(''); }
+			}
+			function disarm() { current.confirmed = false; if (current.alive) setConfirmation(false); }
+			function adoptDraft(settings) {
+				current.draft = { enabled: settings.enabled, port: String(settings.port) };
+				setDraft(current.draft);
+			}
+			React.useEffect(() => {
+				current.alive = true;
+				return () => { current.alive = false; current.ready = false; current.key = ''; current.writeController?.abort(); };
+			}, []);
+
+			async function refresh() {
+				if (!current.alive || !current.active || current.reading || current.writing) return;
+				current.reading = true; current.ready = false; disarm();
+				const id = ++current.readId;
+				const controller = new AbortController();
+				current.readController = controller;
+				const timeout = setTimeout(() => controller.abort(), 30000);
+				setRemote(previous => ({ ...previous, status: 'loading', error: null }));
+				try {
+					const body = await poolJson(ACCOUNTS_ROUTE, { method: 'GET', cache: 'no-store', headers: { accept: 'application/json' }, signal: controller.signal }, t);
+					if (!current.alive || id !== current.readId) return;
+					if (controller.signal.aborted) throw new Error(t('readTimeout'));
+					const settings = body.localApiVersion === 1 ? localApiSnapshot(body.localApi) : null;
+					if (!settings) { setRemote(previous => ({ ...previous, status: 'unsupported', error: null })); return; }
+					current.settings = settings; current.ready = true;
+					setRemote({ status: 'ready', settings, error: null });
+					if (!current.dirty) adoptDraft(settings);
+				} catch (failure) {
+					if (!current.alive || id !== current.readId) return;
+					setRemote(previous => ({ ...previous, status: 'error', error: failure.name === 'AbortError' ? t('readTimeout') : failure.message || t('failed') }));
+				} finally {
+					clearTimeout(timeout);
+					if (id === current.readId) { current.reading = false; current.readController = null; }
+				}
+			}
+			React.useEffect(() => {
+				if (active) void refresh();
+				const timer = active ? setInterval(() => { void refresh(); }, 15000) : null;
+				return () => {
+					// Settings remain mounted to preserve drafts. Leaving must still revoke
+					// secrets, clipboard callbacks and late responses from this visit.
+					current.epoch += 1; current.ready = false; current.readId += 1;
+					current.readController?.abort(); current.readController = null; current.reading = false;
+					if (timer !== null) clearInterval(timer);
+					clearKey(); disarm();
+				};
+			}, [active, t]);
+
+			const canWrite = () => current.alive && current.active && current.ready && !current.reading && !current.writing;
+			const validPort = value => /^\d+$/.test(value) && Number.isInteger(Number(value)) && Number(value) >= 1024 && Number(value) <= 65535;
+			function change(name, value) {
+				if (!canWrite() || (name === 'enabled' && (typeof value !== 'boolean' || (value && !current.settings.keyConfigured)))) return;
+				current.dirty = true; current.draft = { ...current.draft, [name]: value };
+				setDraft(current.draft); setNotice(''); setError('');
+			}
+			async function write(kind) {
+				if (!canWrite()) return false;
+				const rotate = kind === 'rotate';
+				if (rotate && current.settings.keyConfigured && !current.confirmed) return false;
+				if (!rotate && (!validPort(current.draft.port) || (current.draft.enabled && !current.settings.keyConfigured))) return false;
+				current.writing = true;
+				const epoch = current.epoch;
+				const controller = new AbortController();
+				current.writeController = controller;
+				const timeout = setTimeout(() => controller.abort(), 30000);
+				let reconcile = false;
+				setPending(kind); setNotice(''); setError(''); disarm();
+				if (rotate) clearKey();
+				try {
+					const payload = rotate ? { action: 'local-api-rotate-key' }
+						: { action: 'local-api-update', enabled: current.draft.enabled, port: Number(current.draft.port) };
+					const body = await poolJson(ACTION_ROUTE, { method: 'POST', cache: 'no-store', headers: { 'content-type': 'application/json', accept: 'application/json' }, signal: controller.signal, body: JSON.stringify(payload) }, t);
+					if (controller.signal.aborted) throw new Error(t('readTimeout'));
+					const settings = localApiSnapshot(body.localApi);
+					if (body.ok !== true) throw new Error(typeof body.error?.message === 'string' ? body.error.message : t('localApiInvalidReply'));
+					if (!settings || (rotate && (!settings.keyConfigured || typeof body.apiKey !== 'string' || !body.apiKey))
+						|| (body.apiKey !== undefined && (typeof body.apiKey !== 'string' || !body.apiKey || !settings.keyConfigured))) throw new Error(t('localApiInvalidReply'));
+					if (!current.alive) return false;
+					current.settings = settings; current.ready = current.active;
+					setRemote({ status: 'ready', settings, error: null });
+					// Rotation changes no draft settings, even when the operator edited a port.
+					if (!rotate) { current.dirty = false; adoptDraft(settings); }
+					if (current.active && epoch === current.epoch) {
+						if (body.apiKey) { current.key = body.apiKey; setApiKey(body.apiKey); }
+						setNotice(rotate ? 'localApiKeyCreated' : 'localApiSaved');
+					}
+					return true;
+				} catch (failure) {
+					if (current.alive) {
+						current.ready = false; reconcile = true;
+						setError(failure.name === 'AbortError' ? t('readTimeout') : failure.message || t('failed'));
+					}
+					return false;
+				} finally {
+					clearTimeout(timeout); current.writeController = null; current.writing = false;
+					if (current.alive) { setPending(null); if (reconcile) void refresh(); }
+				}
+			}
+			function requestKey() {
+				if (!canWrite()) return;
+				if (current.settings.keyConfigured) { current.confirmed = true; setConfirmation(true); setNotice(''); }
+				else return write('rotate');
+			}
+			async function copy(kind) {
+				if (!current.alive || !current.active || current.copying) return;
+				const value = kind === 'key' ? current.key : current.ready ? current.settings?.baseUrl : '';
+				if (!value) return;
+				const id = ++current.copyId;
+				current.copying = true; setCopying(true); setNotice(''); setError('');
+				try {
+					if (typeof navigator === 'undefined' || typeof navigator.clipboard?.writeText !== 'function') throw new Error('clipboard-unavailable');
+					await navigator.clipboard.writeText(value);
+					if (current.alive && current.active && id === current.copyId) setNotice(kind === 'key' ? 'localApiKeyCopied' : 'localApiBaseUrlCopied');
+				} catch {
+					// Clipboard errors must never interpolate the value being copied.
+					if (current.alive && current.active && id === current.copyId) setError(t('localApiCopyFailed'));
+				} finally {
+					if (id === current.copyId) { current.copying = false; if (current.alive) setCopying(false); }
+				}
+			}
+			const settings = remote.settings;
+			const disabled = !active || !current.ready || !!pending || remote.status !== 'ready';
+			const portValid = validPort(draft.port);
+			const button = (key, label, onClick, off = disabled, extra = '') => h('button', { key, type: 'button', className: `dap-btn ${extra}`, disabled: off, onClick }, t(label));
+			return h('section', { className: 'dap-panel dap-local-api', 'aria-labelledby': 'dap-local-api-title', 'aria-busy': !!pending || remote.status === 'loading' }, [
+				h('div', { key: 'head', className: 'dap-panel-head' }, h('h3', { id: 'dap-local-api-title', className: 'dap-panel-title' }, t('localApiTitle'))),
+				h('form', { key: 'form', className: 'dap-form', onSubmit: event => { event.preventDefault(); return write('save'); } }, [
+					h('p', { key: 'intro', id: 'dap-local-api-intro', className: 'dap-intro' }, t('localApiIntro')),
+					h('label', { key: 'enabled', className: 'dap-check-label' }, [
+						h('input', { key: 'input', type: 'checkbox', role: 'switch', 'aria-checked': draft.enabled, 'aria-label': t('localApiEnable'), 'aria-describedby': 'dap-local-api-intro', checked: draft.enabled, disabled: disabled || (!settings?.keyConfigured && !draft.enabled), onChange: event => change('enabled', event.target.checked) }), t('localApiEnable'),
+					]),
+					h(Field, { key: 'port', type: 'number', min: 1024, max: 65535, step: 1, label: t('localApiPort'), value: draft.port, disabled, onChange: value => change('port', value) }),
+					h('p', { key: 'port-hint', className: 'dap-intro' }, t('localApiPortHint')),
+					!portValid ? h('p', { key: 'invalid-port', role: 'alert', className: 'dap-error' }, t('localApiInvalidPort')) : null,
+					settings && !settings.keyConfigured ? h('p', { key: 'key-required', className: 'dap-intro' }, t('localApiKeyRequired')) : null,
+					h('dl', { key: 'status', className: 'dap-local-api-status', 'aria-live': 'polite' }, [
+						h('dt', { key: 'running-label' }, t('localApiRuntime')), h('dd', { key: 'running' }, settings ? t(settings.running ? 'localApiRunning' : 'localApiStopped') : '—'),
+						h('dt', { key: 'url-label' }, t('localApiBaseUrl')), h('dd', { key: 'url' }, settings?.baseUrl || '—'),
+						h('dt', { key: 'key-label' }, t('localApiKeyConfigured')), h('dd', { key: 'key' }, settings ? t(settings.keyConfigured ? 'credConfigured' : 'credMissing') : '—'),
+						h('dt', { key: 'error-label' }, t('localApiError')), h('dd', { key: 'error', className: settings?.error ? 'dap-error' : '' }, settings ? settings.error || t('localApiNoError') : '—'),
+					]),
+					remote.status === 'loading' ? h('p', { key: 'loading', role: 'status' }, t('localApiLoading')) : null,
+					remote.status === 'unsupported' ? h('p', { key: 'unsupported', role: 'alert', className: 'dap-error' }, t('localApiRestart')) : null,
+					remote.status === 'error' ? h('div', { key: 'read-error', role: 'alert', className: 'dap-error' }, [t('localApiReadFailed'), h('div', { key: 'detail' }, remote.error)]) : null,
+					current.dirty ? h('p', { key: 'draft', className: 'dap-intro' }, t('localApiDraft')) : null,
+					error ? h('p', { key: 'action-error', role: 'alert', className: 'dap-error' }, t('actFailed', { message: error })) : null,
+					notice ? h('p', { key: 'notice', role: 'status' }, t(notice)) : null,
+					confirmation && active ? h('div', { key: 'confirmation', className: 'dap-local-api-confirm', role: 'group', 'aria-label': t('localApiConfirmRotate') }, [
+						h('p', { key: 'warning' }, t('localApiRotateWarning')),
+						h('div', { key: 'buttons', className: 'dap-actions' }, [button('confirm', 'localApiConfirmRotate', () => write('rotate'), disabled, 'dap-btn-danger'), button('cancel', 'cancel', disarm, !!pending)]),
+					]) : null,
+					active && apiKey ? h('div', { key: 'secret', className: 'dap-local-api-secret' }, [
+						h('p', { key: 'warning', className: 'dap-intro' }, t('localApiKeyOnce')),
+						h('label', { key: 'key', className: 'dap-field' }, [h('span', { key: 'label', className: 'dap-field-label' }, t('localApiKeyLabel')), h('input', { key: 'value', className: 'dap-input', type: 'text', readOnly: true, value: apiKey, 'aria-label': t('localApiKeyLabel'), autoComplete: 'off', spellCheck: false })]),
+						h('div', { key: 'actions', className: 'dap-actions' }, [button('copy', 'localApiCopyKey', () => copy('key'), copying || !!pending), button('close', 'localApiCloseKey', clearKey, false)]),
+					]) : null,
+					h('div', { key: 'actions', className: 'dap-actions' }, [
+						h('button', { key: 'save', type: 'submit', className: 'dap-btn dap-btn-primary', disabled: disabled || !portValid || (draft.enabled && !settings?.keyConfigured) }, t(pending === 'save' ? 'saving' : 'save')),
+						button('rotate', pending === 'rotate' ? 'actWorking' : settings?.keyConfigured ? 'localApiRotate' : 'localApiGenerate', requestKey),
+						button('copy-url', 'localApiCopyBaseUrl', () => copy('url'), disabled || copying || !settings?.baseUrl),
+						button('refresh', 'refresh', refresh, !active || !!pending || remote.status === 'loading'),
+						current.dirty ? button('discard', 'localApiDiscard', () => { if (!canWrite()) return; current.dirty = false; adoptDraft(current.settings); setNotice(''); setError(''); }) : null,
+					]),
+				]),
+			]);
+		}
+
+		function CodexCompactionSettings({ t }) {
+			useStyles();
+			const [nonce, setNonce] = React.useState(0);
+			const state = useJson(ACCOUNTS_ROUTE, nonce, t);
+			const action = useAction(() => setNonce((value) => value + 1), t);
+			const [draft, setDraft] = React.useState(false);
+			const [saved, setSaved] = React.useState(false);
+			const dirty = React.useRef(false);
+			const saving = React.useRef(false);
+			const latest = React.useRef(null);
+			React.useEffect(() => () => { latest.current = null; }, []);
+			const settings = state.body?.codexCompatibility;
+			const compatible = state.body?.codexCompatibilityVersion === 1
+				&& typeof settings?.encryptedCompactionV2 === 'boolean' && typeof settings?.available === 'boolean';
+			const ready = state.status === 'ready' && compatible && settings.available === true;
+			React.useEffect(() => {
+				if (state.status === 'ready' && compatible && !dirty.current) setDraft(settings.encryptedCompactionV2);
+			}, [state.body, state.status, compatible]);
+			// Old rendered callbacks must not write after a refresh removed capability.
+			latest.current = { ready, draft, pending: action.pending };
+			function change(event) {
+				const current = latest.current;
+				if (!current?.ready || current.pending || saving.current || typeof event.target.checked !== 'boolean') return;
+				dirty.current = true;
+				setDraft(event.target.checked);
+				setSaved(false);
+			}
+			async function save(event) {
+				event.preventDefault();
+				const current = latest.current;
+				if (!current?.ready || current.pending || saving.current) return false;
+				saving.current = true;
+				setSaved(false);
+				try {
+					// No account id or transport edits: this is one explicit global setting.
+					return await action.run(undefined, 'codex-compatibility-update', { encryptedCompactionV2: current.draft }, () => {
+						dirty.current = false;
+						setSaved(true);
+					});
+				} finally { saving.current = false; }
+			}
+			const disabled = !ready || action.pending;
+			const descriptionIds = ['scope', 'timing', 'history', 'fallback'];
+			return h('div', { className: 'dap-settings-card', 'aria-busy': action.pending || state.status === 'loading' }, [
+				h('section', { key: 'panel', className: 'dap-panel', 'aria-labelledby': 'dap-codex-compaction-title' }, [
+					h('div', { key: 'head', className: 'dap-panel-head' }, h('h3', { id: 'dap-codex-compaction-title', className: 'dap-panel-title' }, t('codexCompactionTitle'))),
+					h('form', { key: 'form', className: 'dap-form', onSubmit: save, 'aria-busy': action.pending }, [
+						h('label', { key: 'enable', htmlFor: 'dap-codex-encrypted-compaction-v2', className: 'dap-check-label' }, [
+							h('input', { key: 'input', id: 'dap-codex-encrypted-compaction-v2', type: 'checkbox', checked: draft, disabled,
+								'aria-label': t('codexCompactionEnable'), 'aria-describedby': descriptionIds.map((id) => `dap-codex-compaction-${id}`).join(' '), onChange: change }),
+							t('codexCompactionEnable'),
+						]),
+						...descriptionIds.map((id) => h('p', { key: id, id: `dap-codex-compaction-${id}`, className: 'dap-intro' }, t(`codexCompaction${id[0].toUpperCase()}${id.slice(1)}`))),
+						state.status === 'loading' ? h('p', { key: 'loading', role: 'status' }, t('codexCompatibilityLoading')) : null,
+						state.status === 'error' ? h('div', { key: 'read-error', className: 'dap-error', role: 'alert' }, [t('codexCompatibilityReadFailed'), h('div', { key: 'detail' }, state.error)]) : null,
+						state.status === 'ready' && !ready ? h('p', { key: 'unavailable', className: 'dap-error', role: 'alert' }, t(compatible ? 'codexCompatibilityUnavailable' : 'codexCompatibilityRestart')) : null,
+						action.error ? h('p', { key: 'save-error', className: 'dap-error', role: 'alert' }, t('actFailed', { message: action.error })) : null,
+						saved ? h('p', { key: 'saved', role: 'status' }, t('codexCompatibilitySaved')) : null,
+						h('div', { key: 'actions', className: 'dap-form-actions' }, [
+							h('button', { key: 'save', type: 'submit', className: 'dap-btn dap-btn-primary', disabled }, action.pending ? t('saving') : t('save')),
+							h('button', { key: 'refresh', type: 'button', className: 'dap-btn', disabled: action.pending, onClick: () => {
+								if (!latest.current || saving.current) return;
+								setNonce((value) => value + 1);
+							} }, t('refresh')),
+						]),
+					]),
+				]),
 			]);
 		}
 
@@ -2886,7 +3842,8 @@ window.__ModuleLoader__.load({
 				label: () => t('title'),
 			}, (props) => h(PoolSection, { ctx, t, close: props.close })));
 
-			// 2. One card under every provider row this plugin owns — the pool and each
+			// 2. Feature settings live in the account-pool Settings tab, not a second
+			// top-level navigation entry. One card under every provider row this plugin owns — the pool and each
 			//    group — keyed by the Loader entry id, the same value the Host half
 			//    declares as `settingsNs`. The row's own route travels in the owner's
 			//    `provider` prop, so a group row must be handed it or every row would
@@ -2924,6 +3881,9 @@ window.__ModuleLoader__.load({
 		exports.localDateInput = localDateInput;
 		exports.formatRemaining = formatRemaining;
 		exports.compact = compact;
+		exports.formatUsageDuration = formatUsageDuration;
+		exports.formatUsageTps = formatUsageTps;
+		exports.usageEffortDisplay = usageEffortDisplay;
 		exports.WINDOWS = WINDOWS;
 
 		module.exports = exports;

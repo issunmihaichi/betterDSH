@@ -1,6 +1,6 @@
 {
   "name": "dsh-github",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "private": true,
   "description": "GitHub support: a GitHub management page in Settings, the /github human command for GitHub MCP tools, and remote repository cloning into a workspace",
   "license": "MIT",
@@ -8,7 +8,7 @@
   "main": "lib/host.js",
   "icon": "./icon.svg",
   "scripts": {
-    "test": "node tools/pure-test.mjs && node tools/host-test.mjs && node tools/client-test.mjs"
+    "test": "node tools/pure-test.mjs && node tools/host-test.mjs && node tools/lifecycle-test.mjs && node tools/client-test.mjs"
   },
   "exports": {
     ".": {

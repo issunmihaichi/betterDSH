@@ -1,13 +1,14 @@
 {
   "name": "dsh-usage-report",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "private": true,
-  "description": "设置里的「用量」页：按天统计本机会话的输入/输出 token（纯本地，无网络请求、无计费数据）",
+  "description": "本机用量统计：Token、聊天排行、工具/技能活动和模型消息趋势（纯本地，无计费数据）",
   "license": "MIT",
   "type": "module",
   "main": "lib/host.js",
   "scripts": {
-    "test": "node tools/report-test.mjs && node tools/host-test.mjs && node tools/client-test.mjs"
+    "test": "node tools/report-test.mjs --synthetic-only && node tools/host-test.mjs && node tools/client-test.mjs",
+    "test:local": "node tools/report-test.mjs"
   },
   "exports": {
     ".": {

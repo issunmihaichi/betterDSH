@@ -70,4 +70,122 @@ await check('actual DSH image history reaches Codex as input_image through a pre
   assert.equal(result.finish.kind, 'stop'); assert.equal(result.blocks().find(block => block.type === 'text').text, 'image received');
   assert.equal(reads, 1); assert.equal(requests, 1);
 });
-console.log(`${checks}/${checks} installed-runtime checks passed; ${fetches} mock HTTP calls, no real credentials`);
+await check('actual DSH preserves Codex purpose through prepared and direct dispatch', async () => {
+  const native = runtime(); const captures = [];
+  const adapter = createPoolAdapter({ initialAccounts: [{ id: 'attribution', platform: 'openai', authMode: 'oauth', status: 'active', schedulable: true, models: ['gpt-5.3-codex'] }],
+    upstream: createHttpUpstream({ resolveCredential: () => ({ access_token: 'offline', chatgpt_account_id: 'offline' }),
+      resolveCodexSession: id => ({ known: true, origin: id === 'child' ? 'subagent' : undefined, parentSessionId: id === 'child' ? 'parent' : undefined, rootSessionId: 'parent', turnId: `${id}:turn:1` }),
+      fetchImpl: async (url, init) => { const body = JSON.parse(init.body); const meta = JSON.parse(body.client_metadata['x-codex-turn-metadata']); captures.push(meta);
+        assert.equal(init.headers['x-codex-turn-metadata'], body.client_metadata['x-codex-turn-metadata']);
+        return new Response('data: '+JSON.stringify({ type: 'response.completed', response: { status: 'completed', output: [], usage: {} } })+'\n\n'); },
+    }) });
+  native.registerAdapter(adapter.routesFor(), adapter);
+  for (const purpose of [undefined, 'session-title', 'compaction']) {
+    const call = await native.prepareCall({ provider: 'pool', model: 'gpt-5.3-codex' });
+    for await (const chunk of call.stream({ ...call.config, sessionId: 'child', purpose, messages: [createUserMessage({ content: [{ type: 'text', text: 'fixture' }], source: { kind: 'user' } })] })) {}
+  }
+  assert.deepEqual(captures.map(m => [m.request_kind, m.thread_source]), [['turn','subagent'],['turn','thread_title'],['compaction','subagent']]);
+  assert.equal(captures[0].subagent_kind, 'thread_spawn'); assert.equal(captures[1].subagent_kind, undefined);
+});
+await check('actual DSH preserves review sidecar without changing ordinary session scheduling', async () => {
+  const native = runtime(); const captures = [];
+  const adapter = createPoolAdapter({ initialAccounts: [{ id: 'review-runtime', platform: 'openai', authMode: 'oauth', status: 'active', schedulable: true, models: ['gpt-5.3-codex'] }],
+    upstream: createHttpUpstream({ resolveCredential: () => ({ access_token: 'offline', chatgpt_account_id: 'offline' }),
+      resolveCodexSession: id => { assert.equal(id, 'owner-runtime'); return { known: true, rootSessionId: id, turnId: 'owner-turn' }; },
+      fetchImpl: async (url, init) => { const body = JSON.parse(init.body); const meta = JSON.parse(body.client_metadata['x-codex-turn-metadata']); captures.push({ meta, body, headers: init.headers });
+        return new Response('data: '+JSON.stringify({ type: 'response.completed', response: { status: 'completed', output: [], usage: {} } })+'\n\n'); },
+    }) });
+  native.registerAdapter(adapter.routesFor(), adapter);
+  const sidecar = Object.freeze({ version: 1, kind: 'auto-review', ownerSessionId: 'owner-runtime', requestId: 'unique-review' });
+  const request = Object.freeze({ provider: 'pool', model: 'gpt-5.3-codex', messages: Object.freeze([createUserMessage({ content: [{ type: 'text', text: 'offline review' }], source: { kind: 'user' } })]), codexRequestProvenance: sidecar });
+  for await (const chunk of native.stream(request)) {}
+  const capture = captures.at(-1); assert.equal(capture.meta.thread_source, 'guardian_review');
+  assert.equal(capture.headers['x-openai-subagent'], 'guardian'); assert.equal(capture.headers['x-codex-guardian'], undefined);
+  assert.equal(capture.headers['thread-id'], capture.meta.thread_id); assert.equal(capture.body.prompt_cache_key, undefined);
+  assert.equal(request.sessionId, undefined); assert.deepEqual(adapter.listBindings(), []);
+  assert.equal(capture.body.client_metadata['x-codex-turn-metadata'], capture.headers['x-codex-turn-metadata']);
+});
+await check('original Auto gate through real Cordis and LlmRuntime reaches scoped Codex review metadata', async () => {
+  const { Context } = require('C:/Users/Administrator/AppData/Local/Programs/DeepSeek Harness/resources/app.asar/dsh/node_modules/@deepseek-ai/cordis');
+  const { AUTO_PRESET } = require('C:/Users/Administrator/AppData/Local/Programs/DeepSeek Harness/resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-permission-presets');
+  const companion = (await import('../../dsh-codex-review-attribution/lib/host.js')).default;
+  const { sessionFixture, mockContext } = await import('../../dsh-codex-review-attribution/tools/fixtures.mjs');
+  const { mountPool, inject: poolInject, ROUTES } = await import('../lib/host.js');
+  const { poolDomainSpec } = await import('../lib/domain.js');
+  const native = runtime(), root = new Context(), calls = [], routes = [], tables = new Map();
+  let globals = { ...poolDomainSpec.global.initial }, mountedPool, domainClosed = 0;
+  const owner = sessionFixture({ id: 'integration-child', mode: 'native', preset: AUTO_PRESET });
+  owner.session.header = { ...owner.session.header, origin: 'subagent', parentSession: 'integration-root' };
+  const ptc = sessionFixture({ id: 'integration-ptc', mode: 'ptc', preset: AUTO_PRESET });
+  const parent = sessionFixture({ id: 'integration-root' });
+  const sessions = [parent.session, owner.session, ptc.session];
+  for (const session of sessions) { const header = session.requestHeader(); session.requestHeader = () => ({ ...header, config: { provider: 'pool', model: 'gpt-5.3-codex' } }); }
+  const h = mockContext({ sessions });
+  const account = { id: 'integration-oauth', platform: 'openai', authMode: 'oauth', credentialRef: 'MOCK_REVIEW', models: ['gpt-5.3-codex'], groups: ['integration'], status: 'active', schedulable: true };
+  tables.set('groups', new Map([['integration', { id: 'integration', label: 'Integration', models: ['gpt-5.3-codex'] }]]));
+  const storageDomain = { open: async spec => {
+    assert.equal(spec, poolDomainSpec);
+    return { global: { get: () => globals, set: async value => { globals = value; } },
+      table(name) { if (!tables.has(name)) tables.set(name, new Map()); const table = tables.get(name);
+        return { get: key => table.get(key), entries: () => table.entries(), put: async (key, value) => { table.set(key, value); },
+          delete: async key => table.delete(key), update: async (key, fn) => { const value = fn(table.get(key)); table.set(key, value); return value; } }; },
+      close: async () => { if (domainClosed === 0) domainClosed += 1; } };
+  } };
+  const services = root.plugin({ name: 'integration-mock-services', apply(ctx) {
+    const values = { approval: h.ctx.approval, permissionPresets: h.ctx.permissionPresets, tools: h.ctx.tools, llm: native, storageDomain,
+      sessions: { list: () => sessions, get: id => sessions.find(session => session.id === id) },
+      sessionProjections: { stateOf: (session, key) => { assert.equal(key, 'turnBoundary'); return { openTurnStartSeq: 1, lastTurn: 1 }; } },
+      connection: { fetch: { register: route => { routes.push(route); return () => { routes.splice(routes.indexOf(route), 1); }; } } }, timer: {}, credentials: { resolve: async ref => { assert.equal(ref, 'MOCK_REVIEW'); return { value: JSON.stringify({ access_token: 'offline', chatgpt_account_id: 'offline' }) }; } }, attachments: {} };
+    for (const [key, value] of Object.entries(values)) ctx.provide(key, value);
+  } });
+  await services;
+  const poolFiber = root.plugin({ name: 'integration-account-pool', inject: poolInject, async apply(ctx) {
+    mountedPool = await mountPool(ctx, { accounts: [account], refreshEnabled: false,
+      fetchImpl: async (url, init) => {
+        assert.equal(url, 'https://chatgpt.com/backend-api/codex/responses');
+        const body = JSON.parse(init.body), meta = JSON.parse(body.client_metadata['x-codex-turn-metadata']); calls.push({ body, meta, headers: init.headers });
+        const text = '{"risk":"low","decision":"allow"}';
+        return new Response('data: ' + JSON.stringify({ type: 'response.completed', response: { status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }], usage: { input_tokens: 10, output_tokens: 2 } } }) + '\n\n');
+      } });
+    return () => mountedPool.dispose();
+  } });
+  await poolFiber;
+  const capability = async () => { const route = routes.find(row => row.path === ROUTES.accounts); return (await (await route.fetch(new Request('http://127.0.0.1' + ROUTES.accounts))).json()).codexAttributionCapabilities; };
+  assert.equal((await capability()).reviewBridge, false);
+  const originalModulePath = require.resolve('C:/Users/Administrator/AppData/Local/Programs/DeepSeek Harness/resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-experimental-auto-review/lib/index.js');
+  const reviewFiber = root.plugin(companion, { originalModulePath });
+  await reviewFiber;
+  try {
+    assert.equal(h.registered, 1, 'exactly one original Auto registration');
+    assert.equal((await capability()).reviewBridge, true, 'real optional child injection observes the sibling service');
+    const ordinary = [];
+    for (const fixture of [owner, ptc]) {
+      for await (const chunk of native.stream({ provider: 'pool', model: 'gpt-5.3-codex', sessionId: fixture.session.id, messages: [createUserMessage({ content: [{ type: 'text', text: 'ordinary mock request' }], source: { kind: 'user' } })] })) {}
+      ordinary.push(calls.at(-1));
+    }
+    const bindings = mountedPool.adapter.listBindings().map(binding => ({ ...binding }));
+    let downstreamCalls = 0;
+    const decisions = await Promise.all([owner, ptc].map(fixture => root.waterfall('tools/pre-execute', fixture.exec, () => { downstreamCalls += 1; return { kind: 'allow' }; })));
+    assert.deepEqual(decisions, [{ kind: 'allow' }, { kind: 'allow' }]); assert.equal(downstreamCalls, 2);
+    const reviews = calls.filter(call => call.meta.thread_source === 'guardian_review');
+    assert.equal(reviews.length, 2);
+    assert.notEqual(reviews[0].meta.thread_id, reviews[1].meta.thread_id);
+    for (const normal of ordinary) {
+      const review = reviews.find(call => call.meta.parent_thread_id === normal.meta.thread_id); assert.ok(review, 'review names the actual owner, not an invented collaboration parent');
+      assert.equal(review.meta.session_id, normal.meta.session_id); assert.notEqual(review.meta.thread_id, normal.meta.thread_id);
+      assert.equal(review.headers['thread-id'], review.meta.thread_id); assert.equal(review.headers['session-id'], review.meta.session_id);
+      assert.equal(review.headers['x-openai-subagent'], 'guardian'); assert.equal(review.headers['x-codex-guardian'], undefined);
+      assert.equal(review.body.prompt_cache_key, undefined); assert.equal(review.headers.session_id, undefined); assert.equal(review.meta.subagent_kind, undefined);
+    }
+    assert.deepEqual(mountedPool.adapter.listBindings(), bindings, 'the original producer adds no ordinary scheduling session');
+    assert.equal((await capability()).review.augmentedRequests, 2); assert.equal((await capability()).review.missingProvenance, 0);
+    await reviewFiber.dispose();
+    assert.equal(h.registered, 0); assert.equal((await capability()).reviewBridge, false);
+    assert.equal(owner.session.preset, 'danger-full-access'); assert.equal(ptc.session.preset, 'danger-full-access');
+    const sentinel = { kind: 'allow' }; assert.equal(root.waterfall('tools/pre-execute', owner.exec, () => sentinel), sentinel);
+  } finally {
+    await reviewFiber.dispose(); await poolFiber.dispose(); await services.dispose();
+  }
+  assert.equal(domainClosed, 1);
+});
+console.log(`${checks}/${checks} installed-runtime checks passed; ${fetches} earlier mock HTTP calls, no real credentials`);

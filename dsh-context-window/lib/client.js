@@ -98,6 +98,8 @@ window.__ModuleLoader__.load({
 			mcpUnnamedServer: '（未命名服务）',
 			skillToolNote: 'skill 工具本身 ~{tokens} · 计入系统工具',
 			aria: '上下文已用 {percent}',
+			detailLoading: '正在读取工具与技能明细…', detailFallback: '分类读取失败，暂显示官方估算桶。',
+			detailStale: '分类更新失败，明细为上次成功读取的数据。', detailTimeout: '读取超时', retry: '重新读取',
 		};
 
 		const en = {
@@ -116,6 +118,8 @@ window.__ModuleLoader__.load({
 			mcpUnnamedServer: '(unnamed server)',
 			skillToolNote: 'the skill tool itself ~{tokens} · counted under System tools',
 			aria: '{percent} of context used',
+			detailLoading: 'Reading tool and skill details…', detailFallback: 'Classification failed. Showing the official estimated buckets.',
+			detailStale: 'Classification refresh failed. Details are from the last successful read.', detailTimeout: 'The read timed out', retry: 'Read again',
 		};
 
 		const dicts = { zh, en };
@@ -129,6 +133,10 @@ window.__ModuleLoader__.load({
 .dcw-tip{position:absolute;left:50%;bottom:calc(100% + 6px);transform:translateX(-50%);z-index:1200;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .1s ease;background:var(--dsw-specific-menu);color:var(--dsw-alias-label-primary);border-radius:var(--dsw-radius-sm);box-shadow:var(--dsw-elevation-prominent);padding:4px 8px;font-size:12px;line-height:18px;white-space:nowrap}
 .dcw-root:hover .dcw-tip,.dcw-root:focus-within .dcw-tip{opacity:1;visibility:visible}
 .dcw-panel{position:fixed;z-index:1100;box-sizing:border-box;width:min(264px,100vw - 24px);border-radius:var(--dsw-radius-lg);background:var(--dsw-specific-menu);backdrop-filter:var(--dsw-menu-backdrop-filter);--dsw-elevation-stroke-color:var(--dsw-alias-border-l1);box-shadow:var(--dsw-elevation-prominent);color:var(--dsw-alias-label-secondary);cursor:default;border:0;padding:12px;font-size:12px;line-height:20px}
+.dcw-panel{max-height:calc(100dvh - 24px);overflow-y:auto}
+.dcw-panel :is(button,[tabindex]):focus-visible,.dcw-trigger:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:3px}
+.dcw-detail-status{margin-top:8px;font-size:11px;line-height:18px;overflow-wrap:anywhere;color:var(--dsw-alias-label-tertiary)}
+.dcw-retry{border:0;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;text-decoration:underline;cursor:pointer;padding:2px 0}
 .dcw-header{display:flex;align-items:center;gap:6px;width:100%;padding:0;background:0 0;border:none;font:inherit;color:inherit;text-align:left;cursor:pointer}
 .dcw-title{flex:none;color:var(--dsw-alias-label-secondary);font-size:13px;font-weight:500;line-height:24px}
 .dcw-figures{margin-left:auto;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -313,7 +321,7 @@ window.__ModuleLoader__.load({
 			const conversationTokens = Math.max(0, messageTokens - skillsTokens);
 			const mcp = detail?.tools?.mcp ?? null;
 			const systemTools = detail?.tools?.system ?? null;
-			const classified = mcp !== null && systemTools !== null;
+			const classified = mcp !== null && systemTools !== null && (toolsTokens === 0 || numberOr(mcp.tokens) + numberOr(systemTools.tokens) > 0);
 			const split = classified ? allocate(toolsTokens, [mcp.tokens, systemTools.tokens]) : null;
 			const rows = [];
 			const push = (definition, value, extra) => {
@@ -385,34 +393,48 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * Read the Host classification while the popover is open. Failure is silent:
-		 * the panel degrades to the official three-bucket view.
+		 * Warm the classification once, then refresh while the popover is open.
+		 * One request at a time; cleanup aborts and ignores late replies. Failure
+		 * retains the last good detail with an explicit stale/fallback diagnostic.
 		 * @param sessionId - current session id from the slot props.
 		 * @param enabled - whether the popover is open.
-		 * @returns the latest payload, or null.
+		 * @returns the session-scoped detail, loading/error/stale state, and retry.
 		 */
 		function useDetail(sessionId, enabled) {
-			const [detail, setDetail] = React.useState(null);
+			const [state, setState] = React.useState({ sessionId: null, detail: null, status: 'loading', error: null, stale: false });
+			const [nonce, setNonce] = React.useState(0);
+			const warmedSession = React.useRef(null);
 			React.useEffect(() => {
 				if (typeof sessionId !== 'string' || sessionId === '') return undefined;
+				if (!enabled && warmedSession.current === sessionId) return undefined;
+				warmedSession.current = sessionId;
 				let cancelled = false;
-				const load = () => {
-					fetch(`${DETAIL_ROUTE}?session=${encodeURIComponent(sessionId)}`, { headers: { accept: 'application/json' } })
-						.then((response) => (response.ok ? response.json() : undefined))
-						.then((payload) => {
-							if (cancelled || payload === undefined || payload?.error !== undefined) return;
-							setDetail(payload);
-						})
-						.catch(() => {});
-				};
-				load();
-				const timer = enabled ? setInterval(load, DETAIL_REFRESH_MS) : undefined;
-				return () => {
-					cancelled = true;
-					clearInterval(timer);
-				};
-			}, [sessionId, enabled]);
-			return detail?.sessionId === sessionId ? detail : null;
+				let flight = null;
+				let timeout;
+				async function load() {
+					if (flight || cancelled) return;
+					const controller = new AbortController();
+					flight = controller;
+					timeout = setTimeout(() => controller.abort(), 20000);
+					setState((previous) => previous.detail?.sessionId === sessionId
+						? { ...previous, status: 'loading' } : { sessionId, detail: null, status: 'loading', error: null, stale: false });
+					try {
+						const response = await fetch(`${DETAIL_ROUTE}?session=${encodeURIComponent(sessionId)}`, { headers: { accept: 'application/json' }, signal: controller.signal });
+						const payload = await response.json();
+						if (!response.ok || payload?.error || payload?.sessionId !== sessionId) throw new Error(payload?.error?.message || `HTTP ${response.status}`);
+						if (!cancelled && !controller.signal.aborted) setState({ sessionId, detail: payload, status: 'ready', error: null, stale: false });
+					} catch (error) {
+						if (!cancelled) setState((previous) => ({ ...previous, status: 'error', error: error.name === 'AbortError' ? 'timeout' : error.message, stale: previous.detail?.sessionId === sessionId }));
+					} finally { clearTimeout(timeout); if (flight === controller) flight = null; }
+				}
+				// One warm read also supplies verified legacy usage corrections to the ring.
+				// Subsequent refreshes happen only while the popover is open.
+				void load();
+				const timer = enabled ? setInterval(() => { void load(); }, DETAIL_REFRESH_MS) : undefined;
+				return () => { cancelled = true; clearInterval(timer); clearTimeout(timeout); flight?.abort(); };
+			}, [sessionId, enabled, nonce]);
+			const current = state.sessionId === sessionId ? state : { detail: null, status: 'loading', error: null, stale: false };
+			return { ...current, retry: () => setNonce((value) => value + 1) };
 		}
 
 		/**
@@ -521,15 +543,34 @@ window.__ModuleLoader__.load({
 					close();
 				};
 				const onKeyDown = (event) => {
-					if (event.key === 'Escape') close();
+					if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(); }
+				};
+				const onFocusIn = (event) => {
+					if (!rootRef.current?.contains(event.target) && !panelRef.current?.contains(event.target)) close();
 				};
 				document.addEventListener('pointerdown', onPointerDown, true);
 				document.addEventListener('keydown', onKeyDown);
+				document.addEventListener('focusin', onFocusIn);
 				return () => {
 					document.removeEventListener('pointerdown', onPointerDown, true);
 					document.removeEventListener('keydown', onKeyDown);
+					document.removeEventListener('focusin', onFocusIn);
 				};
 			}, [rootRef, panelRef, open, close]);
+		}
+
+		/** The panel is portalled to body; move keyboard focus there, then restore
+		 *  it only when dismissal did not already focus another control. */
+		function usePanelFocus(triggerRef, panelRef, ready) {
+			React.useEffect(() => {
+				if (!ready) return undefined;
+				const trigger = triggerRef.current;
+				const panel = panelRef.current;
+				panel?.querySelector('button')?.focus({ preventScroll: true });
+				return () => {
+					if (panel?.contains(document.activeElement) || document.activeElement === document.body) trigger?.focus({ preventScroll: true });
+				};
+			}, [triggerRef, panelRef, ready]);
 		}
 
 		/** The occupancy ring: identical geometry and stroke tokens to the shipped meter. */
@@ -675,7 +716,7 @@ window.__ModuleLoader__.load({
 		 * (title, figures, bar) and the row click reveals the per-bucket legend.
 		 */
 		function ContextPanel(props) {
-			const { occupancy, rows, barRows, free, freeShare, expanded, onToggle, openRow, onToggleRow, t, panelRef, style } = props;
+			const { occupancy, rows, barRows, free, freeShare, expanded, onToggle, openRow, onToggleRow, t, panelRef, style, detailStatus, detailError, detailStale, onRetry } = props;
 			const figures = `${occupancy.estimated ? '~' : ''}${formatCompact(occupancy.used)} / ${formatCompact(occupancy.window)} (${String(occupancy.percent)}%)`;
 			return h('div', {
 				ref: panelRef,
@@ -700,6 +741,11 @@ window.__ModuleLoader__.load({
 				h(OccupancyBar, { key: 'bar', rows: barRows ?? rows }),
 				expanded ? h(BreakdownRows, { key: 'rows', rows, free, freeShare, t }) : null,
 				expanded ? h(DetailSections, { key: 'sections', rows, t, openRow, onToggleRow }) : null,
+				detailError ? h('div', { key: 'detail-error', className: 'dcw-detail-status', role: 'status' }, [
+					h('div', { key: 'hint' }, t(detailStale ? 'detailStale' : 'detailFallback')),
+					h('div', { key: 'message' }, detailError === 'timeout' ? t('detailTimeout') : detailError),
+					h('button', { key: 'retry', type: 'button', className: 'dcw-retry', onClick: onRetry, disabled: detailStatus === 'loading' }, t('retry')),
+				]) : detailStatus === 'loading' ? h('div', { key: 'detail-loading', className: 'dcw-detail-status', role: 'status' }, t('detailLoading')) : null,
 			]);
 		}
 
@@ -718,12 +764,16 @@ window.__ModuleLoader__.load({
 			const [openRow, setOpenRow] = React.useState(null);
 			const rootRef = React.useRef(null);
 			const panelRef = React.useRef(null);
-			const detail = useDetail(typeof props.sessionId === 'string' ? props.sessionId : undefined, open);
+			const triggerRef = React.useRef(null);
+			const detailState = useDetail(typeof props.sessionId === 'string' ? props.sessionId : undefined, open);
+			const detail = detailState.detail;
+			React.useEffect(() => { setOpen(false); setExpanded(false); setOpenRow(null); }, [props.sessionId]);
 			const occupancy = occupancyOf(pressure, breakdown, detail);
 			useHideShippedMeter(rootRef, occupancy !== null);
 			useDismiss(rootRef, panelRef, open, () => { setOpen(false); });
-			const revision = `${String(expanded)}:${openRow ?? ''}:${String(detail?.generatedAt ?? 0)}`;
+			const revision = `${String(expanded)}:${openRow ?? ''}:${String(detail?.generatedAt ?? 0)}:${detailState.status}:${detailState.error ?? ''}`;
 			const position = usePanelPosition(rootRef, panelRef, open, revision);
+			usePanelFocus(triggerRef, panelRef, open && occupancy !== null && position !== null);
 			if (occupancy === null) return null;
 			const composition = compositionOf(breakdown, occupancy.window, detail, occupancy.used);
 			const reading = `${String(occupancy.percent)}%`;
@@ -733,6 +783,7 @@ window.__ModuleLoader__.load({
 					key: 'trigger',
 					type: 'button',
 					className: 'dcw-trigger',
+					ref: triggerRef,
 					'aria-label': tip,
 					'aria-haspopup': 'dialog',
 					'aria-expanded': open,
@@ -760,6 +811,7 @@ window.__ModuleLoader__.load({
 					t,
 					panelRef,
 					style: position,
+					detailStatus: detailState.status, detailError: detailState.error, detailStale: detailState.stale, onRetry: detailState.retry,
 				}), document.body) : null,
 			]);
 		}
@@ -799,6 +851,9 @@ window.__ModuleLoader__.load({
 		exports.TINT = TINT;
 		exports.dicts = dicts;
 		exports.fill = fill;
+		exports.useDetail = useDetail;
+		exports.usePanelFocus = usePanelFocus;
+		exports.useDismiss = useDismiss;
 		exports.RADIUS = RADIUS;
 		exports.CIRCUMFERENCE = CIRCUMFERENCE;
 		exports.formatCompact = formatCompact;

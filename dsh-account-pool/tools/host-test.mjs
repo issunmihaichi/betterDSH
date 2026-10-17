@@ -9,6 +9,7 @@
  */
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { EventEmitter } from 'node:events';
 import { readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -394,19 +395,19 @@ await check('mount: without the `llm` service it still mounts the management sur
   const mounted = await mountPool(ctx, { accounts: CONFIG_ACCOUNTS, clock: makeClock(), upstream: UP_OK() });
 
   assert.equal(mounted.adapterRegistered, false);
-  assert.equal(state.routes.length, 4, 'management routes do not depend on `llm`');
+  assert.equal(state.routes.length, 5, 'management routes do not depend on `llm`');
   assert.ok(state.logs.warn.some((line) => line.includes('`llm` service is unavailable')));
 
   await mounted.dispose();
 });
 
-await check('mount: registers the four management routes under /api', async () => {
+await check('mount: registers the management and session speed routes under /api', async () => {
   const { ctx, state } = makeCtx();
   const mounted = await mountPool(ctx, { accounts: CONFIG_ACCOUNTS, clock: makeClock(), upstream: UP_OK() });
 
   assert.deepEqual(
     state.routes.map((r) => r.path).sort(),
-    [ROUTES.accounts, ROUTES.usage, ROUTES.account, ROUTES.oauth].sort(),
+    [ROUTES.accounts, ROUTES.usage, ROUTES.account, ROUTES.oauth, ROUTES.codexSpeed].sort(),
   );
   for (const route of state.routes) {
     assert.ok(route.path.startsWith('/api/'), `${route.path} must live on the authenticated channel`);
@@ -632,6 +633,41 @@ await check('route: the accounts endpoint reports accounts, bindings and the req
   await mounted.dispose();
 });
 
+await check('usage timing: sink and authenticated route persist finite metrics and default historical rows', async () => {
+  const clock = makeClock();
+  const { ctx, state } = makeCtx();
+  const mounted = await mountPool(ctx, { accounts: [{ id: 'a1', platform: 'anthropic' }], clock,
+    upstream: { async *stream() {
+      clock.advance(20); yield { type: 'block-start', index: 0, blockType: 'text' };
+      clock.advance(20); yield { type: 'text-delta', text: 'fixture answer' };
+      clock.advance(160); yield { type: 'usage', usage: { outputTokens: 8 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+      clock.advance(20000);
+    } } });
+  for await (const chunk of mounted.adapter.stream({ sessionId: 'timing-fixture', model: 'm' })) {
+    if (chunk.type === 'finish') clock.advance(10000);
+  }
+  await mounted.flush();
+  const table = state.medium.tableFor('account_pool', 'usage');
+  const stored = usageSchema.parse([...table.values()][0]);
+  const expected = { firstTokenMs: 40, outputDurationMs: 160, outputTps: 50 };
+  for (const [key, value] of Object.entries(expected)) assert.equal(stored[key], value);
+  table.set('legacy-fixture', { id: 'legacy-fixture', at: iso(T0), ok: true, model: 'old' });
+  const route = state.routes.find(entry => entry.path === ROUTES.usage);
+  const response = await route.fetch(new Request('http://127.0.0.1/api/accountPool.usage'));
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.usageTimingVersion, 1);
+  assert.equal(body.rows.length, 2);
+  for (const [key, value] of Object.entries(expected)) {
+    assert.equal(body.rows[0][key], value);
+    assert.equal(body.rows[1][key], null, 'historical rows serialize null, never fabricated zero');
+  }
+  const accountsRoute = state.routes.find(entry => entry.path === ROUTES.accounts);
+  assert.equal((await (await accountsRoute.fetch(new Request('http://127.0.0.1/api/accountPool.accounts'))).json()).usageTimingVersion, 1);
+  await mounted.dispose();
+});
+
 await check('route: the usage endpoint returns newest-first and honours limit', async () => {
   const clock = makeClock();
   const { ctx, state } = makeCtx();
@@ -657,6 +693,29 @@ await check('route: the usage endpoint returns newest-first and honours limit', 
   assert.equal(capped.limit, 500, 'the limit must be capped');
 
   await mounted.dispose();
+});
+
+await check('usage effort: selected and mapped levels persist across config changes and remount', async () => {
+  const medium = makeMedium();
+  const config = Config({ accounts: [{ id: 'effort-account', platform: 'custom', models: ['m'] }],
+    providers: { pool: { modelOverrides: { m: { reasoningEfforts: { off: null, high: 'xhigh' } } } } } });
+  const first = makeCtx({ medium });
+  const mounted = await mountPool(first.ctx, { ...config, clock: makeClock(), upstream: UP_OK() });
+  try {
+    await drain(mounted.adapter.stream({ model: 'm', reasoningEffort: 'high' }));
+    await drain(mounted.adapter.stream({ model: 'm', reasoningEffort: 'off' }));
+    await mounted.flush();
+    const route = first.state.routes.find(row => row.path === ROUTES.usage);
+    const body = await (await route.fetch(new Request('http://127.0.0.1/api/accountPool.usage'))).json();
+    assert.deepEqual(body.rows.map(row => [row.reasoningEffort, row.mappedReasoningEffort]).sort(), [['high', 'xhigh'], ['off', null]].sort());
+  } finally { await mounted.dispose(); }
+  const next = makeCtx({ medium });
+  const remounted = await mountPool(next.ctx, { clock: makeClock(), upstream: UP_OK() });
+  try {
+    const route = next.state.routes.find(row => row.path === ROUTES.usage);
+    const body = await (await route.fetch(new Request('http://127.0.0.1/api/accountPool.usage'))).json();
+    assert.deepEqual(body.rows.map(row => [row.reasoningEffort, row.mappedReasoningEffort]).sort(), [['high', 'xhigh'], ['off', null]].sort(), 'history is not reconstructed from current provider settings');
+  } finally { await remounted.dispose(); }
 });
 
 // ------------------------------------------------- prune + dispose
@@ -692,11 +751,11 @@ await check('dispose: closes the domain and releases every registration, idempot
 
   assert.equal(state.domainClosed, 1);
   assert.equal(state.adapterDisposed, 1);
-  assert.equal(state.routeDisposed, 4);
+  assert.equal(state.routeDisposed, 5);
 
   await mounted.dispose();
   assert.equal(state.domainClosed, 1, 'disposal must be idempotent');
-  assert.equal(state.routeDisposed, 4, 'a second dispose must not re-run route disposers');
+  assert.equal(state.routeDisposed, 5, 'a second dispose must not re-run route disposers');
   assert.equal(state.providerDeclarationsDisposed, 1, 'and must not re-run the declaration disposer');
 });
 
@@ -902,7 +961,7 @@ await check('mount: a throwing timer accessor costs the sweep, not the whole mou
   const mounted = await mountPool(ctx, { accounts: CONFIG_ACCOUNTS, clock: makeClock(), upstream: UP_OK() });
 
   assert.equal(mounted.adapterRegistered, true, 'the plugin must still mount');
-  assert.equal(state.routes.length, 4, 'and still register its routes');
+  assert.equal(state.routes.length, 5, 'and still register its routes');
   assert.equal(state.intervals.length, 0, 'only the sweep is lost');
   assert.ok(state.logs.warn.some((line) => line.includes('timer service is unavailable')));
 
@@ -923,7 +982,7 @@ await check('mount: the status dump records exactly what resolved', async () => 
 
   const status = JSON.parse(readFileSync(dumpPath, 'utf8'));
   assert.deepEqual(status.capabilities, { storageDomain: true, llm: true, connection: true, timer: true, attachments: false });
-  assert.deepEqual(status.registered, { adapter: true, providerDeclared: true, routes: 4 });
+  assert.deepEqual(status.registered, { adapter: true, providerDeclared: true, routes: 5 });
   assert.equal(status.entryId, 'account-pool', 'the dump names the identity the Models card is keyed by');
   assert.equal(status.providerRoute, 'pool');
   assert.equal(status.upstreamConfigured, true);
@@ -2842,6 +2901,583 @@ await check('mount: Codex durable image attachment service reaches the HTTP tran
   try {
     await drain(mounted.adapter.stream({ model: 'gpt-5.3-codex', messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'sha256:offline-image', width: 1, height: 1, bytes: data.length, mediaType: 'image/png' } }] }] }));
     assert.equal(reads, 1); assert.equal(fetches, 1);
+  } finally { await mounted.dispose(); }
+});
+
+await check('mount: Codex attribution reads actual session origins and open turn projection', async () => {
+  const { ctx, state } = makeCtx(); const oldGet = ctx.get;
+  const sessions = new Map([
+    ['root', { header: { id: 'root' } }],
+    ['child', { header: { id: 'child', origin: 'subagent', parentSession: 'root' } }],
+    ['grandchild', { header: { id: 'grandchild', origin: 'subagent', parentSession: 'child' } }],
+    ['fork', { header: { id: 'fork', parentSession: 'root' } }],
+    ['detached', { header: { id: 'detached', origin: 'subagent', parentSession: 'missing' } }],
+    ['cycle', { header: { id: 'cycle', origin: 'subagent', parentSession: 'cycle' } }],
+  ]);
+  let turn = 1; const calls = [];
+  ctx.get = service => service === 'sessions' ? { get: id => sessions.get(id) }
+    : service === 'sessionProjections' ? { stateOf: (session, key) => { assert.equal(key, 'turnBoundary'); return { openTurnStartSeq: turn * 10, lastTurn: turn }; } } : oldGet(service);
+  await ctx.get('credentials').set('ATTRIBUTION_FIXTURE', JSON.stringify({ access_token: 'fixture-token', chatgpt_account_id: 'fixture-account' }));
+  const mounted = await mountPool(ctx, { refreshEnabled: false,
+    accounts: [{ id: 'attribution', platform: 'openai', authMode: 'oauth', credentialRef: 'ATTRIBUTION_FIXTURE', models: ['gpt-5.3-codex'] }],
+    fetchImpl: async (url, init) => { const body = JSON.parse(init.body); calls.push({ body, headers: init.headers, meta: body.client_metadata && JSON.parse(body.client_metadata['x-codex-turn-metadata']) });
+      return new Response('data: '+JSON.stringify({ type: 'response.completed', response: { status: 'completed', output: [], usage: {} } })+'\n\n'); },
+  });
+  try {
+    const call = opts => drain(mounted.adapter.stream({ model: 'gpt-5.3-codex', messages: [{ role: 'user', content: 'offline attribution' }], ...opts }));
+    for (const sessionId of ['root','child','grandchild','fork','detached','cycle','missing']) await call({ sessionId });
+    const [root,child,grandchild,fork,detached,cycle,missing] = calls.map(c => c.meta);
+    assert.equal(root.thread_source, 'user'); assert.equal(child.thread_source, 'subagent');
+    assert.equal(child.parent_thread_id, root.thread_id); assert.equal(grandchild.parent_thread_id, child.thread_id);
+    assert.equal(grandchild.session_id, root.session_id);
+    assert.notEqual(child.thread_id, root.thread_id); assert.notEqual(grandchild.thread_id, child.thread_id);
+    assert.equal(fork.thread_source, 'user'); assert.equal(fork.parent_thread_id, undefined);
+    assert.equal(detached.thread_source, 'subagent'); assert.ok(detached.parent_thread_id);
+    assert.equal(cycle.parent_thread_id, undefined); assert.equal(missing.thread_source, undefined);
+    await call({ sessionId: 'root' }); assert.equal(calls.at(-1).meta.turn_id, root.turn_id);
+    turn++; await call({ sessionId: 'root' }); assert.notEqual(calls.at(-1).meta.turn_id, root.turn_id);
+    await call({ sessionId: 'child', purpose: 'session-title' }); assert.equal(calls.at(-1).meta.thread_source, 'thread_title');
+    assert.equal(calls.at(-1).meta.parent_thread_id, undefined);
+    assert.equal(calls.at(-1).headers['x-openai-subagent'], undefined);
+    await call({ sessionId: 'child', purpose: 'compaction' }); assert.equal(calls.at(-1).meta.request_kind, 'compaction');
+    await call({}); assert.ok(calls.at(-1).meta.turn_id); assert.equal(calls.at(-1).meta.thread_source, undefined);
+    assert.equal(calls.at(-1).body.prompt_cache_key, undefined);
+    assert.equal(calls.at(-1).headers['session-id'], calls.at(-1).meta.session_id);
+    const bindings = mounted.adapter.listBindings().map(binding => ({ ...binding }));
+    await call({ codexRequestProvenance: Object.freeze({ version: 1, kind: 'auto-review', ownerSessionId: 'child', requestId: 'fixture-review' }) });
+    const review = calls.at(-1);
+    assert.equal(review.meta.thread_source, 'guardian_review');
+    assert.equal(review.headers['x-openai-subagent'], 'guardian');
+    assert.equal(review.headers['x-codex-guardian'], undefined);
+    assert.equal(review.meta.parent_thread_id, child.thread_id);
+    assert.equal(review.meta.session_id, root.session_id);
+    assert.equal(review.meta.subagent_kind, undefined);
+    assert.notEqual(review.meta.thread_id, child.thread_id);
+    assert.equal(review.headers['thread-id'], review.meta.thread_id);
+    assert.equal(review.body.prompt_cache_key, undefined);
+    assert.deepEqual(mounted.adapter.listBindings(), bindings, 'review provenance does not enter ordinary session routing');
+    const route = state.routes.find(row => row.path === ROUTES.accounts);
+    const diagnostics = (await (await route.fetch(new Request('http://127.0.0.1' + ROUTES.accounts))).json()).codexAttributionDispatch;
+    assert.equal(diagnostics.enabled, true); assert.equal(diagnostics.totalAttempts, calls.length);
+    assert.deepEqual(diagnostics.bySource, { user: 4, subagent: 5, thread_title: 1, guardian_review: 1, unknown: 2 });
+    assert.deepEqual(diagnostics.byRequestKind, { turn: 12, compaction: 1 });
+    assert.equal(diagnostics.missingSourceReasons['session-not-found'], 1);
+    assert.equal(diagnostics.missingSourceReasons['missing-session-id'], 1);
+    assert.equal(diagnostics.officialAnalyticsVerified, false);
+    const warnings = () => state.logs.warn.filter(line => line.includes('no verified thread_source'));
+    assert.equal(warnings().length, 2);
+    assert.doesNotMatch(warnings().join('\n'), /fixture-token|fixture-account|offline attribution|ATTRIBUTION_FIXTURE/);
+    await call({ sessionId: 'missing' });
+    assert.equal(warnings().length, 2, 'same missing-source reason warns at most once per mount');
+  } finally { await mounted.dispose(); }
+});
+
+await check('mount: Codex WebSocket configuration dispatch, diagnostics and disposal are wired', async () => {
+  const { ctx, state } = makeCtx();
+  const sockets = [], sent = [];
+  class FixtureSocket extends EventEmitter {
+    constructor(url, init) { super(); this.readyState = 0; sockets.push(this);
+      assert.equal(url, 'wss://chatgpt.com/backend-api/codex/responses');
+      assert.equal(init.headers.authorization, 'Bearer HOST_PRIVATE_FIXTURE');
+      queueMicrotask(() => { this.readyState = 1; this.emit('open'); }); }
+    send(raw, callback) { sent.push(JSON.parse(raw)); callback?.();
+      queueMicrotask(() => this.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: {
+        id: `resp_host_${sent.length}`, status: 'completed', output: [{ type: 'message', id: 'msg_host', status: 'completed', phase: 'final_answer', content: [{ type: 'output_text', text: 'ok' }] }], usage: {},
+      } })), false)); }
+    terminate() { this.readyState = 3; queueMicrotask(() => this.emit('close')); }
+  }
+  await ctx.get('credentials').set('WS_FIXTURE', JSON.stringify({ access_token: 'HOST_PRIVATE_FIXTURE', chatgpt_account_id: 'HOST_WORKSPACE_FIXTURE' }));
+  const mounted = await mountPool(ctx, { refreshEnabled: false, requestRetries: 0, webSocketImpl: FixtureSocket,
+    accounts: [{ id: 'codex-ws', platform: 'openai', authMode: 'oauth', openaiTransport: 'websocket', credentialRef: 'WS_FIXTURE', models: ['fixture-model'] }],
+    fetchImpl: async () => { assert.fail('Host WS path must not dispatch HTTP'); },
+  });
+  try {
+    const first = await drain(mounted.adapter.stream({ model: 'fixture-model', sessionId: 'host-session', messages: [{ role: 'user', content: 'fixture' }] }));
+    const history = [{ role: 'user', content: 'fixture' }, { role: 'assistant', content: first.filter(c => c.type === 'block-end').map(c => c.block), source: { replayState: first.at(-1).replayState } }, { role: 'user', content: 'again' }];
+    await drain(mounted.adapter.stream({ model: 'fixture-model', sessionId: 'host-session', messages: history }));
+    assert.equal(sockets.length, 1); assert.equal(sent[1].previous_response_id, 'resp_host_1'); assert.equal(sent[1].input.length, 1);
+    const route = state.routes.find(row => row.path === ROUTES.accounts);
+    const body = await (await route.fetch(new Request('http://127.0.0.1' + ROUTES.accounts))).json();
+    assert.equal(body.codexWebSocketVersion, 1); assert.equal(typeof body.codexWebSocket, 'object');
+    assert.equal(body.codexAttributionDispatch.totalAttempts, 2);
+    assert.doesNotMatch(JSON.stringify(body.codexWebSocket), /PRIVATE_FIXTURE|WORKSPACE_FIXTURE|host-session|resp_host/);
+  } finally { await mounted.dispose(); }
+  assert.ok(sockets.every(socket => socket.readyState === 3), 'unload closes resident connections');
+});
+
+await check('mount: Codex diagnostics do not require the optional review companion', async () => {
+  const { ctx, state } = makeCtx();
+  assert.equal(plugin.inject.includes('codexReviewAttribution'), false);
+  const mounted = await mountPool(ctx, { accounts: CONFIG_ACCOUNTS, upstream: UP_OK() });
+  try {
+    const route = state.routes.find(row => row.path === ROUTES.accounts);
+    const body = await (await route.fetch(new Request('http://127.0.0.1' + ROUTES.accounts))).json();
+    assert.match(body.runtimeRevision, /^\d+\.\d+\.\d+-[a-z0-9-]+$/, 'reports a versioned runtime independent of the optional companion');
+    assert.equal(body.codexWebSocketVersion, 1);
+    assert.deepEqual(body.codexWebSocket, { available: false }, 'injected transport does not claim native WS state');
+    assert.deepEqual(body.codexContinuity, { mode: 'session-aead-v1', keyState: 'not-loaded', stickyIdleTtlMs: 7 * 24 * 60 * 60 * 1000 });
+    assert.equal(state.secrets.size, 0, 'no replay key is created before Codex is used');
+    assert.equal(body.codexAttributionVersion, 2);
+    assert.equal(body.codexAttributionCapabilities.officialSessionHeaders, true);
+    assert.equal(body.codexAttributionCapabilities.requestLocalMetadata, true);
+    assert.equal(body.codexAttributionCapabilities.reviewBridge, false);
+    assert.equal(body.codexAttributionCapabilities.reviewBridgeStatus, 'not-installed');
+    assert.equal(body.codexAttributionCapabilities.officialAnalyticsVerified, false);
+    assert.equal(body.codexAttributionCapabilities.review, null);
+    assert.equal(body.codexAttributionDispatch.version, 1);
+    assert.equal(body.codexAttributionDispatch.enabled, false, 'custom transport cannot be observed by HTTP dispatch hook');
+    assert.equal(body.codexAttributionDispatch.totalAttempts, 0);
+  } finally { await mounted.dispose(); }
+});
+
+await check('mount: optional review diagnostics attach, sanitize and detach independently', async () => {
+  const { ctx, state } = makeCtx(); const detach = []; let status = {
+    version: 1, compatible: true, augmentationEnabled: true, augmentedRequests: 2, missingProvenance: 0,
+    originalModulePath: 'private-runtime-path', moduleSha256: 'internal-digest', status: 'private-failure-detail',
+  };
+  const bridge = { snapshot: () => status };
+  ctx.inject = (names, callback) => {
+    if (names[0] === 'compaction' || names[0] === 'agents') return;
+    assert.deepEqual(names, ['codexReviewAttribution']);
+    callback({ get: name => { assert.equal(name, names[0]); return bridge; }, effect: fn => { detach.push(fn()); } });
+  };
+  const mounted = await mountPool(ctx, { accounts: CONFIG_ACCOUNTS, upstream: UP_OK() });
+  try {
+    const route = state.routes.find(row => row.path === ROUTES.accounts);
+    const readState = async () => (await (await route.fetch(new Request('http://127.0.0.1' + ROUTES.accounts))).json()).codexAttributionCapabilities;
+    let info = await readState();
+    assert.equal(info.reviewBridge, true); assert.equal(info.reviewBridgeStatus, 'enabled');
+    assert.deepEqual(info.review, { version: 1, compatible: true, augmentationEnabled: true, augmentedRequests: 2, missingProvenance: 0 });
+    assert.equal(JSON.stringify(info).includes('private-'), false); assert.equal(JSON.stringify(info).includes('internal-digest'), false);
+    status = { ...status, compatible: false, augmentationEnabled: false, augmentedRequests: -1, missingProvenance: 'invalid' };
+    info = await readState(); assert.equal(info.reviewBridge, false); assert.equal(info.reviewBridgeStatus, 'disabled-incompatible');
+    assert.equal(info.review.augmentedRequests, 0); assert.equal(info.review.missingProvenance, 0);
+    detach.forEach(fn => fn()); info = await readState();
+    assert.equal(info.reviewBridgeStatus, 'not-installed'); assert.equal(info.review, null);
+  } finally { await mounted.dispose(); }
+});
+
+await check('mount: Codex optional review bridge supports late loading, replacement and unloading without remount', async () => {
+  const { ctx, state } = makeCtx();
+  let attach;
+  ctx.inject = (names, callback) => { if (names[0] === 'compaction' || names[0] === 'agents') return; assert.deepEqual(names, ['codexReviewAttribution']); attach = callback; };
+  const mounted = await mountPool(ctx, { accounts: CONFIG_ACCOUNTS, upstream: UP_OK() });
+  const connect = bridge => {
+    const disposers = [];
+    attach({ get: () => bridge, effect: fn => { disposers.push(fn()); } });
+    return () => disposers.forEach(dispose => dispose());
+  };
+  const service = count => ({ snapshot: () => ({ version: 1, compatible: true, augmentationEnabled: true, augmentedRequests: count, missingProvenance: 0 }) });
+  try {
+    const route = state.routes.find(row => row.path === ROUTES.accounts);
+    const readState = async () => (await (await route.fetch(new Request('http://127.0.0.1' + ROUTES.accounts))).json()).codexAttributionCapabilities;
+    assert.equal((await readState()).reviewBridgeStatus, 'not-installed');
+    const detachFirst = connect(service(1));
+    assert.equal((await readState()).review.augmentedRequests, 1);
+    const detachSecond = connect(service(2));
+    detachFirst();
+    assert.equal((await readState()).review.augmentedRequests, 2, 'stale cleanup must not detach a new provider');
+    detachSecond();
+    assert.equal((await readState()).reviewBridgeStatus, 'not-installed');
+    const detachThird = connect(service(3));
+    assert.equal((await readState()).review.augmentedRequests, 3);
+    detachThird();
+    assert.equal(state.opened.length, 1, 'optional service changes never reopen the account domain');
+    assert.equal(state.registrations.length, 1, 'the pool adapter stays registered');
+    assert.equal((await readState()).review, null);
+    assert.deepEqual((await drain(mounted.adapter.stream({ provider: 'pool', model: 'anthropic/test', sessionId: 'still-independent', messages: [] }))).filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.text), ['ok']);
+  } finally { await mounted.dispose(); }
+});
+
+await check('mount: Codex optional review API failures stay isolated from management and status dump', async () => {
+  const { ctx, state } = makeCtx();
+  const secret = 'PRIVATE_REVIEW_BRIDGE_ERROR';
+  let bridge = { snapshot() { throw Error(secret); } };
+  ctx.inject = (names, callback) => callback({ get: () => ({ get snapshot() { return bridge.snapshot; } }), effect: fn => fn() });
+  const dumpPath = join(tmpdir(), `account-pool-review-bridge-${process.pid}.json`);
+  const mounted = await mountPool(ctx, { accounts: CONFIG_ACCOUNTS, upstream: UP_OK(), statusDumpPath: dumpPath });
+  try {
+    const dump = JSON.parse(readFileSync(dumpPath, 'utf8'));
+    assert.equal(dump.codexAttributionCapabilities.reviewBridgeStatus, 'disabled-unavailable');
+    const route = state.routes.find(row => row.path === ROUTES.accounts);
+    const cases = [
+      ['missing method', {}, 'disabled-unavailable'],
+      ['wrong method type', { snapshot: true }, 'disabled-unavailable'],
+      ['throwing method', { snapshot() { throw Error(secret); } }, 'disabled-unavailable'],
+      ['throwing method getter', { get snapshot() { throw Error(secret); } }, 'disabled-unavailable'],
+      ...[null, undefined, 'invalid', [], { version: 1, compatible: 'yes', augmentationEnabled: true }].map(value => ['invalid snapshot', { snapshot: () => value }, 'disabled-unavailable']),
+      ['unknown version', { snapshot: () => ({ version: 2, compatible: true, augmentationEnabled: true }) }, 'disabled-incompatible'],
+      ['throwing snapshot getter', { snapshot: () => ({ version: 1, compatible: true, augmentationEnabled: true, get augmentedRequests() { throw Error(secret); } }) }, 'disabled-unavailable'],
+      ['async rejection', { snapshot: async () => { throw Error(secret); } }, 'disabled-unavailable'],
+      ['async success is not a synchronous snapshot', { snapshot: async () => ({ version: 1, compatible: true, augmentationEnabled: true }) }, 'disabled-unavailable'],
+      ['throwing then getter', { snapshot: () => ({ get then() { throw Error(secret); } }) }, 'disabled-unavailable'],
+      ['missing flags', { snapshot: () => ({ version: 1 }) }, 'disabled-unavailable'],
+    ];
+    for (const [label, value, status] of cases) {
+      bridge = value;
+      const response = await route.fetch(new Request('http://127.0.0.1' + ROUTES.accounts));
+      assert.equal(response.status, 200, label);
+      const body = await response.json();
+      assert.equal(body.accounts.length, CONFIG_ACCOUNTS.length, label);
+      assert.equal(body.codexAttributionCapabilities.reviewBridge, false, label);
+      assert.equal(body.codexAttributionCapabilities.reviewBridgeStatus, status, label);
+      assert.equal(body.codexAttributionCapabilities.review, null, label);
+      assert.equal(JSON.stringify(body).includes(secret), false, label);
+    }
+    bridge = { snapshot: () => ({ version: 1, compatible: true, augmentationEnabled: true, augmentedRequests: 0, missingProvenance: 0 }) };
+    assert.equal((await (await route.fetch(new Request('http://127.0.0.1' + ROUTES.accounts))).json()).codexAttributionCapabilities.reviewBridge, true, 'a repaired provider recovers without a remount');
+    const reads = { method: 0, compatible: 0, enabled: 0, count: 0 };
+    bridge = { get snapshot() {
+      reads.method++;
+      return () => ({ version: 1,
+        get compatible() { return ++reads.compatible === 1 ? true : secret; },
+        get augmentationEnabled() { return ++reads.enabled === 1 ? true : secret; },
+        get augmentedRequests() { return ++reads.count === 1 ? 7 : secret; },
+        missingProvenance: Number.POSITIVE_INFINITY,
+      });
+    } };
+    const sanitized = (await (await route.fetch(new Request('http://127.0.0.1' + ROUTES.accounts))).json()).codexAttributionCapabilities;
+    assert.deepEqual(sanitized.review, { version: 1, compatible: true, augmentationEnabled: true, augmentedRequests: 7, missingProvenance: 0 });
+    assert.deepEqual(reads, { method: 1, compatible: 1, enabled: 1, count: 1 }, 'validation must not re-read changing provider getters');
+    assert.equal(sanitized.reviewBridgeStatus, 'enabled');
+    assert.equal(JSON.stringify(sanitized).includes(secret), false);
+  } finally { await mounted.dispose(); rmSync(dumpPath, { force: true }); }
+});
+
+await check('mount: model attribution exposes only pinned host probes and aborts on unload', async () => {
+  const { ctx, state } = makeCtx(); const services = new Map(); const oldGet = ctx.get;
+  ctx.get = name => services.get(name) ?? oldGet(name);
+  ctx.provide = (name, service) => { services.set(name, service); return () => services.delete(name); };
+  await ctx.get('credentials').set('MODEL_PROBE_PRIVATE_REF', 'PRIVATE_TOKEN_SENTINEL');
+  let requests = 0;
+  const mounted = await mountPool(ctx, { accounts: [{ id: 'probe-row', platform: 'openai', authMode: 'api-key', credentialRef: 'MODEL_PROBE_PRIVATE_REF', baseUrl: 'https://private-host.test', models: ['fixture-model'], schedulable: false }],
+    upstream: { async *stream(account, options) { requests++; assert.equal(account.id, 'probe-row'); assert.equal(options.purpose, 'model-attribution');
+      yield { type: 'text-delta', index: 0, text: '1 2 3' }; yield { type: 'finish', reason: { kind: 'stop' } }; } },
+  });
+  try {
+    const service = ctx.get('accountPoolModelProbe'); assert.equal(service.version, 1);
+    const targets = await service.targets(); assert.equal(targets[0].configured, true); assert.equal(requests, 0);
+    assert.doesNotMatch(JSON.stringify(targets), /PRIVATE_TOKEN|PRIVATE_REF|private-host/);
+    const prepared = service.prepare('probe-row', { model: 'fixture-model', maxTokens: 8192 });
+    const iterator = prepared.stream('fixed probe', new AbortController().signal); await iterator.next();
+    state.effects.find(effect => effect.label === 'account-pool: modelProbeAbort').disposer();
+    await assert.rejects(iterator.next(), { name: 'AbortError' });
+    assert.equal(mounted.adapter.inflightSnapshot().size, 0);
+    assert.throws(() => service.prepare('probe-row', { model: 'fixture-model' }), { name: 'AbortError' });
+  } finally { await mounted.dispose(); }
+});
+
+// ------------------------------------------------- pinned scheduling capability
+function modelProbeCtx(options) {
+  const fixture = makeCtx(options); const services = new Map(); const oldGet = fixture.ctx.get;
+  fixture.ctx.get = name => services.get(name) ?? oldGet(name);
+  fixture.ctx.provide = (name, service) => { services.set(name, service); return () => services.delete(name); };
+  return fixture;
+}
+const PAUSE_PROBE_ACCOUNT = { id: 'pause-probe', platform: 'openai', authMode: 'api-key',
+  credentialRef: 'FIXTURE_PAUSE_REF', baseUrl: 'https://offline-pause.test', models: ['fixture-model'] };
+const preparePause = ctx => ctx.get('accountPoolModelProbe').prepare('pause-probe', { model: 'fixture-model' });
+
+await check('model probe pause: preserves every other field, is idempotent and never auto resumes', async () => {
+  const { ctx, state } = modelProbeCtx(); const medium = state.medium;
+  const mounted = await mountPool(ctx, { accounts: [PAUSE_PROBE_ACCOUNT], clock: makeClock(), upstream: UP_OK() });
+  try {
+    assert.equal(ctx.get('accountPoolModelProbe').pauseSchedulingVersion, 1);
+    const prepared = preparePause(ctx);
+    // Operator/health edits after preparation must survive the scheduling action.
+    mounted.adapter.upsertAccount({ ...mounted.adapter.getAccount('pause-probe'), label: 'Edited label',
+      status: 'disabled', consecutiveFailures: 7, errorMessage: 'fixture-health', cooldownUntil: iso(T0 + 10000),
+      lastUsedAt: iso(T0 - 1000), priority: 42, concurrency: 9, groups: ['fixture-group'], totalInputTokens: 123 });
+    await mounted.flush();
+    const before = structuredClone(mounted.adapter.getAccount('pause-probe'));
+    const accounts = medium.tableFor('account_pool', 'accounts'); const set = accounts.set.bind(accounts); let writes = 0;
+    accounts.set = (key, value) => { writes++; return set(key, value); };
+    try {
+      assert.deepEqual(await prepared.pauseScheduling(), { alreadyPaused: false });
+      assert.deepEqual(mounted.adapter.getAccount('pause-probe'), { ...before, schedulable: false });
+      assert.deepEqual(accounts.get('pause-probe'), { ...before, schedulable: false });
+      assert.deepEqual(await preparePause(ctx).pauseScheduling(), { alreadyPaused: true });
+      assert.equal(writes, 1, 'already-paused calls do not rewrite storage');
+      await drain(prepared.stream('fixed diagnostic', new AbortController().signal));
+      assert.deepEqual(mounted.adapter.getAccount('pause-probe'), { ...before, schedulable: false }, 'successful diagnostics do not resume scheduling');
+    } finally { accounts.set = set; }
+  } finally { await mounted.dispose(); }
+  const reopened = modelProbeCtx({ medium });
+  const restart = await mountPool(reopened.ctx, { accounts: [PAUSE_PROBE_ACCOUNT], upstream: UP_OK() });
+  try { assert.equal(restart.adapter.getAccount('pause-probe').schedulable, false, 'restart does not resume a persisted pause'); }
+  finally { await restart.dispose(); }
+});
+
+await check('model probe pause: exact connection key guards all fields and deleted/recreated rows', async () => {
+  const changes = { createdAt: iso(T0 + 1), platform: 'grok', authMode: 'oauth', credentialRef: 'OTHER_REF',
+    baseUrl: 'https://other-offline.test', chatgptAccountId: 'other-owner', projectId: 'other-project',
+    openaiApi: 'responses', openaiTransport: 'websocket', mimicry: false, betas: ['other-beta'], models: ['other-model'] };
+  for (const [field, value] of Object.entries(changes)) {
+    const { ctx, state } = modelProbeCtx(); const mounted = await mountPool(ctx, { accounts: [PAUSE_PROBE_ACCOUNT], upstream: UP_OK() });
+    try {
+      const prepared = preparePause(ctx); mounted.adapter.upsertAccount({ ...mounted.adapter.getAccount('pause-probe'), [field]: value });
+      await mounted.flush(); const before = structuredClone(mounted.adapter.getAccount('pause-probe'));
+      await assert.rejects(prepared.pauseScheduling(), { code: 'POOL_TEST_TARGET_CHANGED' });
+      assert.deepEqual(mounted.adapter.getAccount('pause-probe'), before, field);
+      assert.equal(state.medium.tableFor('account_pool', 'accounts').get('pause-probe').schedulable, true, field);
+    } finally { await mounted.dispose(); }
+  }
+  const { ctx, state } = modelProbeCtx(); const mounted = await mountPool(ctx, { accounts: [PAUSE_PROBE_ACCOUNT], upstream: UP_OK() });
+  try {
+    const prepared = preparePause(ctx); const before = mounted.adapter.getAccount('pause-probe');
+    mounted.adapter.removeAccount('pause-probe'); await mounted.flush();
+    await assert.rejects(prepared.pauseScheduling(), { code: 'POOL_TEST_TARGET_CHANGED' });
+    assert.equal(mounted.adapter.getAccount('pause-probe'), undefined);
+    assert.equal(state.medium.tableFor('account_pool', 'accounts').has('pause-probe'), false, 'deleted accounts are never recreated');
+    mounted.adapter.upsertAccount({ ...before, createdAt: iso(T0 + 2) }); await mounted.flush();
+    await assert.rejects(prepared.pauseScheduling(), { code: 'POOL_TEST_TARGET_CHANGED' });
+    assert.equal(mounted.adapter.getAccount('pause-probe').schedulable, true);
+  } finally { await mounted.dispose(); }
+});
+
+await check('model probe pause: lifecycle rejects both scheduling and acknowledgement after unload', async () => {
+  const { ctx, state } = modelProbeCtx(); const mounted = await mountPool(ctx, { accounts: [PAUSE_PROBE_ACCOUNT], upstream: UP_OK() });
+  try {
+    const prepared = preparePause(ctx); const before = structuredClone(mounted.adapter.getAccount('pause-probe'));
+    state.effects.find(effect => effect.label === 'account-pool: modelProbeAbort').disposer();
+    await assert.rejects(prepared.pauseScheduling(), { name: 'AbortError' });
+    assert.deepEqual(mounted.adapter.getAccount('pause-probe'), before);
+  } finally { await mounted.dispose(); }
+});
+
+await check('model probe pause: concurrent handles await the exact durable write and unload suppresses success', async () => {
+  for (const unload of [false, true]) {
+    const { ctx, state } = modelProbeCtx(); const open = ctx.storageDomain.open.bind(ctx.storageDomain);
+    let release; let writes = 0;
+    const gate = new Promise(resolve => { release = resolve; });
+    ctx.storageDomain.open = async spec => {
+      const domain = await open(spec); const table = domain.table.bind(domain);
+      domain.table = name => {
+        const original = table(name);
+        if (name !== 'accounts') return original;
+        return { ...original, put: async (key, value) => {
+          if (key === 'pause-probe' && value.schedulable === false) { writes++; await gate; }
+          return original.put(key, value);
+        } };
+      };
+      return domain;
+    };
+    const mounted = await mountPool(ctx, { accounts: [PAUSE_PROBE_ACCOUNT], upstream: UP_OK() });
+    try {
+      let returned = false; const prepared = preparePause(ctx);
+      const first = prepared.pauseScheduling().then(result => { returned = true; return result; });
+      const second = preparePause(ctx).pauseScheduling(); const both = Promise.all([first, second]);
+      const outcome = unload ? assert.rejects(both, { name: 'AbortError' }) : both;
+      for (let i = 0; i < 12; i++) await Promise.resolve();
+      assert.equal(returned, false); assert.equal(writes, 1);
+      assert.equal(state.medium.tableFor('account_pool', 'accounts').get('pause-probe').schedulable, true);
+      if (unload) state.effects.find(effect => effect.label === 'account-pool: modelProbeAbort').disposer();
+      release(); const result = await outcome;
+      if (!unload) assert.deepEqual(result, [{ alreadyPaused: false }, { alreadyPaused: false }]);
+      assert.equal(state.medium.tableFor('account_pool', 'accounts').get('pause-probe').schedulable, false);
+    } finally { release(); await mounted.dispose(); }
+  }
+});
+
+await check('model probe pause: synchronous/immediate/delayed persistence errors reject and clean retry persists', async () => {
+  for (const mode of ['synchronous', 'immediate', 'delayed']) {
+    const { ctx, state } = modelProbeCtx(); const open = ctx.storageDomain.open.bind(ctx.storageDomain);
+    let fail = true; let rejectWrite; let writes = 0;
+    const rejected = new Promise((_, reject) => { rejectWrite = reject; }); rejected.catch(() => {});
+    ctx.storageDomain.open = async spec => {
+      const domain = await open(spec); const table = domain.table.bind(domain);
+      domain.table = name => {
+        const original = table(name);
+        if (name !== 'accounts') return original;
+        return { ...original, put: (key, value) => {
+          if (key === 'pause-probe' && value.schedulable === false) {
+            writes++;
+            if (fail) {
+              if (mode === 'synchronous') throw Error('private-sync-persist');
+              return mode === 'immediate' ? Promise.reject(Error('private-immediate-persist')) : rejected;
+            }
+          }
+          return original.put(key, value);
+        } };
+      };
+      return domain;
+    };
+    const mounted = await mountPool(ctx, { accounts: [PAUSE_PROBE_ACCOUNT], upstream: UP_OK() });
+    try {
+      const prepared = preparePause(ctx); let returned = false;
+      const first = prepared.pauseScheduling().finally(() => { returned = true; });
+      const rejectedPause = assert.rejects(first, error => error.code === 'persist-failed' && !error.message.includes('private-'));
+      if (mode === 'delayed') {
+        for (let i = 0; i < 12; i++) await Promise.resolve();
+        assert.equal(returned, false); rejectWrite(Error('private-delayed-persist'));
+      }
+      await rejectedPause;
+      assert.equal(mounted.adapter.getAccount('pause-probe').schedulable, false, 'runtime may change even when persistence fails');
+      assert.equal(state.medium.tableFor('account_pool', 'accounts').get('pause-probe').schedulable, true);
+      fail = false;
+      assert.deepEqual(await preparePause(ctx).pauseScheduling(), { alreadyPaused: true });
+      assert.equal(state.medium.tableFor('account_pool', 'accounts').get('pause-probe').schedulable, false);
+      assert.equal(writes, 2, 'dirty pause retries storage rather than falsely acknowledging the memory snapshot');
+      assert.deepEqual(await prepared.pauseScheduling(), { alreadyPaused: true }); assert.equal(writes, 2);
+    } finally { fail = false; rejectWrite(Error('cleanup')); await mounted.dispose(); }
+  }
+});
+
+// ------------------------------------------------- durable management outcomes
+await check('management persistence: immediate rejected writes cannot report successful save', async () => {
+  const { ctx, state } = makeCtx();
+  const mounted = await mountPool(ctx, { accounts: CONFIG_ACCOUNTS, upstream: UP_OK(), oauthCallbackPort: 0 });
+  const table = state.medium.tableFor('account_pool', 'accounts');
+  const originalSet = table.set.bind(table);
+  table.set = () => { throw Error('private-storage-diagnostic'); };
+  try {
+    const route = state.routes.find(row => row.path === ROUTES.account);
+    const response = await route.fetch(actionRequest({ action: 'disable', id: 'a1' }));
+    assert.equal(response.status, 503);
+    const body = await response.json();
+    assert.equal(body.ok, false); assert.equal(body.persisted, false);
+    assert.equal(body.error.code, 'persist-failed');
+    assert.equal(body.runtimeMayHaveChanged, true);
+    assert.ok(!JSON.stringify(body).includes('private-storage-diagnostic'));
+    assert.notEqual(table.get('a1').status, 'disabled', 'durable data did not change');
+  } finally { table.set = originalSet; await mounted.dispose(); }
+});
+await check('management persistence: concurrent request failure is isolated from a successful save', async () => {
+  const { ctx, state } = makeCtx();
+  const mounted = await mountPool(ctx, { accounts: CONFIG_ACCOUNTS, upstream: UP_OK(), oauthCallbackPort: 0 });
+  const table = state.medium.tableFor('account_pool', 'accounts');
+  const originalSet = table.set.bind(table);
+  table.set = (key, value) => { if (key === 'a1') throw Error('storage-a1'); return originalSet(key, value); };
+  try {
+    const route = state.routes.find(row => row.path === ROUTES.account);
+    const [failed, saved] = await Promise.all(['a1', 'a2'].map(id => route.fetch(actionRequest({ action: 'disable', id }))));
+    assert.equal(failed.status, 503); assert.equal(saved.status, 200);
+    assert.equal((await saved.json()).ok, true);
+    assert.equal(table.get('a2').status, 'disabled');
+  } finally { table.set = originalSet; await mounted.dispose(); }
+});
+await check('management persistence: group failures are visible and clean retries succeed', async () => {
+  const { ctx, state } = makeCtx();
+  const mounted = await mountPool(ctx, { accounts: CONFIG_ACCOUNTS, upstream: UP_OK(), oauthCallbackPort: 0 });
+  const table = state.medium.tableFor('account_pool', 'groups');
+  const originalSet = table.set.bind(table);
+  table.set = () => { throw Error('storage-groups'); };
+  try {
+    const route = state.routes.find(row => row.path === ROUTES.account);
+    const failed = await route.fetch(actionRequest({ action: 'group-create', group: { id: 'ux-save', label: 'Test group' } }));
+    assert.equal(failed.status, 503);
+    assert.equal((await failed.json()).error.code, 'persist-failed');
+    table.set = originalSet;
+    const saved = await route.fetch(actionRequest({ action: 'group-update', id: 'ux-save', group: { label: 'Saved on retry' } }));
+    assert.equal(saved.status, 200); assert.equal(table.get('ux-save').label, 'Saved on retry');
+  } finally { table.set = originalSet; await mounted.dispose(); }
+});
+
+await check('management persistence: delayed rejection is awaited and a clean retry can save', async () => {
+  const { ctx, state } = makeCtx();
+  const open = ctx.storageDomain.open.bind(ctx.storageDomain);
+  let rejectWrite; let fail = true;
+  const deferredWrite = new Promise((_, reject) => { rejectWrite = reject; });
+  ctx.storageDomain.open = async spec => {
+    const domain = await open(spec); const table = domain.table.bind(domain);
+    domain.table = name => {
+      const original = table(name);
+      if (name !== 'accounts') return original;
+      return { ...original, put: (key, value) => fail && key === 'a1' && value.status === 'disabled' ? deferredWrite : original.put(key, value) };
+    };
+    return domain;
+  };
+  const mounted = await mountPool(ctx, { accounts: CONFIG_ACCOUNTS, upstream: UP_OK(), oauthCallbackPort: 0 });
+  try {
+    const route = state.routes.find(row => row.path === ROUTES.account);
+    let returned = false;
+    const pendingSave = route.fetch(actionRequest({ action: 'disable', id: 'a1' })).then(response => { returned = true; return response; });
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    assert.equal(returned, false, 'success cannot be reported before durable write settles');
+    rejectWrite(Error('delayed-private-diagnostic'));
+    const response = await pendingSave;
+    assert.equal(response.status, 503); assert.equal((await response.json()).error.code, 'persist-failed');
+    fail = false;
+    const retry = await route.fetch(actionRequest({ action: 'disable', id: 'a1' }));
+    assert.equal(retry.status, 200); assert.equal((await retry.json()).ok, true);
+    assert.equal(state.medium.tableFor('account_pool', 'accounts').get('a1').status, 'disabled');
+  } finally { fail = false; rejectWrite(Error('test-cleanup')); await mounted.dispose(); }
+});
+await check('management persistence: unrelated background usage rejection does not fail an operator save', async () => {
+  const { ctx, state } = makeCtx();
+  const mounted = await mountPool(ctx, { accounts: CONFIG_ACCOUNTS, upstream: UP_OK(), oauthCallbackPort: 0 });
+  const usage = state.medium.tableFor('account_pool', 'usage'); const set = usage.set.bind(usage);
+  usage.set = () => { throw Error('advisory-usage-write'); };
+  try {
+    await drain(mounted.adapter.stream({ model: 'claude-fixture', messages: [{ role: 'user', content: 'offline' }] }));
+    const route = state.routes.find(row => row.path === ROUTES.account);
+    const response = await route.fetch(actionRequest({ action: 'disable', id: 'a2' }));
+    assert.equal(response.status, 200); assert.equal((await response.json()).ok, true);
+    assert.equal(state.medium.tableFor('account_pool', 'accounts').get('a2').status, 'disabled');
+  } finally { usage.set = set; await mounted.dispose(); }
+});
+
+await check('mount: sealed Codex replay survives credential-service and Host remount with refreshed token', async () => {
+  const token = tick => `fixture.${Buffer.from(JSON.stringify({ iss: 'https://auth.fixture', sub: 'fixture-user', iat: tick,
+    'https://api.openai.com/auth': { chatgpt_account_id: 'fixture-workspace' } })).toString('base64url')}.signature`;
+  const configured = [{ id: 'continuity', platform: 'openai', authMode: 'oauth', credentialRef: 'FIXTURE_CODEX_TOKEN', models: ['gpt-6.1-sol'] }];
+  const privateFixture = 'HOST-PRIVATE-REASONING-FIXTURE';
+  const reply = () => new Response('data: ' + JSON.stringify({ type: 'response.completed', response: { status: 'completed', output: [
+    { type: 'reasoning', id: 'rs_private', encrypted_content: privateFixture },
+    { type: 'message', id: 'msg_fixture', phase: 'final_answer', content: [{ type: 'output_text', text: 'offline answer' }] },
+  ] } }) + '\n\n');
+  const first = makeCtx();
+  first.state.secrets.set('FIXTURE_CODEX_TOKEN', JSON.stringify({ access_token: token(1), chatgpt_account_id: 'fixture-workspace' }));
+  const initial = await mountPool(first.ctx, { accounts: configured, refreshEnabled: false, fetchImpl: async () => reply() });
+  let history, keyValue;
+  try {
+    assert.equal(first.state.secrets.size, 1, 'no eager replay key');
+    const chunks = await drain(initial.adapter.stream({ model: 'gpt-6.1-sol', sessionId: 'host-continuity', messages: [{ role: 'user', content: 'offline' }] }));
+    assert.ok(chunks.at(-1).replayState);
+    assert.equal(JSON.stringify(chunks).includes(privateFixture), false);
+    history = JSON.parse(JSON.stringify([{ role: 'assistant', content: chunks.filter(chunk => chunk.type === 'block-end').map(chunk => chunk.block), source: { replayState: chunks.at(-1).replayState } }]));
+    keyValue = first.state.secrets.get('DSH_ACCOUNT_POOL_CODEX_REPLAY_KEY_V1');
+    assert.equal(Buffer.from(keyValue, 'base64url').length, 32);
+    const status = await (await first.state.routes.find(row => row.path === ROUTES.accounts).fetch(new Request('http://127.0.0.1' + ROUTES.accounts))).json();
+    assert.equal(status.codexContinuity.keyState, 'ready');
+    assert.equal(JSON.stringify(status).includes(keyValue), false);
+  } finally { await initial.dispose(); }
+  const fresh = makeCtx({ medium: first.state.medium });
+  for (const [ref, value] of first.state.secrets) fresh.state.secrets.set(ref, value);
+  fresh.state.secrets.set('FIXTURE_CODEX_TOKEN', JSON.stringify({ access_token: token(2), chatgpt_account_id: 'fixture-workspace' }));
+  let requested = false;
+  const reopened = await mountPool(fresh.ctx, { accounts: configured, refreshEnabled: false, fetchImpl: async (url, init) => {
+    const input = JSON.parse(init.body).input;
+    assert.equal(input[0].encrypted_content, privateFixture); assert.equal(input[1].phase, 'final_answer'); requested = true;
+    return reply();
+  } });
+  try {
+    await drain(reopened.adapter.stream({ model: 'gpt-6.1-sol', sessionId: 'host-continuity', messages: history }));
+    assert.equal(requested, true); assert.equal(fresh.state.secrets.get('DSH_ACCOUNT_POOL_CODEX_REPLAY_KEY_V1'), keyValue);
+    assert.equal(fresh.state.secrets.size, 2, 'remount does not rotate/duplicate keys');
+  } finally { await reopened.dispose(); }
+});
+
+await check('mount: corrupt replay key never rotates silently and diagnostics are redacted', async () => {
+  const { ctx, state } = makeCtx();
+  const ref = 'DSH_ACCOUNT_POOL_CODEX_REPLAY_KEY_V1';
+  state.secrets.set(ref, 'INVALID-PRIVATE-KEY-FIXTURE');
+  state.secrets.set('FIXTURE_CODEX', JSON.stringify({ access_token: 'opaque-offline', chatgpt_account_id: 'offline-workspace' }));
+  const mounted = await mountPool(ctx, { refreshEnabled: false, accounts: [{ id: 'continuity', platform: 'openai', authMode: 'oauth', credentialRef: 'FIXTURE_CODEX', models: ['gpt-6.1-sol'] }],
+    fetchImpl: async () => new Response('data: ' + JSON.stringify({ type: 'response.completed', response: { status: 'completed', output: [
+      { type: 'message', id: 'msg_fixture', content: [{ type: 'output_text', text: 'offline answer' }] },
+    ] } }) + '\n\n'),
+  });
+  const readStatus = async () => (await (await state.routes.find(row => row.path === ROUTES.accounts).fetch(new Request('http://127.0.0.1' + ROUTES.accounts))).json()).codexContinuity;
+  try {
+    const opts = { model: 'gpt-6.1-sol', sessionId: 'key-failure', messages: [{ role: 'user', content: 'offline' }] };
+    const failedKey = await drain(mounted.adapter.stream(opts));
+    assert.equal(failedKey.at(-1).replayState, undefined); assert.equal((await readStatus()).keyState, 'unavailable');
+    assert.equal(state.secrets.get(ref), 'INVALID-PRIVATE-KEY-FIXTURE');
+    assert.equal(state.logs.warn.join('\n').includes('INVALID-PRIVATE-KEY-FIXTURE'), false);
+    state.secrets.set(ref, Buffer.alloc(32, 4).toString('base64url')); // Explicit operator repair, not automatic overwrite.
+    const retried = await drain(mounted.adapter.stream({ ...opts }));
+    assert.ok(retried.at(-1).replayState); assert.equal((await readStatus()).keyState, 'ready');
   } finally { await mounted.dispose(); }
 });
 

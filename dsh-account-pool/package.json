@@ -1,27 +1,14 @@
 {
   "name": "dsh-account-pool",
-  "version": "0.4.8",
+  "version": "0.4.26",
   "private": true,
   "description": "DSH 账号池：两层选路（粘性会话 + 负载感知）、失败冷却与降级（对标 sub2api 号池核心，自用规模）",
   "license": "MIT",
   "type": "module",
-  "main": "./lib/runtime-v0.4.18-probe-retries/host.js",
-  "scripts": {
-    "test": "node tools/test.mjs",
-    "test:retry": "node --test tools/retry-test.mjs",
-    "test:detection": "node tools/detection-test.mjs --quick",
-    "test:detection:all": "node tools/detection-test.mjs",
-    "test:client": "node tools/client-test.mjs",
-    "test:client:styles": "node tools/client-style-test.mjs",
-    "test:host": "node tools/host-test.mjs",
-    "test:domain": "node tools/domain-test.mjs",
-    "test:quota": "node tools/quota-test.mjs",
-    "test:reset-credits": "node tools/reset-credits-test.mjs",
-    "test:all": "node tools/kernel-test.mjs && node tools/domain-test.mjs && node tools/upstream-test.mjs && node tools/claude-code-test.mjs && node tools/importer-test.mjs && node tools/oauth-test.mjs && node tools/host-test.mjs && node tools/client-test.mjs && node --test tools/codex-test.mjs tools/gemini-test.mjs tools/openai-responses-test.mjs && node tools/quota-test.mjs && node tools/reset-credits-test.mjs && node tools/prepared-call-test.mjs && node tools/supplier-test.mjs && node tools/menu-capability-test.mjs && node tools/detection-test.mjs"
-  },
+  "main": "./lib/runtime-v0.4.49-local-tauri/host.js",
   "exports": {
     ".": {
-      "default": "./lib/runtime-v0.4.18-probe-retries/host.js"
+      "default": "./lib/runtime-v0.4.49-local-tauri/host.js"
     },
     "./kernel": {
       "default": "./lib/kernel.js"
@@ -63,6 +50,8 @@
     "lib/client.js",
     "lib/kernel.js",
     "lib/adapter.js",
+    "lib/usage-timing.js",
+    "lib/codex-compaction-bridge.js",
     "lib/domain.js",
     "lib/upstream.js",
     "lib/detection.js",
@@ -79,11 +68,47 @@
     "cordis.patch.yml",
     "DESIGN.md",
     "README.md",
-    "lib/runtime-v0.4.18-probe-retries"
+    "lib/codex-speed.js",
+    "lib/runtime-v0.4.43-batch-attribution",
+    "lib/runtime-v0.4.44-per-preset-compaction",
+    "lib/runtime-v0.4.46-local-api",
+    "lib/local-api.js",
+    "lib/local-api-protocol.js",
+    "lib/local-api-controller.js",
+    "lib/local-api-responses-request.js",
+    "lib/local-api-responses-output.js",
+    "lib/runtime-v0.4.47-local-responses",
+    "lib/runtime-v0.4.48-local-tauri",
+    "lib/runtime-v0.4.49-local-tauri",
+    "LOCAL-API.md"
   ],
   "dependencies": {
     "@deepseek-ai/schemastery": "3.18.4",
     "zod": "^4.6.5",
     "ws": "^8.18.3"
+  },
+  "scripts": {
+    "test": "node tools/test.mjs",
+    "test:retry": "node --test tools/retry-test.mjs",
+    "test:continuity": "node --test tools/codex-continuity-test.mjs tools/codex-test.mjs",
+    "test:codex-ws": "node --test tools/codex-websocket-test.mjs tools/codex-websocket-integration-test.mjs",
+    "test:codex-compaction": "node --test tools/codex-compaction-test.mjs tools/codex-compaction-host-test.mjs",
+    "test:attribution": "node tools/test.mjs attribution",
+    "test:model-probe": "node tools/test.mjs model-probe",
+    "test:detection": "node tools/detection-test.mjs --quick",
+    "test:detection:all": "node tools/detection-test.mjs",
+    "test:client": "node tools/client-test.mjs",
+    "test:client:styles": "node tools/client-style-test.mjs",
+    "test:timing": "node tools/test.mjs timing",
+    "test:usage-effort": "node tools/test.mjs usage-effort",
+    "test:host": "node tools/host-test.mjs",
+    "test:domain": "node tools/domain-test.mjs",
+    "test:quota": "node tools/quota-test.mjs",
+    "test:reset-credits": "node tools/reset-credits-test.mjs",
+    "test:all": "node tools/kernel-test.mjs && node tools/domain-test.mjs && node tools/upstream-test.mjs && node tools/claude-code-test.mjs && node tools/importer-test.mjs && node tools/oauth-test.mjs && node tools/host-test.mjs && node tools/client-test.mjs && node --test tools/codex-test.mjs tools/codex-continuity-test.mjs tools/codex-attribution-test.mjs tools/codex-compaction-test.mjs tools/codex-compaction-host-test.mjs tools/codex-websocket-test.mjs tools/codex-websocket-integration-test.mjs tools/model-probe-test.mjs tools/gemini-test.mjs tools/openai-responses-test.mjs && node tools/quota-test.mjs && node tools/reset-credits-test.mjs && node tools/prepared-call-test.mjs && node tools/usage-effort-test.mjs && node tools/supplier-test.mjs && node tools/menu-capability-test.mjs && node tools/detection-test.mjs",
+    "test:codex-speed": "node --test tools/codex-speed-test.mjs",
+    "test:local-api": "node tools/test.mjs local-api",
+    "test:local-responses": "node tools/test.mjs local-responses",
+    "test:local-tauri": "node tools/test.mjs local-tauri"
   }
 }

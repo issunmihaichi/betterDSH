@@ -152,6 +152,10 @@ export const accountSchema = z.strictObject({
   createdAt: instant,
   updatedAt: instant,
 }).superRefine((account, ctx) => {
+  // Codex OAuth uses a fixed native Responses endpoint, not openaiApi. Keep
+  // legacy rows on HTTP by default; opting into WS does not require migrating
+  // their historical chat-completions value to the generic API-key protocol.
+  if (account.platform === 'openai' && account.authMode === 'oauth' && account.openaiTransport === 'websocket') return;
   if (account.openaiApi === 'chat-completions' && account.openaiTransport === 'http') return;
   if (!['openai', 'grok', 'custom'].includes(account.platform) || account.authMode !== 'api-key') {
     ctx.addIssue({ code: 'custom', path: ['openaiApi'], message: 'OpenAI 请求格式和传输选项仅用于 OpenAI 兼容 API Key 账号' });
@@ -239,11 +243,18 @@ export const usageSchema = z.strictObject({
   sessionId: z.string().default(''),
   platform: z.string().default(''),
   model: z.string().default(''),
+  // Request-local selection and mapping; null on historical rows means unknown.
+  reasoningEffort: z.string().nullable().default(null),
+  mappedReasoningEffort: z.string().nullable().default(null),
   inputTokens: z.number().min(0).default(0),
   outputTokens: z.number().min(0).default(0),
   cacheReadTokens: z.number().min(0).default(0),
   cacheWriteTokens: z.number().min(0).default(0),
   reasoningTokens: z.number().min(0).default(0),
+  // Advisory request timing; historical records have no measurement, not zero.
+  firstTokenMs: z.number().finite().min(0).nullable().default(null),
+  outputDurationMs: z.number().finite().min(0).nullable().default(null),
+  outputTps: z.number().finite().min(0).nullable().default(null),
   accountSwitches: z.number().int().min(0).default(0),
   ok: z.boolean(),
   errorCode: z.string().default(''),
@@ -256,6 +267,14 @@ export const usageSchema = z.strictObject({
 export const poolGlobalSchema = z.strictObject({
   installedAt: instant,
   totalRequests: z.number().int().min(0).default(0),
+  codexEncryptedCompactionV2: z.boolean().default(false),
+  /** Only acknowledged session/provider/model speed choices; standard needs no row. */
+  codexSpeedSelections: z.array(z.strictObject({
+    sessionId: z.string().min(1).max(256),
+    provider: z.string().min(1).max(256),
+    model: z.string().min(1).max(256),
+    mode: z.enum(['fast', 'ultrafast']),
+  })).max(512).default([]),
 });
 
 export const DOMAIN_NAME = 'account_pool';
@@ -294,6 +313,9 @@ export const poolDomainSpec = {
     priorities: { valueSchema: prioritySchema },
     bindings: { valueSchema: bindingSchema },
     usage: { valueSchema: usageSchema },
+    // Additive table: keeps listener settings separate from existing pool globals.
+    // No secret values live in this domain; the API key uses the credential store.
+    local_api: { valueSchema: z.strictObject({ enabled: z.boolean(), port: z.number().int().min(1024).max(65535) }) },
   },
 };
 

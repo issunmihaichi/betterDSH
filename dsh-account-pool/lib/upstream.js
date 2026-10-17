@@ -11,13 +11,16 @@
  * `fetch` is injected so the whole thing is testable against a fake Response
  * with a hand-written SSE body; no network and no DSH runtime are required.
  */
+import { createHash, randomUUID } from 'node:crypto';
 import { rememberDetectionText } from './detection.js';
 import { OAUTH_ONLY_BETA, accountExtraBetas, applyClaudeCodeMode, isClaudeCodeModeEnabled } from './claude-code/index.js';
-import { buildCodexRequest, mapCodex, prepareCodexImages } from './native/codex.js';
+import { buildCodexRequest, mapCodex, getCodexContinuationOutput, getCodexContinuationCallIds, prepareCodexImages, prepareCodexCompactionHistory, snapshotCodexRequestProvenance, snapshotCodexSessionContext } from './native/codex.js';
+import { createCodexWebSocketTransport } from './native/codex-websocket.js';
 import { buildOpenAIResponsesRequest, mapOpenAIResponses } from './native/openai-responses.js';
 import { openAIResponsesWebSocket } from './native/openai-responses-websocket.js';
 export { buildOpenAIResponsesRequest, mapOpenAIResponses } from './native/openai-responses.js';
 import { buildGeminiRequest, ensureGeminiProject, mapGemini } from './native/gemini.js';
+import { compactionError, expandCodexCompactionMessages } from './native/codex-compaction.js';
 
 /** Raised when an account has no usable secret. Not an account fault — never cooled. */
 export class PoolCredentialError extends Error {
@@ -559,14 +562,54 @@ export function createHttpUpstream({
   defaultMaxTokens = 4096,
   signal,
   resolveAttachments,
+  resolveCodexSession,
+  // Trusted Host dependencies, never accepted from per-call/model options.
+  codexReplayCodec,
+  resolveCodexReplayCodec,
+  resolveCodexEncryptedCompaction,
+  resolveCompactionHistory,
+  // Synchronous, trusted local observer; receives bounded labels, never request/credentials.
+  onCodexRequest,
   webSocketImpl,
   webSocketConnectTimeoutMs = 10_000,
   webSocketIdleTimeoutMs = 120_000,
+  codexWebSocketSessionIdleMs = 300_000,
+  codexWebSocketMaxSessions = 32,
 } = {}) {
   if (typeof fetchImpl !== 'function') throw new TypeError('createHttpUpstream: `fetchImpl` is required');
+  const codexWebSocket = createCodexWebSocketTransport({
+    webSocketImpl, connectTimeoutMs: webSocketConnectTimeoutMs, idleTimeoutMs: webSocketIdleTimeoutMs,
+    sessionIdleMs: codexWebSocketSessionIdleMs, maxSessions: codexWebSocketMaxSessions, upstreamError,
+  });
+  const identityHash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
+  // Retry/detection/failover reuse options. Snapshot provenance before async
+  // credential/image I/O and retain one fallback turn identity for all attempts.
+  // Weak keys do not retain finished sessions or their prompts.
+  const codexContexts = new WeakMap();
   async function* stream(account, options = {}) {
     const requestSignal = options.signal ?? signal;
+    let codexContext;
+    if (account.platform === 'openai' && account.authMode === 'oauth') {
+      codexContext = codexContexts.get(options);
+      if (!codexContext) {
+        const purpose = options.purpose;
+        const sessionId = options.sessionId;
+        const review = snapshotCodexRequestProvenance(options.codexRequestProvenance, { purpose, sessionId });
+        const turnId = options.codexTurnId;
+        codexContext = Object.freeze({
+          // Only overlay the existing session, never the sidecar owner. The
+          // adapter's original options/sessionId still owns sticky selection.
+          sessionId: typeof sessionId === 'string' ? sessionId : undefined,
+          purpose: typeof purpose === 'string' ? purpose : undefined,
+          codexTurnId: typeof turnId === 'string' && turnId.trim() !== '' ? turnId : randomUUID(),
+          codexRequestProvenance: review,
+          codexSessionContext: snapshotCodexSessionContext(resolveCodexSession
+            ? resolveCodexSession(sessionId ?? review?.ownerSessionId) : options.codexSessionContext),
+        });
+        codexContexts.set(options, codexContext);
+      }
+    }
     requestSignal?.throwIfAborted();
     // MUST be awaited: the host resolves through the credentials service, which is
     // async. Treating that promise as a value made `typeof credential !== 'string'`
@@ -584,15 +627,26 @@ export function createHttpUpstream({
     const anthropic = account.platform === 'anthropic';
     const codex = account.platform === 'openai' && account.authMode === 'oauth';
     const gemini = account.platform === 'gemini';
+    if (!codex) {
+      // Ciphertext is not portable to another provider or API-key identity.
+      // Restore only cited authoritative records before its ordinary encoder.
+      options = { ...options, messages: expandCodexCompactionMessages(options.messages, { enabled: false, resolveCompactionHistory, options }) };
+      if (options.purpose === 'compaction' && options.codexCompactionV2 === true) throw compactionError('POOL_CODEX_COMPACTION_UNSUPPORTED');
+    }
     const responses = !anthropic && !codex && !gemini && account.openaiApi === 'responses';
     const websocket = account.openaiTransport === 'websocket';
-    if (websocket && !responses) {
-      throw new PoolUnsupportedContentError('WebSocket transport requires API-key OpenAI Responses');
+    if (websocket && !responses && !codex) {
+      throw new PoolUnsupportedContentError('WebSocket transport requires OpenAI Responses or Codex OAuth');
     }
     let request;
     const nativeCredential = bundle ? { ...bundle, access_token: credential } : credential;
-    if (codex) request = buildCodexRequest(account, await prepareCodexImages({ ...options, signal: requestSignal }, resolveAttachments), nativeCredential);
-    else if (gemini) {
+    if (codex) {
+      const replayCodec = codexReplayCodec ?? await resolveCodexReplayCodec?.();
+      requestSignal?.throwIfAborted();
+      const compactionDependencies = { replayCodec, encryptedCompaction: resolveCodexEncryptedCompaction?.() === true, resolveCompactionHistory };
+      const codexOptions = prepareCodexCompactionHistory(account, { ...options, ...codexContext, signal: requestSignal }, nativeCredential, compactionDependencies);
+      request = buildCodexRequest(account, await prepareCodexImages(codexOptions, resolveAttachments), nativeCredential, compactionDependencies);
+    } else if (gemini) {
       let contextBundle = bundle ? { ...bundle, access_token: credential } : (account.authMode === 'oauth' ? { access_token: credential } : { api_key: credential });
       if (account.authMode === 'oauth' && !account.projectId && !contextBundle.project_id && !contextBundle.projectId) {
         const project = await ensureGeminiProject(contextBundle, { fetchImpl, signal: options.signal ?? signal, accountId: account.id });
@@ -609,7 +663,7 @@ export function createHttpUpstream({
       ? buildAnthropicRequest(account, options, credential, defaultMaxTokens)
       : buildOpenAIRequest(account, options, credential, defaultMaxTokens);
 
-    if (websocket) {
+    if (websocket && !codex) {
       yield* mapOpenAIResponses(openAIResponsesWebSocket(request, {
         signal: requestSignal,
         webSocketImpl,
@@ -620,26 +674,54 @@ export function createHttpUpstream({
       return;
     }
 
-    const response = await fetchImpl(request.url, {
-      ...request.init,
-      signal: options.signal ?? signal,
-    });
-
-    if (!response.ok) {
-      const text = typeof response.text === 'function' ? await response.text().catch(() => '') : '';
-      throw upstreamError(response, text);
+    requestSignal?.throwIfAborted();
+    const onDispatch = () => {
+      if (codex && typeof onCodexRequest === 'function') {
+        // Fixed-label diagnostics cannot change wire identity or cause a retry.
+        try { onCodexRequest(request.context.attribution); } catch {}
+      }
+    };
+    async function* http({ signal: httpSignal = requestSignal } = {}) {
+      httpSignal?.throwIfAborted();
+      onDispatch();
+      const response = await fetchImpl(request.url, { ...request.init, signal: httpSignal });
+      if (!response.ok) {
+        const text = typeof response.text === 'function' ? await response.text().catch(() => '') : '';
+        throw upstreamError(response, text);
+      }
+      if (response.body === null || response.body === undefined) {
+        const error = new Error('upstream returned no response body for a streaming request');
+        error.code = 'POOL_EMPTY_BODY';
+        throw error;
+      }
+      if (codex) yield* mapCodex(response.body, parseSse, request.context);
+      else if (responses) yield* mapOpenAIResponses(parseSse(response.body), request.context);
+      else if (gemini) yield* mapGemini(response.body, parseSse, request.context);
+      else yield* (anthropic ? mapAnthropic(parseSse(response.body)) : mapOpenAI(parseSse(response.body)));
     }
-    if (response.body === null || response.body === undefined) {
-      const error = new Error('upstream returned no response body for a streaming request');
-      error.code = 'POOL_EMPTY_BODY';
-      throw error;
+    if (codex && websocket) {
+      // Session key deliberately excludes account: changing credentials/account in
+      // this logical session must invalidate the old resident WS, not park it for reuse.
+      const sessionKey = request.context.scope && codexContext.sessionId
+        ? identityHash(['codex-ws-session-v1', codexContext.sessionId]) : undefined;
+      // Refresh must reconnect even when durable replay can survive JWT rotation.
+      const identityKey = identityHash(['codex-ws-identity-v1', request.context.scope ?? null,
+        account.id, account.createdAt, account.credentialRef, request.url, options.model,
+        request.init.headers.authorization, request.init.headers['chatgpt-account-id']]);
+      yield* codexWebSocket.stream(request, {
+        signal: requestSignal, sessionKey, identityKey, onDispatch,
+        mapResponse: frames => mapCodex(frames, value => value, request.context),
+        getContinuationOutput: () => getCodexContinuationOutput(request.context),
+        getContinuationCallIds: () => getCodexContinuationCallIds(request.context),
+        httpFallback: http,
+      });
+    } else {
+      if (codex && request.context.scope && codexContext.sessionId) {
+        codexWebSocket.invalidate(identityHash(['codex-ws-session-v1', codexContext.sessionId]));
+      }
+      yield* http();
     }
-
-    if (codex) yield* mapCodex(response.body, parseSse, request.context);
-    else if (responses) yield* mapOpenAIResponses(parseSse(response.body), request.context);
-    else if (gemini) yield* mapGemini(response.body, parseSse, request.context);
-    else yield* (anthropic ? mapAnthropic(parseSse(response.body)) : mapOpenAI(parseSse(response.body)));
   }
 
-  return { stream };
+  return { stream, dispose: () => codexWebSocket.dispose(), codexWebSocketSnapshot: () => codexWebSocket.snapshot() };
 }

@@ -1,10 +1,7 @@
 // Host-half tests: the MCP row payload (tool counts, context cost, ownership),
-// the config route's secret redaction/restore, and the parity between this
-// plugin's token arithmetic and the context-window panel's.
-//
-// The parity block is the reason `lib/estimate.js` exists as a copy: two pages
-// report "this server costs ~X", and a drift between them must fail a test
-// rather than quietly disagree in the UI.
+// the config route's secret redaction/restore, and local token arithmetic.
+// Cross-plugin estimator parity lives in the repository tools suite so this
+// plugin's own tests also work with no context-window installation.
 //
 // usage: node tools/host-test.mjs
 import assert from 'node:assert/strict';
@@ -14,13 +11,14 @@ import {
   ROUTES,
   ROW_OWNERS,
   createMcpSkills,
+  describeEndpoint,
   isMcpConfig,
   redactSecrets,
   restoreSecrets,
   toolTokensFor,
 } from '../lib/host.js';
 import * as mine from '../lib/estimate.js';
-import * as panel from '../../dsh-context-window/lib/estimate.js';
+
 
 let passed = 0;
 const failures = [];
@@ -34,45 +32,12 @@ async function check(label, fn) {
   }
 }
 
-// ------------------------------------------------------------ pricing parity ---
+// ------------------------------------------------------------ local pricing ---
 
-await check('both estimator copies carry the same constants', () => {
+await check('standalone estimator carries the documented constants', () => {
   assert.equal(mine.CHARS_PER_TOKEN, 4);
   assert.equal(mine.BLOCK_OVERHEAD, 4);
   assert.equal(mine.ROLE_OVERHEAD, 4);
-  assert.equal(mine.CHARS_PER_TOKEN, panel.CHARS_PER_TOKEN);
-  assert.equal(mine.BLOCK_OVERHEAD, panel.BLOCK_OVERHEAD);
-  assert.equal(mine.ROLE_OVERHEAD, panel.ROLE_OVERHEAD);
-});
-
-const SAMPLES = {
-  texts: ['', 'a', 'abcd', 'abcde', '你好世界', 'x'.repeat(101)],
-  blocks: [
-    [],
-    [{ type: 'text', text: 'hello' }],
-    [{ type: 'reasoning', text: 'why' }],
-    [{ type: 'tool-call', name: 'read', arguments: '{"path":"a"}' }],
-    [{ type: 'unknown-extensible', weird: true }],
-  ],
-  tools: [
-    [],
-    [{ name: 'x', description: 'y' }],
-    [{ name: 'mcp__github__issue_write', description: 'w', parameters: { type: 'object', properties: {} } }],
-    [{ name: 'a' }, { name: 'b', description: 'z' }],
-  ],
-  messages: [
-    { role: 'system', content: [{ type: 'text', text: 'prompt' }] },
-    { role: 'user', content: [{ type: 'text', text: 'hi' }] },
-    { role: 'tool', content: [{ type: 'tool-result', text: 'ok' }] },
-    { role: 'assistant', content: [] },
-  ],
-};
-
-await check('every formula agrees with the context panel on the same inputs', () => {
-  for (const text of SAMPLES.texts) assert.equal(mine.estimateText(text), panel.estimateText(text), `estimateText(${JSON.stringify(text)})`);
-  for (const blocks of SAMPLES.blocks) assert.equal(mine.estimateContent(blocks), panel.estimateContent(blocks), `estimateContent(${JSON.stringify(blocks)})`);
-  for (const tools of SAMPLES.tools) assert.equal(mine.estimateToolsTokens(tools), panel.estimateToolsTokens(tools), `estimateToolsTokens(${JSON.stringify(tools)})`);
-  for (const message of SAMPLES.messages) assert.equal(mine.estimateMessage(message), panel.estimateMessage(message), `estimateMessage(${JSON.stringify(message)})`);
 });
 
 await check('the golden tool-schema price is the documented number', () => {
@@ -81,9 +46,9 @@ await check('the golden tool-schema price is the documented number', () => {
   assert.equal(mine.estimateToolsTokens([{ name: 'x', description: 'y' }]), 12);
 });
 
-await check('toolTokensFor prices one tool exactly as the panel prices it', () => {
+await check('toolTokensFor uses the standalone estimator', () => {
   const schema = { name: 'mcp__github__issue_write', description: 'write an issue', parameters: { type: 'object' } };
-  assert.equal(toolTokensFor(schema), panel.estimateToolsTokens([schema]));
+  assert.equal(toolTokensFor(schema), mine.estimateToolsTokens([schema]));
 });
 
 await check('an unserializable schema prices as zero instead of throwing', () => {
@@ -164,12 +129,16 @@ function world(overrides = {}) {
   return { host, calls };
 }
 
-/** Minimal Request stand-in: what the routes actually read. */
+/** Real Fetch bodies are single-use; fakes that return body twice hide route bugs. */
 function get(url) {
-  return { method: 'GET', url, json: async () => { throw new Error('no body'); } };
+  return new Request(url);
 }
 function post(url, body) {
-  return { method: 'POST', url, json: async () => body };
+  return new Request(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
 }
 
 async function bodyOf(response, expectedStatus = 200) {
@@ -263,6 +232,50 @@ await check('a row this profile owns reads back without an owner', async () => {
   assert.equal(body.reason, 'not-found');
 });
 
+await check('config text saves through one real single-use Request body', async () => {
+  const { host, calls } = world();
+  const request = post(`http://x${ROUTES.mcpConfig}`, {
+    patchId: 'github-mcp',
+    text: JSON.stringify({ serverName: 'github', transport: 'stdio', command: 'server' }),
+  });
+  const body = await bodyOf(await host.route(ROUTES.mcpConfig, request));
+  assert.equal(body.ok, true);
+  assert.equal(request.bodyUsed, true);
+  assert.equal(calls.edits.length, 1);
+  assert.equal(calls.edits[0].config.command, 'server');
+});
+
+await check('malformed and empty JSON bodies are 400, never edits or internal 500', async () => {
+  for (const route of [ROUTES.mcpConfig, ROUTES.mcpToggle, ROUTES.skillToggle]) {
+    for (const text of ['{', '']) {
+      const { host, calls } = world();
+      const request = new Request(`http://x${route}`, { method: 'POST', body: text });
+      const body = await bodyOf(await host.route(route, request), 400);
+      assert.equal(body.reason, 'bad-json');
+      assert.match(body.message, /JSON/);
+      assert.equal(calls.edits.length, 0);
+      assert.equal(calls.enabled.length, 0);
+    }
+  }
+});
+
+await check('bad config objects and config text are refused after a single parse', async () => {
+  for (const config of [null, [], 'not-an-object']) {
+    const { host, calls } = world();
+    const body = await bodyOf(await host.route(ROUTES.mcpConfig, post(`http://x${ROUTES.mcpConfig}`, {
+      patchId: 'github-mcp', config,
+    })), 400);
+    assert.equal(body.reason, 'bad-config');
+    assert.equal(calls.edits.length, 0);
+  }
+  const { host, calls } = world();
+  const body = await bodyOf(await host.route(ROUTES.mcpConfig, post(`http://x${ROUTES.mcpConfig}`, {
+    patchId: 'github-mcp', text: '{',
+  })), 400);
+  assert.equal(body.reason, 'bad-json');
+  assert.equal(calls.edits.length, 0);
+});
+
 // -------------------------------------------------------------------- actions ---
 
 await check('toggling a row calls the plugin manager with the entry id', async () => {
@@ -305,6 +318,104 @@ await check('redaction and restore are inverses around a placeholder', () => {
   assert.equal(restored.headers.Authorization, 'Bearer t');
   assert.equal(restored.headers['x-trace'], 'changed');
   assert.equal(restored.nested[0].token, 'abc');
+});
+
+const SECRET_CONFIG = {
+  serverName: 'github',
+  transport: 'stdio',
+  command: 'github-mcp-server',
+  env: {
+    GITHUB_PERSONAL_ACCESS_TOKEN: 'github-env-secret',
+    OPENAI_API_KEY: 'openai-env-secret',
+    accessToken: 'camel-secret',
+    PATH: 'C:\\tools',
+    MONKEY: 'ordinary-value',
+  },
+  headers: {
+    'X-API-Key': 'header-key-secret',
+    'Proxy-Authorization': 'Bearer proxy-secret',
+    'x-trace': 'trace-value',
+  },
+  args: [
+    'stdio', '--token', 'cli-token-secret', '--api-key=inline-key-secret',
+    '--header', 'Authorization: Bearer header-arg-secret',
+    '-e', 'GITHUB_PERSONAL_ACCESS_TOKEN=env-arg-secret',
+    '--endpoint=https://alice:url-password@example.test/mcp?api_key=url-key-secret&mode=fast',
+  ],
+};
+
+const NEVER_RETURN = [
+  'github-env-secret', 'openai-env-secret', 'camel-secret', 'header-key-secret',
+  'proxy-secret', 'cli-token-secret', 'inline-key-secret', 'header-arg-secret',
+  'env-arg-secret', 'alice', 'url-password', 'url-key-secret',
+];
+
+await check('env names, custom credential headers, and secret argv are masked and restorable', () => {
+  const masked = redactSecrets(SECRET_CONFIG);
+  const serialized = JSON.stringify(masked);
+  for (const secret of NEVER_RETURN) assert.ok(!serialized.includes(secret), `leaked ${secret}`);
+  assert.equal(masked.env.GITHUB_PERSONAL_ACCESS_TOKEN, REDACTED);
+  assert.equal(masked.env.OPENAI_API_KEY, REDACTED);
+  assert.equal(masked.env.accessToken, REDACTED);
+  assert.equal(masked.env.PATH, 'C:\\tools');
+  assert.equal(masked.env.MONKEY, 'ordinary-value');
+  assert.equal(masked.headers['x-trace'], 'trace-value');
+  assert.deepEqual(restoreSecrets(SECRET_CONFIG, masked), SECRET_CONFIG);
+  const changed = restoreSecrets(SECRET_CONFIG, {
+    ...masked, env: { ...masked.env, OPENAI_API_KEY: 'replacement-secret' },
+  });
+  assert.equal(changed.env.OPENAI_API_KEY, 'replacement-secret');
+  assert.equal(changed.env.GITHUB_PERSONAL_ACCESS_TOKEN, 'github-env-secret');
+});
+
+await check('config read/save never returns stdio secrets and preserves them on real POST', async () => {
+  const { host, calls } = world({ configuration: [{
+    entry: { options: { id: 'github-mcp' } }, inherited: SECRET_CONFIG, override: {},
+  }] });
+  const read = await bodyOf(await host.route(ROUTES.mcpConfig, get(`http://x${ROUTES.mcpConfig}?patchId=github-mcp`)));
+  const status = await bodyOf(await host.route(ROUTES.status, get(`http://x${ROUTES.status}`)));
+  for (const secret of NEVER_RETURN) {
+    assert.ok(!JSON.stringify(read).includes(secret));
+    assert.ok(!JSON.stringify(status).includes(secret));
+  }
+  assert.match(status.mcp.rows[0].endpoint, /github-mcp-server stdio --token \*\*\*/);
+  const saved = await bodyOf(await host.route(ROUTES.mcpConfig, post(`http://x${ROUTES.mcpConfig}`, {
+    patchId: 'github-mcp', config: { ...read.config, readOnly: true },
+  })));
+  assert.equal(saved.ok, true);
+  assert.equal(calls.edits.length, 1);
+  assert.deepEqual(calls.edits[0].config, { ...SECRET_CONFIG, readOnly: true });
+});
+
+await check('credential URLs have a safe endpoint view and a restorable config placeholder', async () => {
+  const stored = {
+    serverName: 'github', transport: 'streamable-http',
+    url: 'https://alice:url-password@example.test/mcp?api_key=url-key-secret&mode=fast',
+  };
+  assert.equal(redactSecrets(stored).url, REDACTED);
+  assert.deepEqual(restoreSecrets(stored, redactSecrets(stored)), stored);
+  const endpoint = describeEndpoint(stored);
+  assert.ok(!endpoint.includes('alice'));
+  assert.ok(!endpoint.includes('url-password'));
+  assert.ok(!endpoint.includes('url-key-secret'));
+  assert.ok(endpoint.includes('example.test/mcp'));
+  assert.ok(endpoint.includes('mode=fast'));
+  const { host, calls } = world({ configuration: [{
+    entry: { options: { id: 'github-mcp' } }, inherited: stored, override: {},
+  }] });
+  const status = await bodyOf(await host.route(ROUTES.status, get(`http://x${ROUTES.status}`)));
+  assert.equal(status.mcp.rows[0].endpoint, endpoint);
+  const read = await bodyOf(await host.route(ROUTES.mcpConfig, get(`http://x${ROUTES.mcpConfig}?patchId=github-mcp`)));
+  await bodyOf(await host.route(ROUTES.mcpConfig, post(`http://x${ROUTES.mcpConfig}`, {
+    patchId: 'github-mcp', config: read.config,
+  })));
+  assert.equal(calls.edits[0].config.url, stored.url);
+});
+
+await check('literal stars in an ordinary field do not restore an unrelated stored value', () => {
+  assert.deepEqual(restoreSecrets({ description: 'old', headers: { Authorization: 'Bearer secret' } }, {
+    description: REDACTED, headers: { Authorization: REDACTED },
+  }), { description: REDACTED, headers: { Authorization: 'Bearer secret' } });
 });
 
 await check('the skills page reports an empty registry without failing', async () => {

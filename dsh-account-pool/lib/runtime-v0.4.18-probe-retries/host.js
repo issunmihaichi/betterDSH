@@ -17,6 +17,7 @@
  * `apply` is async and returns the disposer — supported, see DESIGN.md §11.
  */
 import { randomBytes } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { writeFileSync } from 'node:fs';
 
 import z from '@deepseek-ai/schemastery';
@@ -391,16 +392,31 @@ export async function mountPool(ctx, options = {}) {
   const bindingsTable = domain.table('bindings');
   const usageTable = domain.table('usage');
 
-  /** Writes started by the adapter are fire-and-forget; tests await them via flush(). */
+  /** Background adapter writes remain best-effort, while each management request
+   * owns an exact promise ledger. Keep rejected promises in that ledger even if
+   * they settled before flush; unrelated stream telemetry must not fail a save.
+   */
+  const operationWrites = new AsyncLocalStorage();
   const pending = new Set();
   function track(promise) {
     const p = Promise.resolve(promise);
     pending.add(p);
+    operationWrites.getStore()?.push(p);
     p.catch((error) => log?.warn?.('account-pool: persist failed: %s', String(error?.message ?? error)))
       .finally(() => pending.delete(p));
     return p;
   }
   async function flush() {
+    const writes = operationWrites.getStore();
+    if (writes) {
+      while (writes.length > 0) {
+        const results = await Promise.allSettled(writes.splice(0));
+        if (results.some(result => result.status === 'rejected')) {
+          throw Object.assign(new Error('持久化失败；运行时状态可能已改变，请重试，未保存内容重启后可能丢失。'), { code: 'persist-failed' });
+        }
+      }
+      return;
+    }
     while (pending.size > 0) await Promise.allSettled([...pending]);
   }
 
@@ -973,7 +989,7 @@ export async function mountPool(ctx, options = {}) {
       path: ROUTES.account,
       methods: ['POST'],
       requestBody: 'buffered',
-      fetch: async (request) => {
+      fetch: (request) => operationWrites.run([], async () => {
         let body;
         try {
           body = await request.json();
@@ -1727,13 +1743,17 @@ export async function mountPool(ctx, options = {}) {
           log?.info?.('account-pool: %s applied to %s', action, id);
           return json({ ok: true, action, account: adapter.getAccount(id) });
         } catch (error) {
+          if (error?.code === 'persist-failed') {
+            log?.warn?.('account-pool: management persistence failed for %s', action);
+            return json({ ok: false, persisted: false, runtimeMayHaveChanged: true, error: { code: 'persist-failed', message: error.message } }, 503);
+          }
           const code = error instanceof RangeError ? 'invalid-argument'
             : error?.name === 'ZodError' ? 'invalid-account'
               : 'action-failed';
           log?.warn?.('account-pool: %s on %s failed: %s', action, id === '' ? '(new)' : id, String(error?.message ?? error));
           return json({ error: { code, message: String(error?.message ?? error) } }, 400);
         }
-      },
+      }),
     }));
 
     // The provider picker's data source. A GET because it is pure description —

@@ -1,0 +1,11 @@
+{
+  "name": "betterdsh-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node tools/test.mjs",
+    "test:contracts": "node tools/contracts-test.mjs",
+    "test:standalone": "node tools/standalone-test.mjs"
+  }
+}

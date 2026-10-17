@@ -111,20 +111,35 @@ export function createGithub(deps) {
   let lastError;
 
   const settingsCache = { value: undefined };
+  let settingsLoad;
+  let settingsWrite = Promise.resolve();
 
-  /** Current settings, normalized; re-read from disk on the first call only. */
+  /** Share the initial read so a late load cannot overwrite a committed patch. */
   async function settings() {
     if (settingsCache.value === undefined) {
-      settingsCache.value = normalizeSettings(await store.load());
+      settingsLoad ??= Promise.resolve().then(() => store.load()).then((value) => {
+        settingsCache.value = normalizeSettings(value);
+      }).catch((error) => {
+        settingsLoad = undefined;
+        throw error;
+      });
+      await settingsLoad;
     }
     return settingsCache.value;
   }
 
-  async function saveSettings(patch) {
-    const next = normalizeSettings({ ...(await settings()), ...(patch ?? {}) });
-    await store.save(next);
-    settingsCache.value = next;
-    return next;
+  /** Serialize the entire read/merge/save/publish transaction, not just writes. */
+  function saveSettings(patch) {
+    const values = { ...(patch ?? {}) };
+    const operation = settingsWrite.then(async () => {
+      const next = normalizeSettings({ ...(await settings()), ...values });
+      await store.save(next);
+      settingsCache.value = next;
+      return next;
+    });
+    // A rejected write is reported to its caller but must not poison the queue.
+    settingsWrite = operation.catch(() => {});
+    return operation;
   }
 
   /** Which token is in force, without ever returning the secret itself. */
@@ -435,7 +450,7 @@ export function createGithub(deps) {
     const parsed = parseRepoSpec(request.repo);
     if (parsed.ok !== true) return { ok: false, reason: 'bad-repo', message: parsed.reason };
     const current = await settings();
-    const root = await cloneRoot();
+    const root = current.cloneRoot === '' ? defaultCloneRoot : current.cloneRoot;
     const requestedName = typeof request.dir === 'string' && request.dir.trim() !== ''
       ? request.dir.trim().replace(/[\\/]+$/, '')
       : parsed.repo;
@@ -454,6 +469,7 @@ export function createGithub(deps) {
       cloneUrl: parsed.cloneUrl,
       webUrl: parsed.webUrl,
       dest: target.path,
+      dir: requestedName,
       root,
       branch: asked !== '' ? asked : fallback !== '' ? fallback : current.cloneBranch,
       depth: current.cloneDepth,
@@ -466,6 +482,13 @@ export function createGithub(deps) {
   async function startClone(request) {
     const plan = await planClone(request);
     if (plan.ok !== true) return plan;
+    if (request.expected !== undefined) {
+      const fields = ['fullName', 'cloneUrl', 'dest', 'branch', 'depth'];
+      if (request.expected === null || typeof request.expected !== 'object'
+        || fields.some((field) => request.expected[field] !== plan[field])) {
+        return { ok: false, reason: 'plan-changed', message: '下载目标、分支或深度已改变，请重新生成计划并确认。' };
+      }
+    }
     jobCounter += 1;
     const job = {
       id: `clone-${String(clock())}-${String(jobCounter)}`,
@@ -483,7 +506,7 @@ export function createGithub(deps) {
     };
     jobs.set(job.id, job);
     // Keep the job table small: a page only ever watches the newest few.
-      if (jobs.size > 12) {
+    if (jobs.size > 12) {
       const oldest = [...jobs.values()].sort((left, right) => left.startedAt - right.startedAt)[0];
       if (oldest !== undefined && oldest.state !== 'running') jobs.delete(oldest.id);
     }
@@ -790,8 +813,11 @@ export function createGithub(deps) {
             if (plan.ok !== true) return json(plan, 400);
             return json({ ok: true, needsConfirm: true, plan, text: formatClonePlan(plan) });
           }
+          if (body.expected === undefined) {
+            return json({ ok: false, reason: 'confirmation-required', message: '请先生成下载计划，再确认其目标和深度。' }, 409);
+          }
           const started = await startClone(body);
-          if (started.ok !== true) return json(started, 400);
+          if (started.ok !== true) return json(started, started.reason === 'plan-changed' ? 409 : 400);
           return json({ ok: true, needsConfirm: false, job: started.job, text: formatCloneResult({ ...started.job, state: 'running' }) });
         }
         const id = new URL(request.url).searchParams.get('id');
@@ -884,7 +910,7 @@ export function createGithub(deps) {
         if (!confirmed) {
           return { kind: 'success', text: `${formatClonePlan(plan)}\n\n确认下载请执行：/github clone ${plan.fullName} --yes` };
         }
-        const started = await startClone({ repo: options.repoToken, branch: options.branch, dir: options.dir });
+        const started = await startClone({ repo: options.repoToken, branch: options.branch, dir: options.dir, expected: plan });
         if (started.ok !== true) return { kind: 'error', text: started.message };
         const settled = await waitForJob(started.job.id, invocation?.signal);
         return { kind: settled.state === 'failed' ? 'error' : 'success', text: formatCloneResult(settled) };
@@ -1014,7 +1040,9 @@ export function apply(ctx, config = {}) {
       execute: (input) => ctx.get('tools')?.execute?.(input),
     },
     commands: { list: (agent) => ctx.get('commands')?.list?.(agent) ?? [] },
-    workspaceRegistry: ctx.get('workspaceRegistry'),
+    // Read optional services at use time, not once at plugin mount: a service
+    // may arrive later, be disabled, or be replaced without remounting this API.
+    get workspaceRegistry() { return ctx.get('workspaceRegistry'); },
     sleep: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
   });
 
@@ -1038,12 +1066,16 @@ export function apply(ctx, config = {}) {
     }, `dsh-github: route ${route}`);
   }
 
-  ctx.effect(() => {
-    const commands = ctx.get('commands');
-    if (commands === undefined || typeof commands.register !== 'function') return () => {};
+  const mountCommand = (scope) => scope.effect(() => {
+    const commands = scope.get('commands');
+    if (typeof commands?.register !== 'function') return () => {};
     const dispose = commands.register(github.commandDefinition());
     return () => dispose();
   }, 'dsh-github: /github command');
+  // The command is optional. Its child fiber follows the registry's lifetime
+  // without withdrawing the settings/HTTP API when commands is unavailable.
+  if (typeof ctx.inject === 'function') ctx.inject(['commands'], mountCommand);
+  else mountCommand(ctx); // Small embedders/offline contexts without child fibers.
 
   const debugDumpPath = typeof config.debugDumpPath === 'string' && config.debugDumpPath !== ''
     ? config.debugDumpPath

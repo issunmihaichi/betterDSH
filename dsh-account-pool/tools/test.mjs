@@ -3,19 +3,30 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const scopes = {
+  'local-tauri': [['--test', 'tools/local-api-tauri-test.mjs']],
+  'local-api': [['--test', 'tools/local-api-test.mjs', 'tools/local-api-tauri-test.mjs', 'tools/local-api-controller-test.mjs', 'tools/local-api-host-test.mjs', 'tools/local-api-responses-request-test.mjs', 'tools/local-api-responses-output-test.mjs', 'tools/local-api-responses-http-test.mjs'], ['tools/local-api-client-test.mjs']],
+  'local-responses': [['--test', 'tools/local-api-responses-request-test.mjs', 'tools/local-api-responses-output-test.mjs', 'tools/local-api-responses-http-test.mjs']],
+  'codex-speed': [['--test', 'tools/codex-speed-test.mjs']],
   retry: [['--test', 'tools/retry-test.mjs']],
   detection: [['tools/detection-test.mjs', '--quick']],
   client: [['tools/client-test.mjs']],
+  timing: [['--test', 'tools/usage-timing-test.mjs', 'tools/usage-timing-client-test.mjs']],
   host: [['tools/host-test.mjs']],
   domain: [['tools/domain-test.mjs']],
-  routing: [['tools/kernel-test.mjs'], ['tools/prepared-call-test.mjs']],
+  routing: [['tools/kernel-test.mjs'], ['tools/prepared-call-test.mjs'], ['tools/usage-effort-test.mjs']],
+  'usage-effort': [['tools/usage-effort-test.mjs'], ['tools/host-test.mjs', '--name=usage effort'], ['tools/client-test.mjs']],
   upstream: [['tools/upstream-test.mjs']],
   supplier: [['tools/supplier-test.mjs']],
   quota: [['tools/quota-test.mjs']],
   'reset-credits': [['tools/reset-credits-test.mjs']],
   oauth: [['tools/oauth-test.mjs']],
   importer: [['tools/importer-test.mjs'], ['tools/host-test.mjs', '--import-only']],
-  codex: [['--test', 'tools/codex-test.mjs']],
+  codex: [['--test', 'tools/codex-test.mjs', 'tools/codex-continuity-test.mjs', 'tools/codex-attribution-test.mjs']],
+  attribution: [['--test', 'tools/codex-attribution-test.mjs'], ['tools/host-test.mjs', '--name=Codex']],
+  'codex-ws': [['--test', 'tools/codex-websocket-test.mjs', 'tools/codex-websocket-integration-test.mjs']],
+  'model-probe': [['--test', 'tools/model-probe-test.mjs'], ['tools/client-test.mjs']],
+  continuity: [['--test', 'tools/codex-continuity-test.mjs']],
+  'codex-compaction': [['--test', 'tools/codex-compaction-test.mjs', 'tools/codex-compaction-host-test.mjs']],
   gemini: [['--test', 'tools/gemini-test.mjs']],
 };
 const selected = process.argv.slice(2);

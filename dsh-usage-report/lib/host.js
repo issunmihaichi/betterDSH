@@ -17,6 +17,9 @@ import {
   aggregateSnapshots,
   accumulateSnapshot,
   buildReport,
+  createAggregationState,
+  accumulateAnalyticsSnapshot,
+  buildAnalyticsReport,
   dayKeys,
 } from './report.js';
 
@@ -89,12 +92,11 @@ export function apply(ctx, config = {}) {
   };
 
   /** Read a bounded number of sessions at a time and fold each one as it lands. */
-  async function foldSessions(service, records, signal) {
-    const byDay = new Map();
+  async function foldSessions(service, records, rangeDays, nowMs, signal) {
+    const aggregation = createAggregationState(rangeDays, nowMs);
     const skippedReasons = [];
     let scanned = 0;
     let skipped = 0;
-    let inheritedEventsSkipped = 0;
     let cursor = 0;
 
     const worker = async () => {
@@ -103,10 +105,10 @@ export function apply(ctx, config = {}) {
         const record = records[cursor];
         cursor += 1;
         if (record === undefined) return;
+        let snapshot;
         try {
-          const snapshot = await service.readSession(record.header.id);
-          accumulateSnapshot(byDay, snapshot);
-          inheritedEventsSkipped += snapshot?.inheritedEventCount ?? 0;
+          snapshot = await service.readSession(record.header.id);
+          accumulateAnalyticsSnapshot(aggregation, snapshot, record.header.id);
           scanned += 1;
         } catch (error) {
           skipped += 1;
@@ -114,12 +116,16 @@ export function apply(ctx, config = {}) {
             const reason = error instanceof Error ? error.message : String(error);
             skippedReasons.push(`${String(record.header.id)}: ${reason}`);
           }
+        } finally {
+          // The aggregate stores counters only; do not retain complete logs
+          // while this worker waits for its next readSession result.
+          snapshot = undefined;
         }
       }
     };
 
     await Promise.all(Array.from({ length: Math.min(readConcurrency, records.length) }, worker));
-    return { byDay, scanned, skipped, skippedReasons, inheritedEventsSkipped };
+    return { aggregation, scanned, skipped, skippedReasons };
   }
 
   /** Fold every visible session into one report for `rangeDays`. */
@@ -128,6 +134,9 @@ export function apply(ctx, config = {}) {
     if (service === undefined) {
       throw Object.assign(new Error('会话查询服务 sessionQuery 未加载，无法统计本机用量'), { code: 'unavailable' });
     }
+    // Capture one calendar window before asynchronous reads, even if a fold
+    // crosses local midnight. Tokens and all analytics share this same axis.
+    const nowMs = Date.now();
     const all = await service.listSessions(signal);
     const records = Array.isArray(all) ? all : [];
     // Live sessions first: they are the ones still accumulating today's tokens.
@@ -136,25 +145,26 @@ export function apply(ctx, config = {}) {
       ...records.filter((record) => record.live !== true),
     ].slice(0, maxSessions);
 
-    const folded = await foldSessions(service, ordered, signal);
-    return buildReport(folded.byDay, rangeDays, Date.now(), {
+    const folded = await foldSessions(service, ordered, rangeDays, nowMs, signal);
+    return buildAnalyticsReport(folded.aggregation, {
       sessionCount: records.length,
       scannedSessions: folded.scanned,
       skippedSessions: folded.skipped,
       skippedReasons: folded.skippedReasons,
       truncatedSessions: Math.max(0, records.length - ordered.length),
       liveSessions: records.filter((record) => record.live === true).length,
-      inheritedEventsSkipped: folded.inheritedEventsSkipped,
     });
   }
 
   /** Cached `collect`, with single-flight per range. */
-  async function report(rangeDays, signal) {
-    const cached = cache.get(rangeDays);
-    if (cached !== undefined && Date.now() - cached.at < ttlMs) return cached.report;
+  async function report(rangeDays, force = false) {
+    // A refresh is still single-flight; one caller's abort must not cancel the
+    // bounded fold shared by other requests. Complete it and cache only success.
     const pending = inflight.get(rangeDays);
     if (pending !== undefined) return pending;
-    const run = collect(rangeDays, signal)
+    const cached = cache.get(rangeDays);
+    if (!force && cached !== undefined && Date.now() - cached.at < ttlMs) return cached.report;
+    const run = collect(rangeDays)
       .then((built) => {
         cache.set(rangeDays, { at: Date.now(), report: built });
         return built;
@@ -173,8 +183,9 @@ export function apply(ctx, config = {}) {
     fetch: async (request) => {
       if (request.method === 'HEAD') return new Response(null, { status: 200, headers: JSON_HEADERS });
       try {
-        const rangeDays = normalizeRange(new URL(request.url).searchParams.get('range'));
-        return jsonResponse(await report(rangeDays, request.signal));
+        const query = new URL(request.url).searchParams;
+        const rangeDays = normalizeRange(query.get('range'));
+        return jsonResponse(await report(rangeDays, query.get('refresh') === '1'));
       } catch (error) {
         const code = error && typeof error === 'object' && typeof error.code === 'string' ? error.code : 'internal';
         const message = error instanceof Error ? error.message : String(error);
@@ -220,6 +231,9 @@ export function apply(ctx, config = {}) {
 }
 
 /** Exposed for the offline tests: the same fold the Host half performs. */
-export { aggregateSnapshots, accumulateSnapshot, buildReport, dayKeys };
+export {
+  aggregateSnapshots, accumulateSnapshot, buildReport, dayKeys,
+  createAggregationState, accumulateAnalyticsSnapshot, buildAnalyticsReport,
+};
 
 export default { name, inject, apply };

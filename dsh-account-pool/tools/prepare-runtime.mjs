@@ -10,8 +10,10 @@ const source = path.join(plugin, 'lib');
 const target = path.join(source, `runtime-v${version}`);
 const files = [
   'adapter.js','detection.js','domain.js','group-models.js','host.js','importer.js','kernel.js','oauth.js','quota.js','reset-credits.js','retry.js','supplier.js','upstream.js',
+  'local-api-responses-request.js','local-api-responses-output.js',
+  'local-api.js','local-api-protocol.js','local-api-controller.js','usage-timing.js','codex-speed.js','codex-compaction-bridge.js','native/codex-compaction.js',
   'claude-code/betas.js','claude-code/billing.js','claude-code/constants.js','claude-code/defaults.js','claude-code/hash.js','claude-code/headers.js','claude-code/identity.js','claude-code/index.js','claude-code/metadata.js','claude-code/model.js','claude-code/system.js','claude-code/version.js',
-  'native/codex.js','native/gemini.js','native/openai-responses.js','native/openai-responses-websocket.js','oauth/callback.js','oauth/engine.js','oauth/pkce.js','oauth/providers.js','oauth/refresh.js',
+  'native/codex.js','native/codex-websocket.js','native/codex-replay.js','native/codex-attribution.js','native/gemini.js','native/openai-responses.js','native/openai-responses-websocket.js','oauth/callback.js','oauth/engine.js','oauth/pkce.js','oauth/providers.js','oauth/refresh.js',
 ];
 const manifest = { version, source: '../', files: {} };
 for (const relative of files) {

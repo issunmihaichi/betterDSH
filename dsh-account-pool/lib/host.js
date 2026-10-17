@@ -17,13 +17,15 @@
  * `apply` is async and returns the disposer — supported, see DESIGN.md §11.
  */
 import { randomBytes } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { writeFileSync } from 'node:fs';
 
 import z from '@deepseek-ai/schemastery';
 
 import { DEFAULT_PROVIDER, POOL_DEFAULT_MAX_TOKENS, createPoolAdapter, priorityKey } from './adapter.js';
 import { PLATFORMS, accountSchema, groupSchema, poolDomainSpec, usageSchema } from './domain.js';
-import { ACCOUNT_ACTIONS, applyAccountAction } from './kernel.js';
+import { normalizeUsageTiming } from './usage-timing.js';
+import { ACCOUNT_ACTIONS, DURATIONS, applyAccountAction } from './kernel.js';
 import { METADATA_ACCOUNT_FIELDS, METADATA_FORMAT, decodeBundle, planImport, planMetadataImport, slugifyId } from './importer.js';
 import { base64url } from './oauth/pkce.js';
 import {
@@ -31,11 +33,16 @@ import {
   createOAuthEngine, describeProviders, readCallbackParams, refreshAccountCredential,
 } from './oauth.js';
 import { createHttpUpstream } from './upstream.js';
+import { loadCodexReplayCodec } from './native/codex-replay.js';
+import { createCodexAttributionDiagnostics } from './native/codex-attribution.js';
+import { createCompactionHistoryResolver, installCodexCompactionBridge, installExternalCompactionReplay, isCodexCompactionTarget, projectCompactionFiles } from './codex-compaction-bridge.js';
 import { createQuotaService, quotaConnectionKey } from './quota.js';
 import { isResetRequestId, supportsResetCredits } from './reset-credits.js';
 import { parseBundle } from './oauth/refresh.js';
 import { planSupplier, discoverSupplierModels, SupplierError } from './supplier.js';
 import { discoverGroupModels, GroupModelsError } from './group-models.js';
+import { createCodexCatalogProbe, createCodexSpeedService, parseCodexSpeedBody } from './codex-speed.js';
+import { createLocalApiController } from './local-api-controller.js';
 
 export const name = 'dsh-account-pool';
 
@@ -60,7 +67,7 @@ export const PROVIDER_LABEL = '号池';
  * requires the service to be REACHABLE. The runtime checks further down stay
  * (a service can exist yet lack a method); reachability is declared here.
  */
-export const inject = ['storageDomain', 'llm', 'connection', 'timer', 'credentials', 'attachments'];
+export const inject = ['storageDomain', 'llm', 'connection', 'timer', 'credentials', 'attachments', 'sessions', 'sessionProjections'];
 
 /**
  * The plugin's own settings document — and the reason the pool can appear in the
@@ -305,6 +312,7 @@ export const ROUTES = {
   usage: '/api/accountPool.usage',
   account: '/api/accountPool.account',
   oauth: '/api/accountPool.oauth',
+  codexSpeed: '/api/accountPool.codexSpeed',
 };
 
 const JSON_HEADERS = {
@@ -391,21 +399,50 @@ export async function mountPool(ctx, options = {}) {
   const bindingsTable = domain.table('bindings');
   const usageTable = domain.table('usage');
 
-  /** Writes started by the adapter are fire-and-forget; tests await them via flush(). */
+  /** Background adapter writes remain best-effort, while each management request
+   * owns an exact promise ledger. Keep rejected promises in that ledger even if
+   * they settled before flush; unrelated stream telemetry must not fail a save.
+   */
+  const operationWrites = new AsyncLocalStorage();
   const pending = new Set();
   function track(promise) {
     const p = Promise.resolve(promise);
     pending.add(p);
+    operationWrites.getStore()?.push(p);
     p.catch((error) => log?.warn?.('account-pool: persist failed: %s', String(error?.message ?? error)))
       .finally(() => pending.delete(p));
     return p;
   }
   async function flush() {
+    const writes = operationWrites.getStore();
+    if (writes) {
+      while (writes.length > 0) {
+        const results = await Promise.allSettled(writes.splice(0));
+        if (results.some(result => result.status === 'rejected')) {
+          throw Object.assign(new Error('持久化失败；运行时状态可能已改变，请重试，未保存内容重启后可能丢失。'), { code: 'persist-failed' });
+        }
+      }
+      return;
+    }
     while (pending.size > 0) await Promise.allSettled([...pending]);
   }
 
   // --- config reconciliation -------------------------------------------------
   const { inserted, refreshed } = reconcileConfiguredAccounts(accountsTable, options.accounts, now());
+
+  // Serialize singleton updates so background usage cannot overwrite a setting
+  // saved while its telemetry write was awaiting persistence.
+  let globalWrites = Promise.resolve();
+  function updateGlobal(update) {
+    const write = globalWrites.then(() => domain.global.set(update(domain.global.get())));
+    globalWrites = write.catch(() => {});
+    return write;
+  }
+  const encryptedCompactionEnabled = () => domain.global.get()?.codexEncryptedCompactionV2 === true;
+  const resolveCompactionHistory = createCompactionHistoryResolver(id => ctx.get('sessions')?.get?.(id),
+    messages => projectCompactionFiles(messages, ref => ctx.get('llm')?.fileRequestText?.(ref)));
+  const compactionBridgeDisposers = new Set();
+  let compactionBridgeAvailable = false;
 
   // --- usage sink -----------------------------------------------------------
   let usageSeq = 0;
@@ -419,6 +456,8 @@ export async function mountPool(ctx, options = {}) {
       sessionId: payload.sessionId ?? '',
       platform: payload.platform ?? '',
       model: payload.model ?? '',
+      reasoningEffort: payload.reasoningEffort ?? null,
+      mappedReasoningEffort: payload.mappedReasoningEffort ?? null,
       accountSwitches: payload.switches ?? 0,
       ok: payload.ok === true,
       errorCode: payload.errorCode ?? '',
@@ -427,13 +466,13 @@ export async function mountPool(ctx, options = {}) {
       cacheReadTokens: payload.usage?.cacheReadTokens ?? 0,
       cacheWriteTokens: payload.usage?.cacheWriteTokens ?? 0,
       reasoningTokens: payload.usage?.reasoningTokens ?? 0,
+      ...normalizeUsageTiming(payload),
     });
     // The whole chain is tracked, so flush() also awaits the counter bump.
     return track((async () => {
       await usageTable.put(record.id, record);
       try {
-        const global = domain.global.get();
-        await domain.global.set({ ...global, totalRequests: (global?.totalRequests ?? 0) + 1 });
+        await updateGlobal(global => ({ ...global, totalRequests: (global?.totalRequests ?? 0) + 1 }));
       } catch { /* the counter is advisory; a failed bump must not fail a request */ }
     })());
   }
@@ -450,13 +489,135 @@ export async function mountPool(ctx, options = {}) {
    * token requests and from overwriting each other's rotated refresh token.
    */
   const refreshInFlight = new Map();
+  // The optional review companion must never become a mount dependency for the
+  // account pool. A child injection makes a sibling's service reachable without
+  // blocking ordinary Codex traffic when the companion is absent/default-off.
+  let reviewAttributionBridge;
+  ctx.inject?.(['codexReviewAttribution'], (child) => {
+    const bridge = child.get('codexReviewAttribution');
+    reviewAttributionBridge = bridge;
+    child.effect(() => () => {
+      if (reviewAttributionBridge === bridge) reviewAttributionBridge = undefined;
+    }, 'account-pool: reviewAttributionDetach');
+  });
+  // Observe actual HTTP/WS dispatch attempts, not estimated billing or inferred prompt purposes.
+  // No account/session/model identifiers or request text enter these fixed-size counters.
+  const codexDispatchDiagnostics = createCodexAttributionDiagnostics({
+    now: () => clock.now(),
+    enabled: options.upstream === undefined && credentials !== undefined,
+    onUnknown: (reason) => log?.warn?.(`account-pool: Codex request has no verified thread_source (${reason}); check codexAttributionDispatch, not prompt text`),
+  });
+  function codexAttributionDiagnostics() {
+    let review = null;
+    let reviewBridgeStatus = 'not-installed';
+    if (reviewAttributionBridge != null) {
+      reviewBridgeStatus = 'disabled-unavailable';
+      // Diagnostics from an optional sibling must not break account management or
+      // mount-time status dumps. Treat its API, version and getters as fallible.
+      try {
+        const snapshot = reviewAttributionBridge.snapshot;
+        if (typeof snapshot === 'function') {
+          const bridge = snapshot.call(reviewAttributionBridge);
+          if (bridge && typeof bridge.then === 'function') {
+            // The contract is synchronous; also observe an accidental async rejection.
+            Promise.resolve(bridge).catch(() => {});
+          } else if (bridge && typeof bridge === 'object' && !Array.isArray(bridge)) {
+            if (bridge.version !== 1) reviewBridgeStatus = 'disabled-incompatible';
+            else {
+              // Capture getters once: validation and publication must use the same values.
+              const { compatible, augmentationEnabled, augmentedRequests, missingProvenance } = bridge;
+              if (typeof compatible === 'boolean' && typeof augmentationEnabled === 'boolean') {
+                const active = compatible && augmentationEnabled;
+                review = {
+                  version: 1,
+                  compatible,
+                  augmentationEnabled: active,
+                  augmentedRequests: Number.isSafeInteger(augmentedRequests) && augmentedRequests >= 0 ? augmentedRequests : 0,
+                  missingProvenance: Number.isSafeInteger(missingProvenance) && missingProvenance >= 0 ? missingProvenance : 0,
+                };
+                reviewBridgeStatus = active ? 'enabled' : compatible ? 'disabled' : 'disabled-incompatible';
+              }
+            }
+          }
+        }
+      } catch { /* Only fixed, non-sensitive capability states cross the API. */ }
+    }
+    return {
+      sessions: typeof ctx.get('sessions')?.get === 'function',
+      turns: typeof ctx.get('sessionProjections')?.stateOf === 'function',
+      officialSessionHeaders: true,
+      requestLocalMetadata: true,
+      reviewBridge: review?.augmentationEnabled === true,
+      reviewBridgeStatus,
+      review,
+      // Client capabilities are not evidence of OpenAI's final analytics bucket.
+      officialAnalyticsVerified: false,
+    };
+  }
+  // Session replay is durable, but the sync API is not a secret channel. Keep an
+  // independent AEAD key in the existing credential service, created lazily only
+  // when the Codex transport is actually used. Never derive it from OAuth tokens.
+  let replayCodecPromise;
+  const codexReplayStatus = { mode: 'session-aead-v1', keyState: credentials ? 'not-loaded' : 'unavailable' };
+  function resolveCodexReplayCodec() {
+    if (!replayCodecPromise) {
+      replayCodecPromise = loadCodexReplayCodec(credentials).then(codec => {
+        codexReplayStatus.keyState = 'ready';
+        return codec;
+      }).catch(() => {
+        codexReplayStatus.keyState = 'unavailable';
+        replayCodecPromise = undefined;
+        log?.warn?.('account-pool: Codex durable replay is unavailable; credential key could not be loaded');
+        // Do not make unrelated accounts unavailable. This request keeps neutral
+        // history; the explicit capability state reports the degraded feature.
+        return undefined;
+      });
+    }
+    return replayCodecPromise;
+  }
   const upstream = options.upstream ?? (credentials === undefined ? undefined : createHttpUpstream({
+    resolveCodexReplayCodec,
+    resolveCodexEncryptedCompaction: encryptedCompactionEnabled,
+    resolveCompactionHistory,
+    onCodexRequest: summary => codexDispatchDiagnostics.record(summary),
     fetchImpl: options.fetchImpl ?? globalThis.fetch,
+    webSocketImpl: options.webSocketImpl,
+    webSocketConnectTimeoutMs: options.webSocketConnectTimeoutMs,
+    webSocketIdleTimeoutMs: options.webSocketIdleTimeoutMs,
+    codexWebSocketSessionIdleMs: options.codexWebSocketSessionIdleMs,
+    codexWebSocketMaxSessions: options.codexWebSocketMaxSessions,
     // The same ceiling the models declare, so a direct `stream()` call (management
     // tooling, probes) budgets like a real DSH turn instead of at the transport's
     // much smaller 4096 fallback.
     defaultMaxTokens: POOL_DEFAULT_MAX_TOKENS,
     resolveAttachments: () => ctx.get('attachments'),
+    resolveCodexSession: (sessionId) => {
+      const sessions = ctx.get('sessions');
+      if (typeof sessions?.get !== 'function') return { known: false, missingSourceReason: 'session-service-unavailable' };
+      const session = sessions.get(sessionId);
+      if (!session) return { known: false, missingSourceReason: 'session-not-found' };
+      const header = session.header;
+      const boundary = ctx.get('sessionProjections')?.stateOf?.(session, 'turnBoundary');
+      const origin = header?.origin;
+      let rootSessionId = sessionId;
+      let current = session;
+      const seen = new Set([sessionId]);
+      // Ordinary forks are independent tasks, not collaboration parents. Missing
+      // ancestors and cycles terminate without inventing parent turn identities.
+      for (let depth = 0; depth < 64 && current?.header?.origin === 'subagent'; depth++) {
+        const parent = current.header.parentSession;
+        if (typeof parent !== 'string' || !parent || seen.has(parent)) break;
+        seen.add(parent);
+        rootSessionId = parent;
+        current = sessions.get(parent);
+      }
+      return {
+        known: true, origin, rootSessionId,
+        ...(origin === 'subagent' && typeof header.parentSession === 'string' && header.parentSession !== sessionId ? { parentSessionId: header.parentSession } : {}),
+        ...(boundary?.openTurnStartSeq != null && Number.isSafeInteger(boundary.lastTurn) && boundary.lastTurn > 0
+          ? { turnId: `${sessionId}:turn:${boundary.lastTurn}:${boundary.openTurnStartSeq}` } : {}),
+      };
+    },
     resolveCredential: (account) => resolveAccountCredential(credentials, account, {
       fetchImpl: options.fetchImpl ?? globalThis.fetch,
       clock,
@@ -496,6 +657,17 @@ export async function mountPool(ctx, options = {}) {
     const profile = providers && typeof providers === 'object' && Object.hasOwn(providers, route) ? providers[route] : undefined;
     return liveValue(profile?.modelOverrides) ?? {};
   };
+  const codexCatalogProbe = createCodexCatalogProbe({
+    fetchImpl: options.fetchImpl ?? globalThis.fetch, clock,
+    ttlMs: options.codexSpeedTtlMs, timeoutMs: options.codexSpeedTimeoutMs,
+    resolveCredential: account => resolveAccountCredential(credentials, account, {
+      fetchImpl: options.fetchImpl ?? globalThis.fetch, clock, inFlight: refreshInFlight,
+      refreshEnabled: options.refreshEnabled, returnBundle: true,
+      // Capability discovery fails closed and quietly; no raw refresh error reaches UI/logs.
+    }),
+  });
+  ctx.effect(() => () => codexCatalogProbe.dispose(), 'account-pool: codexSpeedClose');
+  let codexSpeedService;
   let resetSyncCapture = null;
   const adapter = createPoolAdapter({
     initialAccounts: [...accountsTable.entries()].map(([, value]) => value),
@@ -507,7 +679,9 @@ export async function mountPool(ctx, options = {}) {
       putAccount: (record) => {
         const previous = accountsTable.get(record.id);
         if (previous !== undefined && quotaConnectionKey(previous) !== quotaConnectionKey(record)) quotaService.invalidate(record.id);
-        const write = track(accountsTable.put(record.id, record));
+        let write;
+        try { write = track(accountsTable.put(record.id, record)); }
+        catch (error) { write = track(Promise.reject(error)); }
         if (resetSyncCapture?.accountId === record.id) resetSyncCapture.promise = write;
         return write;
       },
@@ -521,6 +695,7 @@ export async function mountPool(ctx, options = {}) {
     },
     upstream,
     clock,
+    resolveCodexSpeed: request => codexSpeedService.resolveRequest(request),
     requestRetries: options.requestRetries,
     requestRetryDelayMs: options.requestRetryDelayMs,
     requestRetryMaxDelayMs: options.requestRetryMaxDelayMs,
@@ -535,6 +710,74 @@ export async function mountPool(ctx, options = {}) {
     onUsage: (payload) => { void recordUsage(payload); },
     onCooldown: (event) => log?.info?.('account-pool: %s -> %s on %s', event.account.id, event.decision.kind, event.account.platform),
   });
+
+  codexSpeedService = createCodexSpeedService({
+    initialSelections: domain.global.get()?.codexSpeedSelections ?? [],
+    persistSelections: selections => updateGlobal(global => ({ ...global, codexSpeedSelections: selections })),
+    resolveTarget: async target => {
+      // A composer may name its next model, but may not invent a session or route.
+      if (!ctx.get('sessions')?.get?.(target.sessionId) || !adapter.callableRoutesFor().includes(target.provider)) return false;
+      return (await adapter.listModels(target.provider)).some(model => model.id === target.model);
+    },
+    listAccounts: target => adapter.listRouteAccounts(target.provider, target.model),
+    probeAccount: (account, model, signal) => codexCatalogProbe.probe(account, model, signal),
+  });
+
+  // Optional Host-only integration for fixed-account behavioral attribution.
+  // The detector owns prompts/configuration/scoring; this service owns account
+  // credentials and transport. Unloading this pool aborts every pinned probe.
+  if (typeof ctx.provide === 'function') {
+    const probeLifecycle = new AbortController();
+    ctx.effect(() => () => probeLifecycle.abort(), 'account-pool: modelProbeAbort');
+    // Share in-flight durable pauses across prepared handles for the same exact
+    // connection. A failed write stays dirty so a retry cannot mistake the
+    // adapter's already-paused memory snapshot for a persisted scheduling pause.
+    const probePauses = new Map();
+    function pauseProbeScheduling(prepared) {
+      probeLifecycle.signal.throwIfAborted();
+      const { id, key } = prepared.target;
+      const current = adapter.getAccount(id);
+      if (!current || adapter.describeAccountProbe(id).key !== key) {
+        throw Object.assign(new Error('Account connection changed; start a new test.'), { code: 'POOL_TEST_TARGET_CHANGED' });
+      }
+      const previous = probePauses.get(key);
+      if (previous?.promise) return previous.promise;
+      const alreadyPaused = current.schedulable === false;
+      const entry = {};
+      probePauses.set(key, entry);
+      entry.promise = operationWrites.run([], async () => {
+        // No await between the connection check and mutation: merge only the
+        // scheduling flag onto the current row, without health/metadata resets.
+        if (!alreadyPaused || previous?.failed) adapter.pauseAccountProbeScheduling(id, key);
+        await flush();
+        probeLifecycle.signal.throwIfAborted();
+        return { alreadyPaused };
+      }).then(result => { probePauses.delete(key); return result; }, error => {
+        entry.promise = undefined;
+        entry.failed = true;
+        throw error;
+      });
+      return entry.promise;
+    }
+    const modelProbeService = Object.freeze({
+      version: 1,
+      pauseSchedulingVersion: 1,
+      async targets() {
+        probeLifecycle.signal.throwIfAborted();
+        return Promise.all(adapter.listAccounts().map(async account => ({ ...adapter.describeAccountProbe(account.id),
+          configured: (await describeCredential(credentials, account.credentialRef)).configured === true })));
+      },
+      prepare(id, selection) {
+        probeLifecycle.signal.throwIfAborted();
+        const prepared = adapter.prepareAccountProbe(id, selection);
+        return Object.freeze({ ...prepared,
+          async pauseScheduling() { return pauseProbeScheduling(prepared); },
+          stream: (prompt, signal) => prepared.stream(prompt,
+            signal ? AbortSignal.any([signal, probeLifecycle.signal]) : probeLifecycle.signal) });
+      },
+    });
+    ctx.effect(() => ctx.provide('accountPoolModelProbe', modelProbeService), 'account-pool: modelProbeService');
+  }
 
   // --- OAuth login ----------------------------------------------------------
   // The engine is pure (see lib/oauth/engine.js); everything that touches DSH —
@@ -903,6 +1146,63 @@ export async function mountPool(ctx, options = {}) {
     refreshRoutes();
   });
 
+  // Optional: wrap the existing engine only; never register/replace a compaction service.
+  // Preset revisions own isolated, shared engines. Host/agent ctx.get cannot address them.
+  const compactionBridgeEngines = new Map();
+  function attachCompactionEngine(engine, owner) {
+    engine = engine?.[Symbol.for('cordis.original')] ?? engine;
+    if (!engine || compactionBridgeEngines.has(engine)) return;
+    const restore = installCodexCompactionBridge({ engine, llm,
+      enabled: encryptedCompactionEnabled, canCompact: target => isCodexCompactionTarget(adapter, target),
+      resolveCompactionHistory, onFallback: () => log?.warn?.('account-pool: native Codex compaction unavailable; using the configured text summarizer') });
+    if (!restore) return;
+    let attached = true;
+    const detach = () => {
+      if (!attached) return;
+      attached = false;
+      restore();
+      compactionBridgeEngines.delete(engine);
+      compactionBridgeDisposers.delete(detach);
+      compactionBridgeAvailable = compactionBridgeDisposers.size > 0;
+    };
+    compactionBridgeEngines.set(engine, detach);
+    compactionBridgeDisposers.add(detach);
+    compactionBridgeAvailable = true;
+    // Undo on either pool unload or the actual engine/revision owner's unload.
+    owner.effect(() => engine.ctx?.effect
+      ? engine.ctx.effect(() => detach, 'account-pool: codexCompactionEngineDetach')
+      : detach, 'account-pool: codexCompactionDetach');
+  }
+  // Retain preset-free/root compositions without making compaction a mount dependency.
+  ctx.inject?.(['compaction'], child => attachCompactionEngine(child.get('compaction'), child));
+  ctx.inject?.(['agents', 'agentPresets'], child => {
+    const agents = child.get('agents');
+    const presets = child.get('agentPresets');
+    if (typeof agents?.list !== 'function' || typeof presets?.serviceFor !== 'function') return;
+    const discover = agent => {
+      if (agent) attachCompactionEngine(presets.serviceFor(agent, 'compaction'), child);
+    };
+    const discoverAll = () => { for (const agent of agents.list()) discover(agent); };
+    child.on('agent/created', ({ agent }) => discover(agent));
+    // recompose emits tools/change after rebinding; new/resumed agents emit agent/created.
+    child.on('tools/change', discoverAll);
+    child.on('internal/service', name => { if (name === 'compaction') discoverAll(); }, { global: true });
+    discoverAll();
+  });
+  // Preserve a prepared call's registration and dispatch; never re-enter
+  // llm.stream and choose another adapter after preparation. Pool routes restore
+  // later, after their exact account has been selected and its scope is known.
+  const stopExternalCompactionReplay = installExternalCompactionReplay({ llm,
+    isPool: provider => adapter.routesFor().includes(provider), resolveCompactionHistory });
+
+  // --- local inference API (separate key, never the management channel) -------
+  const localApiTable = domain.table('local_api');
+  const localApi = createLocalApiController({ adapter, credentials, available: upstream !== undefined,
+    readConfig: () => localApiTable.get('listener'),
+    saveConfig: value => localApiTable.put('listener', value) });
+  ctx.effect(() => () => localApi.close(), 'account-pool: localApiClose');
+  await localApi.initialize();
+
   // --- management surface ---------------------------------------------------
   const routeDisposers = [];
   const connection = ctx.get('connection');  if (connection?.fetch?.register !== undefined) {
@@ -925,6 +1225,20 @@ export async function mountPool(ctx, options = {}) {
         })));
         return json({
           managementVersion: 2,
+          localApiVersion: 1,
+          localApiProtocols: ['chat-completions', 'responses'],
+          localApi: localApi.snapshot(),
+          usageTimingVersion: 1,
+          runtimeRevision: '0.4.49-local-tauri',
+          codexContinuity: { ...codexReplayStatus, stickyIdleTtlMs: DURATIONS.codexStickyTtlMs },
+          codexCompatibilityVersion: 1,
+          codexCompatibility: { encryptedCompactionV2: encryptedCompactionEnabled(),
+            available: compactionBridgeAvailable && !!stopExternalCompactionReplay && adapterRegistered && options.upstream === undefined },
+          codexWebSocketVersion: 1,
+          codexWebSocket: upstream?.codexWebSocketSnapshot?.() ?? { available: false },
+          codexAttributionVersion: 2,
+          codexAttributionCapabilities: codexAttributionDiagnostics(),
+          codexAttributionDispatch: codexDispatchDiagnostics.snapshot(),
           settingsNs,
           quotaVersion: 1,
           resetCreditsVersion: 1,
@@ -959,21 +1273,53 @@ export async function mountPool(ctx, options = {}) {
         await flush();
         const requested = Number(new URL(request.url).searchParams.get('limit'));
         const limit = Number.isFinite(requested) && requested > 0 ? Math.min(requested, 500) : 100;
-        const rows = [...usageTable.entries()].map(([, value]) => value)
+        const rows = [...usageTable.entries()].map(([, value]) => ({ ...value, ...normalizeUsageTiming(value) }))
           .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0))
           .slice(0, limit);
-        return json({ limit, rows });
+        return json({ limit, rows, usageTimingVersion: 1 });
       },
     }));
 
-    // The one WRITE route: operator actions on a single account. Deliberately
+    routeDisposers.push(connection.fetch.register({
+      path: ROUTES.codexSpeed, methods: ['GET', 'POST'], requestBody: 'buffered',
+      fetch: async request => {
+        try {
+          if (request.method === 'GET') {
+            const params = new URL(request.url).searchParams;
+            if ([...params.keys()].some(key => !['sessionId', 'provider', 'model'].includes(key))
+              || ['sessionId', 'provider', 'model'].some(key => params.getAll(key).length > 1)) {
+              return json({ error: { code: 'invalid-codex-speed', message: 'Invalid Codex speed request.' } }, 400);
+            }
+            return json(await codexSpeedService.get({ sessionId: params.get('sessionId'),
+              provider: params.get('provider'), model: params.get('model') }, request.signal));
+          }
+          if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('content-type') ?? '')) {
+            return json({ error: { code: 'invalid-codex-speed', message: 'Expected a JSON Codex speed request.' } }, 400);
+          }
+          const text = await request.text();
+          if (text.length > 8192) return json({ error: { code: 'invalid-codex-speed', message: 'Invalid Codex speed request.' } }, 400);
+          let body;
+          try { body = parseCodexSpeedBody(JSON.parse(text)); }
+          catch { return json({ error: { code: 'invalid-codex-speed', message: 'Invalid Codex speed request.' } }, 400); }
+          return json(await codexSpeedService.set(body, request.signal));
+        } catch (error) {
+          if (request.signal?.aborted) return json({ error: { code: 'codex-speed-aborted', message: 'Codex speed request cancelled.' } }, 499);
+          const saving = error?.code === 'POOL_CODEX_SPEED_SAVE_FAILED';
+          return json({ error: { code: saving ? 'codex-speed-save-failed' : 'codex-speed-unavailable',
+            message: saving ? 'Codex speed was not saved; the previous selection remains active.'
+              : 'Selected Codex speed is unavailable; choose Standard or refresh capabilities.' } }, saving ? 503 : 409);
+        }
+      },
+    }));
+
+    // The account WRITE route: operator actions on a single account. Deliberately
     // narrow — one account, one named action — so it cannot become a generic
     // "patch anything" surface reachable from a browser page.
     routeDisposers.push(connection.fetch.register({
       path: ROUTES.account,
       methods: ['POST'],
       requestBody: 'buffered',
-      fetch: async (request) => {
+      fetch: (request) => operationWrites.run([], async () => {
         let body;
         try {
           body = await request.json();
@@ -982,9 +1328,26 @@ export async function mountPool(ctx, options = {}) {
         }
 
         const action = typeof body?.action === 'string' ? body.action : '';
+        // These actions are independently serialized by the controller. They do
+        // not accept account ids, caller-supplied keys, or arbitrary config.
+        if (action === 'local-api-update' || action === 'local-api-rotate-key') {
+          if (request.signal.aborted) return json({ error: { code: 'local-api-aborted', message: '请求已取消。' } }, 499);
+          if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('content-type') ?? '')) {
+            return json({ error: { code: 'invalid-local-api', message: 'Expected application/json.' } }, 415);
+          }
+          try {
+            return json(action === 'local-api-update' ? await localApi.update(body) : await localApi.rotateKey(body));
+          } catch (error) {
+            const known = /^local-api-|^invalid-local-api$/.test(error?.code ?? '');
+            return json({ ok: false, localApi: localApi.snapshot(), error: {
+              code: known ? error.code : 'local-api-failed',
+              message: known ? error.message : '本机 API 操作失败，请刷新后检查状态。',
+            } }, known ? error.status ?? 503 : 503);
+          }
+        }
         const id = typeof body?.id === 'string' ? body.id.trim() : '';
         const allowed = [
-          'supplier-connect', 'supplier-models', 'group-models',
+          'codex-compatibility-update', 'supplier-connect', 'supplier-models', 'group-models',
           ...ACCOUNT_ACTIONS, ...CRUD_ACTIONS, ...GROUP_ACTIONS, ...PRIORITY_ACTIONS, ...BATCH_ACTIONS, ...OAUTH_ACTIONS, ...MANAGEMENT_ACTIONS,
         ];
         if (!allowed.includes(action)) {
@@ -993,7 +1356,7 @@ export async function mountPool(ctx, options = {}) {
         // `import` addresses a whole document, `group-create` carries its id in the
         // group body, `batch` addresses many accounts at once, and the `oauth-*`
         // verbs address a login FLOW — none of them is addressed by a top-level id.
-        if (id === '' && !['supplier-connect', 'supplier-models'].includes(action) && action !== 'create' && action !== 'import' && action !== 'group-create' && action !== 'batch' && action !== 'export' && !OAUTH_ACTIONS.includes(action)) {
+        if (id === '' && !['codex-compatibility-update', 'supplier-connect', 'supplier-models'].includes(action) && action !== 'create' && action !== 'import' && action !== 'group-create' && action !== 'batch' && action !== 'export' && !OAUTH_ACTIONS.includes(action)) {
           return json({ error: { code: 'missing-id', message: '`id` is required' } }, 400);
         }
 
@@ -1001,6 +1364,18 @@ export async function mountPool(ctx, options = {}) {
           /** Group ids an account names that do not exist. */
           function unknownGroupsFor(record) {
             return (record.groups ?? []).filter((groupId) => adapter.getGroup(groupId) === undefined);
+          }
+
+          if (action === 'codex-compatibility-update') {
+            if (typeof body.encryptedCompactionV2 !== 'boolean' || Object.keys(body).some(key => !['action', 'encryptedCompactionV2'].includes(key))) {
+              return json({ error: { code: 'invalid-argument', message: 'encryptedCompactionV2 must be a boolean; unrelated settings are not accepted' } }, 400);
+            }
+            if (body.encryptedCompactionV2 && (!compactionBridgeAvailable || !stopExternalCompactionReplay || !adapterRegistered || options.upstream !== undefined)) {
+              return json({ error: { code: 'codex-compaction-unavailable', message: 'The compatible native compaction bridge is unavailable; restart DSH after updating the account pool' } }, 409);
+            }
+            track(updateGlobal(global => ({ ...global, codexEncryptedCompactionV2: body.encryptedCompactionV2 })));
+            await flush();
+            return json({ ok: true, action, encryptedCompactionV2: encryptedCompactionEnabled() });
           }
 
           if (action === 'group-models') {
@@ -1727,13 +2102,17 @@ export async function mountPool(ctx, options = {}) {
           log?.info?.('account-pool: %s applied to %s', action, id);
           return json({ ok: true, action, account: adapter.getAccount(id) });
         } catch (error) {
+          if (error?.code === 'persist-failed') {
+            log?.warn?.('account-pool: management persistence failed for %s', action);
+            return json({ ok: false, persisted: false, runtimeMayHaveChanged: true, error: { code: 'persist-failed', message: error.message } }, 503);
+          }
           const code = error instanceof RangeError ? 'invalid-argument'
             : error?.name === 'ZodError' ? 'invalid-account'
               : 'action-failed';
           log?.warn?.('account-pool: %s on %s failed: %s', action, id === '' ? '(new)' : id, String(error?.message ?? error));
           return json({ error: { code, message: String(error?.message ?? error) } }, 400);
         }
-      },
+      }),
     }));
 
     // The provider picker's data source. A GET because it is pure description —
@@ -1783,7 +2162,13 @@ export async function mountPool(ctx, options = {}) {
   if (typeof options.statusDumpPath === 'string' && options.statusDumpPath !== '') {
     const status = {
       at: now(),
-      runtimeRevision: '0.4.18-probe-retries',
+      runtimeRevision: '0.4.49-local-tauri',
+      codexContinuity: { ...codexReplayStatus, stickyIdleTtlMs: DURATIONS.codexStickyTtlMs },
+      codexWebSocketVersion: 1,
+      codexWebSocket: upstream?.codexWebSocketSnapshot?.() ?? { available: false },
+      codexAttributionVersion: 2,
+      codexAttributionCapabilities: codexAttributionDiagnostics(),
+      codexAttributionDispatch: codexDispatchDiagnostics.snapshot(),
       requestRetries: options.requestRetries ?? 3,
       entryId: typeof entryId === 'string' && entryId !== '' ? entryId : null,
       providerRoute,
@@ -1822,7 +2207,15 @@ export async function mountPool(ctx, options = {}) {
   async function dispose() {
     if (disposed) return;
     disposed = true;
+    await localApi.close();
+    for (const restore of compactionBridgeDisposers) restore();
+    compactionBridgeDisposers.clear();
+    compactionBridgeAvailable = false;
+    try { stopExternalCompactionReplay?.(); } catch { /* already unwound */ }
+    // Only close transport state owned by this mount, not caller-injected dependencies.
+    if (options.upstream === undefined) upstream?.dispose?.();
     quotaService.dispose();
+    codexCatalogProbe.dispose();
     resetActions.clear();
     try { stopPrune?.(); } catch { /* already stopped */ }
     try { stopCapabilityValidation?.(); } catch { /* the fiber also unwinds this */ }
@@ -1853,6 +2246,12 @@ export async function apply(ctx, config = {}) {
     child.effect(() => child.settings.configure({ auto: false }, ctx.fiber));
   });
   const mounted = await mountPool(ctx, config);
+  // Publish the shipped browser artifact through the existing Host; no second
+  // web server or implicit dev watcher is involved. Refresh the GUI to verify.
+  ctx.inject?.(['clientModules'], child => {
+    try { child.get('clientModules')?.rebuilt?.(name); }
+    catch { ctx.logger?.warn?.('account-pool: client publication failed; restart Host and refresh the GUI'); }
+  });
   return () => mounted.dispose();
 }
 

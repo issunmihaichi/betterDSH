@@ -1,6 +1,9 @@
 # 依赖
 node_modules/
 
+# 自动审查归因兼容专项的 fixture 由本地 DSH 提取，不随仓库分发
+dsh-codex-review-attribution/tools/fixtures/
+
 # 从本机已安装 app.asar 抽出的只读参考源码（研究材料，非插件本体）
 refs/
 
@@ -10,3 +13,7 @@ Thumbs.db
 .vscode/
 .idea/
 *.log
+
+# Python 打包工具的字节码缓存
+__pycache__/
+*.pyc
